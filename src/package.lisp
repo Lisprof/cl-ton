@@ -1,0 +1,137 @@
+;;;; cl-ton -- a TON blockchain client for Common Lisp.
+;;;;
+;;;; Copyright (c) 2026 lisprof
+;;;;
+;;;; Licensed under the Apache License, Version 2.0 (the "License");
+;;;; you may not use this file except in compliance with the License.
+;;;; You may obtain a copy of the License at
+;;;;
+;;;;     https://www.apache.org/licenses/LICENSE-2.0
+;;;;
+;;;; Unless required by applicable law or agreed to in writing, software
+;;;; distributed under the License is distributed on an "AS IS" BASIS,
+;;;; WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+;;;; See the License for the specific language governing permissions and
+;;;; limitations under the License.
+
+;;;; client-package.lisp -- the reusable TON client package.  
+  
+(defpackage :cl-ton
+  (:nicknames :ton-client)
+  (:use :cl)  
+  (:export
+   ;; files.lisp: locating BUILDER.LISP's bundled env/ binaries
+   :bundled-env-binary :clear-bundled-env-binary-cache
+   ;; tonlib.lisp: resolve-time getter retry
+   :call-with-getter-retry :definitive-getter-failure-p :*getter-retry-attempts* :*getter-retry-delay*
+   ;; boc (formerly the separate :ton-boc package; see src/ton-boc.lisp)
+   :boc-error
+   :builder :builder-p :begin-cell :build-cell
+   :builder-bits :builder-bit-length :builder-refs :builder-refs-count :builder-exotic-p
+   :store-bit :store-bits :store-uint :store-int :store-bytes
+   :store-bit-vector :store-ref :store-builder :end-cell
+   :node :node-p :node-hash :node-hash-hex :node-depth :node-level :node-equal
+   :cell :cell-p :make-cell
+   :cell-bits :cell-bit-length :cell-refs :cell-exotic-p
+   :cell-bit :cell-uint :cell-bit-vector :cell-data-octets
+   :cell-hash :cell-hash-hex :cell-depth :cell-level :cell-representation
+   :absent-cell :absent-cell-p :make-absent-cell
+   :collect-nodes :parse-boc :crc32c
+   :pmap :*worker-count* :*parallel-threshold*
+   :octets :octets->hex :hex->octets
+   :as-octets :uint->octets :octets->uint :concat-octets :sha256
+   :demo :run-boc-tests
+   ;; conditions  
+   :ton-error :tonlib-error :tonlib-error-code :tonlib-error-message :emulator-error  
+   ;; tl.lisp: TL serialization primitives
+   :tl-error :crc32-ieee :tl-constructor-id :make-tl-buffer :tl-buffer-octets
+   :tl-write-uint :tl-write-int32 :tl-write-int64 :tl-write-int256 :tl-write-raw
+   :tl-write-bytes :tl-write-string :tl-write-vector
+   :make-tl-reader :tl-reader-remaining :tl-reader-eof-p :tl-take :tl-read-uint
+   :tl-read-int32 :tl-read-int64 :tl-read-int256 :tl-read-bytes :tl-read-string :tl-read-vector
+   ;; adnl-crypto.lisp
+   :x25519 :x25519-reference :adnl-shared-secret :adnl-key-id :ed25519-public-from-seed :ed25519-pub->x25519-pub
+   :ed25519-clamped-scalar-octets :make-aes-ctr :aes-ctr-process :adnl-handshake-key-iv
+   :sha512-octets :octets-le->int :int->octets-le
+   ;; adnl.lisp
+   :adnl-error :adnl-session :adnl-session-p :adnl-client-handshake-packet :adnl-server-accept-handshake
+   :adnl-encode-packet :adnl-decode-packet :adnl-parse-message :adnl-connect :adnl-close :adnl-send
+   :adnl-receive :adnl-query :adnl-ping :adnl-serve :adnl-stop-server :random-octets
+   :tl-encode-tcp-ping :tl-encode-tcp-pong :tl-encode-adnl-query :tl-encode-adnl-answer :tl-encode-lite-query
+   ;; proxy-liteserver-native.lisp
+   :open-native-proxy-liteserver :close-native-proxy-liteserver :native-proxy :native-proxy-p :native-proxy-port
+   :native-proxy-pub :native-proxy-db :native-proxy-ready-upstreams :write-native-proxy-identity
+   :read-native-proxy-identity :native-proxy-config-json :describe-lite-query :encode-lite-server-error
+   :global-config-liteservers :ip-int->dotted :ed25519-sign
+   ;; base64  
+   :base64-encode :base64-decode :cell->base64 :base64->cell  
+   ;; slice  
+   :slice :slice-p :cell-slice :slice-remaining-bits :slice-remaining-refs  
+   :load-uint :load-int :load-bit :load-coins :load-address :load-ref  
+   :load-maybe-ref :load-bytes :skip-bits :slice-empty-p :slice-rest-bits  
+   ;; types  
+   :address :address-p :make-address :address-workchain :address-hash  
+   :parse-address :address->string :address->raw-string :address-equal  
+   :store-address :store-coins :store-maybe-ref :store-either-ref  
+   :store-string-tail :nano :from-nano :usdt-units :from-usdt-units  
+   :make-state-init :state-init-address  
+   :internal-message-relaxed :external-message :serialize-boc  
+   ;; vm-stack  
+   :stack-int :stack-cell :stack-slice :stack-null  
+   :serialize-vm-stack :parse-vm-stack  
+   ;; tonlib  
+   :tonlib :open-tonlib :close-tonlib :with-tonlib :tonlib-call :ensure-keystore
+   :tonlib-masterchain-info :tonlib-masterchain-block :tonlib-shards  
+   :tonlib-block-transactions :tonlib-sync :tonlib-account-state :account-state  
+   :account-state-balance :account-state-code :account-state-data  
+   :account-state-last-lt :account-state-last-hash :account-state-status  
+   :tonlib-run-get-method :make-tonlib-getter :make-local-getter :tonlib-send-message :*get-method-block*
+   :tonlib-config-cell :tonlib-shard-account-cell :tonlib-libraries :collect-library-hashes :library-cell-hash :tonlib-transactions
+   :transaction-utime :transaction-lt :transaction-in-msg-source :transaction-out-count
+   :transaction-matches-broadcast-p
+   ;; emulator  
+   :load-emulator-library :run-get-method-local :emulate-external-message :emulate-message :parse-message-header :funded-shard-account :emulation-result  
+   :load-tonlib-library  
+   ;; proxy-liteserver
+   :proxy-liteserver :proxy-liteserver-p :proxy-liteserver-port :proxy-liteserver-process
+   :proxy-liteserver-binary :proxy-liteserver-db :proxy-liteserver-global-config
+   :validate-proxy-liteserver-preconditions
+   :open-proxy-liteserver :*proxy-liteserver-implementation* :close-proxy-liteserver :proxy-liteserver-alive-p :open-tonlib-via-proxy :check-routed-config :write-account-fixture :read-account-fixture :fakechain-load-fixture
+   :read-proxy-liteserver-identity :proxy-liteserver-entry :proxy-liteserver-config
+   :proxy-liteserver-global-config-path :ipv4-string->ip-int
+   ;; proxy diagnostics (where does the native proxy stop?)
+   :proxy-diagnostics :proxy-diagnostics-report :proxy-verdict :proxy-wait-ready :start-proxy-watch
+   :diagnose-proxy :adnl-ext-client-status :adnl-failure-hint
+   :proxy-method-table :proxy-history-query-p :*proxy-max-attempts* :*proxy-attempt-timeout*
+   :*proxy-failure-penalty* :*proxy-history-queries*
+   :emulation-result-success-p :emulation-result-error :emulation-result-exit-code  
+   :emulation-result-fees :emulation-result-vm-log :emulation-result-out-messages  
+   :emulator-version :method-id :unix-now
+   :load-hm-label :dict-entries :transaction-messages :parse-message-summary
+   :emulation-out-message-cells :emulation-out-messages-summary :emulation-result-shard-account
+   :external-message-normalized-hash
+   ;; jetton  
+   :jetton-transfer-body :jetton-wallet-address :jetton-wallet-balance :address-slice
+   ;; dex: the bare DEX-agnostic protocol shape only (see dex.lisp) -- no
+   ;; methods, no addresses, no contract knowledge. Every DEFMETHOD/DEFUN
+   ;; dispatch and every pool/router/factory/master address lives in the
+   ;; trader (src/dex-config.lisp and its per-DEX modules dex-stonfi.lisp/
+   ;; dex-dedust.lisp/dex-storm.lisp).
+   :message-spec :message-spec-to :message-spec-value :message-spec-body :message-spec-state-init :make-message-spec
+   :dex-resolve :dex-id :dex-pool-address :dex-pool-state
+   :dex-swap-ton->usdt :dex-swap-usdt->ton :dex-swap-cycle
+   ;; wallet  
+   :keypair :keypair-public :mnemonic->keypair :seed->keypair  
+   :wallet-v5r1 :make-wallet-v5r1 :wallet-v5r1-p :wallet-address :wallet-state-init  
+   :wallet-seqno :wallet-external-message :sign-cell :wallet-v5r1-id  
+   :wallet-v5r1-code :wallet-from-mnemonic-source :wallet-from-mnemonic :*wallet*
+   ;; indexer  
+   :flow-event :flow-event-pool :flow-event-block :flow-event-transaction
+   :flow-event-observed-at :*flow-event-hook* :flow-scanner :start-flow-scanner :stop-flow-scanner  
+   :drain-flow-events :*flow-event-backlog* :publish-flow-event :scan-confirmed-flow-once  
+   ;; chain protocol  
+   :chain :chain-pools :chain-ton-balance :chain-usdt-balance :chain-wallet-deployed-p
+   :chain-jetton-balance :chain-wallet-transactions :chain-drain-flow-events
+   :chain-wallet-seqno :chain-send :chain-emulate :chain-now :chain-sleep :chain-wait-block  
+   :chain-set-wallet :chain-getter :chain-close :tonlib-chain :make-tonlib-chain :wait-until
+   :head-poller :start-head-poller :stop-head-poller))

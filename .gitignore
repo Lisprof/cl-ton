@@ -1,0 +1,5 @@
+lib/*linux-x86_64.so
+.tonlib/
+tests/*linux-x86_64
+*.fasl
+*~
