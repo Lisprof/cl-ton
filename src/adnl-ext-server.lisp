@@ -47,6 +47,10 @@
   (handshakes 0)
   (rejected 0)
   (last-reject nil)                      ; (universal-time . text) of the latest refused handshake
+  (live-stats '())                       ; ADNL-CONN-STAT of every open connection
+  (closed-stats '())                     ; the latest finished ones, newest first, at most 30
+  (closed-count 0)
+  (late-answers 0)                       ; answers computed but undeliverable: the client was gone
   (query-log nil))                       ; when a list cell: (:log . entries), newest first
 
 (defun adnl-ext-server-note-query (server query)
@@ -65,6 +69,30 @@
   (sb-thread:with-mutex ((adnl-ext-server-lock server))
     (reverse (cdr (adnl-ext-server-query-log server)))))
 
+(defstruct (adnl-conn-stat (:copier nil))
+  "What happened on one inbound connection, for diagnostics (ADNL-EXT-SERVER-CONNECTION-STATS)."
+  (opened (get-universal-time))
+  (closed nil)
+  (queries 0)
+  (answered 0)
+  (late 0)                              ; answers that could not be sent (client already gone)
+  (slowest 0)                           ; seconds of the slowest answered query
+  (in-flight-at-close 0)
+  (reason nil))
+
+(defun adnl-ext-server-connection-stats (server)
+  "(VALUES LIVE CLOSED): property lists (:opened :closed :queries :answered :late :slowest
+:in-flight-at-close :reason), LIVE for open connections, CLOSED newest first (at most 30)."
+  (flet ((plist (st)
+           (list :opened (adnl-conn-stat-opened st) :closed (adnl-conn-stat-closed st)
+                 :queries (adnl-conn-stat-queries st) :answered (adnl-conn-stat-answered st)
+                 :late (adnl-conn-stat-late st) :slowest (adnl-conn-stat-slowest st)
+                 :in-flight-at-close (let ((c (adnl-conn-stat-in-flight-at-close st))) (if (consp c) (car c) c))
+                 :reason (adnl-conn-stat-reason st))))
+    (sb-thread:with-mutex ((adnl-ext-server-lock server))
+      (values (mapcar #'plist (adnl-ext-server-live-stats server))
+              (mapcar #'plist (adnl-ext-server-closed-stats server))))))
+
 (defun %server-track (server conn)
   (sb-thread:with-mutex ((adnl-ext-server-lock server))
     (push conn (adnl-ext-server-connections server))))
@@ -75,26 +103,38 @@
           (remove conn (adnl-ext-server-connections server)))))
 
 (defun %server-answer (conn query-id answer)
+  "Send ANSWER; returns T when it went out, NIL when there was nothing to send or the client
+is gone (the connection is then closed)."
   (when answer
     (handler-case
-        (adnl-send-packet conn (tl-encode (tl-make "adnl.message.answer"
-                                                   :query-id query-id :answer answer)))
-      (error () (adnl-conn-close conn)))))
+        (progn (adnl-send-packet conn (tl-encode (tl-make "adnl.message.answer"
+                                                          :query-id query-id :answer answer)))
+               t)
+      (error () (adnl-conn-close conn) nil))))
 
-(defun %server-run-query (server conn query-id query in-flight-cell)
-  (handler-case
-      (%server-answer conn query-id
-                      (funcall (adnl-ext-server-handler server) server conn query-id query))
-    (error (e)
-      (adnl-log "query handler failed: ~A" e)
-      (%server-answer conn query-id
-                      (tl-encode (tl-make "liteServer.error" :code -400
-                                                             :message (format nil "internal error: ~A" e))))))
-  (sb-thread:with-mutex ((adnl-ext-server-lock server))
-    (decf (car in-flight-cell))))
+(defun %server-run-query (server conn query-id query in-flight-cell stat)
+  (let* ((t0 (get-internal-real-time))
+         (sent (handler-case
+                   (%server-answer conn query-id
+                                   (funcall (adnl-ext-server-handler server) server conn query-id query))
+                 (error (e)
+                   (adnl-log "query handler failed: ~A" e)
+                   (%server-answer conn query-id
+                                   (tl-encode (tl-make "liteServer.error" :code -400
+                                                                          :message (format nil "internal error: ~A" e))))))))
+    (let ((secs (/ (- (get-internal-real-time) t0) (float internal-time-units-per-second))))
+      (sb-thread:with-mutex ((adnl-ext-server-lock server))
+        (decf (car in-flight-cell))
+        (cond (sent (incf (adnl-conn-stat-answered stat))
+                    (setf (adnl-conn-stat-slowest stat) (max (adnl-conn-stat-slowest stat) secs)))
+              ;; computed, but the client had already gone: it gave up (or dropped) first
+              ((adnl-conn-closed-p conn)
+               (incf (adnl-conn-stat-late stat))
+               (incf (adnl-ext-server-late-answers server))))))))
 
-(defun %server-connection-loop (server conn)
+(defun %server-connection-loop (server conn stat)
   (let ((in-flight (list 0)))
+    (setf (adnl-conn-stat-in-flight-at-close stat) in-flight)   ; the cell; read at close
     (loop until (or (adnl-ext-server-stop-p server) (adnl-conn-closed-p conn))
           do (let ((payload (adnl-recv-packet conn :timeout 1)))
                (unless (eq payload :timeout)
@@ -120,6 +160,8 @@
                         (let ((query-id (tl-get obj :query-id))
                               (query (tl-get obj :query)))
                           (adnl-ext-server-note-query server query)
+                          (sb-thread:with-mutex ((adnl-ext-server-lock server))
+                            (incf (adnl-conn-stat-queries stat)))
                           (if (>= (car in-flight) (adnl-ext-server-max-in-flight server))
                               (%server-answer conn query-id
                                               (tl-encode (tl-make "liteServer.error" :code -400
@@ -128,27 +170,42 @@
                                 (sb-thread:with-mutex ((adnl-ext-server-lock server))
                                   (incf (car in-flight)))
                                 (sb-thread:make-thread
-                                 (lambda () (%server-run-query server conn query-id query in-flight))
+                                 (lambda () (%server-run-query server conn query-id query in-flight stat))
                                  :name "adnl-ext query")))))
                        (t nil)))))))))
 
 (defun %server-connection (server socket)
-  (let ((conn nil))
+  (let ((conn nil) (stat (make-adnl-conn-stat)) (reason "closed by the server"))
     (unwind-protect
          (handler-case
              (progn
                (setf conn (adnl-accept-handshake socket (adnl-ext-server-keypair server)))
                (sb-thread:with-mutex ((adnl-ext-server-lock server))
-                 (incf (adnl-ext-server-handshakes server)))
+                 (incf (adnl-ext-server-handshakes server))
+                 (push stat (adnl-ext-server-live-stats server)))
                (%server-track server conn)
-               (%server-connection-loop server conn))
+               (%server-connection-loop server conn stat)
+               (when (adnl-ext-server-stop-p server) (setf reason "proxy shutting down")))
            (error (e)
+             (setf reason (remove #\Newline (princ-to-string e)))
              (unless conn
                (sb-thread:with-mutex ((adnl-ext-server-lock server))
                  (incf (adnl-ext-server-rejected server))
                  (setf (adnl-ext-server-last-reject server)
                        (cons (get-universal-time) (princ-to-string e)))))
              (adnl-log "adnl-ext connection ended: ~A" e)))
+      (when conn
+        (sb-thread:with-mutex ((adnl-ext-server-lock server))
+          (let ((cell (adnl-conn-stat-in-flight-at-close stat)))
+            (setf (adnl-conn-stat-in-flight-at-close stat) (if (consp cell) (car cell) 0)))
+          (setf (adnl-conn-stat-closed stat) (get-universal-time)
+                (adnl-conn-stat-reason stat) reason
+                (adnl-ext-server-live-stats server) (remove stat (adnl-ext-server-live-stats server)))
+          (incf (adnl-ext-server-closed-count server))
+          (push stat (adnl-ext-server-closed-stats server))
+          (when (> (length (adnl-ext-server-closed-stats server)) 30)
+            (setf (adnl-ext-server-closed-stats server)
+                  (subseq (adnl-ext-server-closed-stats server) 0 30)))))
       (if conn
           (progn (%server-untrack server conn) (adnl-conn-close conn))
           (ignore-errors (sb-bsd-sockets:socket-close socket))))))

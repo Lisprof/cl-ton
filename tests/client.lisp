@@ -942,6 +942,12 @@ Skipped when TON_FIFT_BINARY isn't set."
     (test-skip-policy)
     (test-tl-adnl-ext)   ; Phase A/B unit tests (tests/tl-adnl-ext.lisp)
     (test-proxy-ext)     ; Phase C/D: client + native proxy vs Lisp upstream (tests/proxy-ext.lisp)
+    (test-patient-sync)      ; sync keeps going while verified steps arrive
+    (test-keystores)         ; private, per-client keystore directories
+    (test-network-summary)   ; fast / ok / slow / unknown
+    (test-unknown-query-naming)
+    (test-proxy-hedging)     ; hedge, adaptive delay, penalties, speed preference, standby
+    (test-proxy-connection-stats) ; inbound connection lifecycle + answer times
     (test-proxy-retry)       ; retry on another upstream: stall / drop / pruned / single
     (test-proxy-diagnostics) ; where the native proxy stops: stage, hint, verdict, watch
     (test-proxy-ext-vs-binary)  ; ... vs the released binary (skips without it)
@@ -957,6 +963,7 @@ Skipped when TON_FIFT_BINARY isn't set."
     (test-library-cells) ; library references + getLibraries
     (test-fakechain-library-execution) ; library-code contracts execute once the library is published
     (test-fakechain-faults) ; drop-externals / stall-p
+    (test-tonlib-through-flaky-links) ; slow, flaky links between the proxy and the liteservers
     (test-tonlib-via-native-proxy) ; F.3/E: tonlib -> native proxy -> fakechain
     (test-tonlib-via-binary-proxy) ; F.2: same scenario, released binary (skips without it)
     (test-slice)

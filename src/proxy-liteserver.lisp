@@ -84,6 +84,11 @@ liteServer.error instead of leaving the client hanging.")
   (ever-alive-p nil)                    ; an upstream has been alive at least once (see PROXY-AWAIT-UPSTREAM)
   pollers                               ; one freshness-poller thread per upstream
   log-fn                                ; (control &rest args) or NIL: diagnostic lines (see OPEN-NATIVE-PROXY)
+  (max-active 8)                        ; upstream sessions kept open at once, the rest stand by (see PROXY-SUPERVISE)
+  supervisor                            ; the thread that keeps MAX-ACTIVE sessions open
+  (method-latency (make-hash-table :test 'equal)) ; METHOD -> (n . ewma-seconds) of answered attempts
+  (served (make-hash-table :test 'equal)) ; METHOD -> (n total-seconds max-seconds slow) as tonlib saw it
+                                         ; (retries included); SLOW counts answers later than 8 s
   (stats (make-hash-table :test #'equal)))
 
 (defstruct (proxy-upstream (:copier nil))
@@ -96,7 +101,12 @@ liteServer.error instead of leaving the client hanging.")
   (poll-state nil)                      ; NIL (none yet) / :OK / :ERROR -- the LATEST poll
   poll-detail                           ; text of the latest failure, or the seqno of the latest success
   (poll-at nil)                         ; universal time of the latest poll
-  (outcomes (make-hash-table :test 'equal)))   ; (METHOD OUTCOME DETAIL) -> count, see PROXY-RECORD-OUTCOME
+  (outcomes (make-hash-table :test 'equal))    ; (METHOD OUTCOME DETAIL) -> count, see PROXY-RECORD-OUTCOME
+  (latency (make-hash-table :test 'equal))     ; METHOD -> (n total-seconds max-seconds) of ANSWERED attempts
+  (slowness nil)                        ; EWMA of answer time relative to the method's usual time (1.0 = typical)
+  (fail-streak 0)                       ; consecutive timeouts / lost connections; reset by an answer
+  host port public                      ; where to connect (kept so a standby session can be started later)
+  (started-p t))                        ; NIL while on standby: its session has not been opened yet
 
 (defun proxy-liteserver-config-file (proxy)
   "The config.json PROXY's own process writes into its db on first launch
@@ -180,6 +190,26 @@ opened on PATH can reach nothing but the local proxy."
                  (length servers)))
     path))
 
+(defun %native-of (proxy)
+  (etypecase proxy
+    (lisp-proxy proxy)
+    (proxy-liteserver (proxy-liteserver-native proxy))))
+
+(defun proxy-ok-count (proxy method)
+  "How many queries named METHOD the native PROXY's upstreams answered, in total (0 for the binary)."
+  (let ((native (%native-of proxy)) (n 0))
+    (when native
+      (dolist (u (lisp-proxy-upstreams native) n)
+        (sb-thread:with-mutex ((lisp-proxy-lock native))
+          (maphash (lambda (k v) (when (and (string= (first k) method) (eq (second k) :ok)) (incf n v)))
+                   (proxy-upstream-outcomes u)))))))
+
+(defun proxy-progress-function (proxy)
+  "A function for TONLIB-SYNC's PROGRESS: the number of block proofs the native PROXY has
+obtained so far (every one is a step of tonlib's verified chain).  NIL for the released binary,
+which has no such counter -- the sync is then simply retried a fixed number of times."
+  (and (%native-of proxy) (lambda () (proxy-ok-count proxy "getBlockProof"))))
+
 (defun open-tonlib-via-proxy (proxy global-config-path &key library-path (verbosity 0)
                                                            (keystore :in-memory) (sync t) output-path)
   "Phase E.  Route a tonlib client through PROXY (either implementation): write
@@ -195,7 +225,8 @@ must touch no real network)."
          (path (proxy-liteserver-global-config-path proxy global-config-path out)))
     (check-routed-config path)
     (values (open-tonlib path :library-path library-path :verbosity verbosity
-                              :keystore keystore :sync sync)
+                              :keystore keystore :sync sync
+                              :sync-progress (proxy-progress-function proxy))
             path)))
 
 (defun proxy-liteserver-alive-p (proxy)
@@ -408,10 +439,24 @@ name (workchain,shard-hex)."
 (defun %lower-first (name)
   (concatenate 'string (string-downcase (subseq name 0 1)) (subseq name 1)))
 
+(defun %decode-function (fn-octets)
+  "The decoded liteServer function in FN-OCTETS, or (CONSTRUCTOR-ID . FN-OCTETS) when the schema
+does not know it."
+  (handler-case (tl-decode fn-octets)
+    (error () (cons (if (>= (length fn-octets) 4)
+                        (logior (aref fn-octets 0) (ash (aref fn-octets 1) 8)
+                                (ash (aref fn-octets 2) 16) (ash (aref fn-octets 3) 24))
+                        0)
+                    fn-octets))))
+
 (defun proxy-query-info (fn)
   "FN is a decoded liteServer function (a TL-OBJ) or an undecoded (id . raw)."
   (if (not (tl-obj-p fn))
-      (make-qinfo :name "unknown")
+      ;; a function the schema does not know: name it by its constructor id, so the diagnostics
+      ;; say WHICH query it was
+      (make-qinfo :name (if (and (consp fn) (integerp (car fn)) (plusp (car fn)))
+                            (format nil "unknown-~8,'0X" (car fn))
+                            "unknown"))
       (let* ((full (tl-obj-name fn))
              (name (subseq full (1+ (position #\. full :from-end t))))
              (q (make-qinfo :name name)))
@@ -538,7 +583,21 @@ them while nothing is known yet (the pollers learn it within a couple of seconds
                         (let ((top (reduce #'max base :key #'proxy-upstream-seqno)))
                           (remove-if-not (lambda (up) (= (proxy-upstream-seqno up) top)) base)))
                    base)))
-    (and pool (nth (random (length pool)) pool))))
+    (and pool (proxy-pick-weighted pool))))
+
+(defun proxy-upstream-weight (up)
+  "How much UP is preferred among otherwise equal candidates: faster than typical (SLOWNESS
+below 1) and with no recent failures weighs more.  Never zero, so every upstream is still tried
+now and then and a recovered one is noticed."
+  (let ((slow (or (proxy-upstream-slowness up) 1.0)))
+    (/ 1.0 (* (expt (max 0.25 (min 4.0 slow)) 2) (1+ (proxy-upstream-fail-streak up))))))
+
+(defun proxy-pick-weighted (pool)
+  (let* ((weights (mapcar #'proxy-upstream-weight pool))
+         (r (random (reduce #'+ weights))))
+    (loop for up in pool for w in weights
+          do (decf r w) (when (<= r 0) (return up))
+          finally (return (car (last pool))))))
 
 ;;; --- seqno watermarking ------------------------------------------------------
 
@@ -691,15 +750,21 @@ function-octets): an optional waitMasterchainSeqno prefix and the rest."
 (defparameter *proxy-max-attempts* 4
   "At most this many upstreams are tried for one query before the last answer is passed on.")
 
-(defparameter *proxy-attempt-timeout* 3
-  "Seconds one attempt may take while OTHER upstreams are still available to retry on.  A
-liteserver normally answers in well under a second; waiting out the whole query timeout on a
-silent one would hand tonlib a timeout a healthy upstream would not have produced.  The last
-possible attempt gets whatever is left of the query timeout (never less than 1 s), and a
-proxy with a single upstream always gives that upstream the full timeout.")
+(defparameter *proxy-hedge-delay* 2
+  "Seconds a query waits for its first upstream before a second one is asked as well, until
+enough answers have been measured to adapt (see PROXY-HEDGE-DELAY).  The first attempt is NOT
+cancelled: whichever valid answer arrives first wins, so a slow answer is never turned into a
+failure.")
+
+(defparameter *proxy-hedge-min* 0.5 "Lower bound of the adaptive hedge delay (fast networks).")
+(defparameter *proxy-hedge-max* 4.0 "Upper bound of the adaptive hedge delay (slow networks).")
 
 (defparameter *proxy-failure-penalty* 10
-  "Seconds an upstream that timed out on a query is avoided in favour of upstreams that did not.")
+  "Seconds an upstream that timed out or lost its connection on a query is avoided.  It doubles
+with every consecutive failure (10, 20, 40, ...) up to *PROXY-FAILURE-PENALTY-MAX*, and an answer
+clears it.")
+
+(defparameter *proxy-failure-penalty-max* 120)
 
 (defparameter *proxy-history-queries*
   '("getBlockProof" "getBlock" "getBlockHeader" "lookupBlock" "getState" "getShardBlockProof"
@@ -735,12 +800,26 @@ the error text for :ERROR / :NOTREADY (digit runs collapsed, truncated)."
     (sb-thread:with-mutex ((lisp-proxy-lock proxy))
       (incf (gethash key (proxy-upstream-outcomes up) 0)))))
 
+(defun %note-latency (table method secs lock &optional slow-limit)
+  (sb-thread:with-mutex (lock)
+    (let ((cell (or (gethash method table)
+                    (setf (gethash method table) (list 0 0.0 0.0 0)))))
+      (incf (first cell)) (incf (second cell) secs)
+      (setf (third cell) (max (third cell) secs))
+      (when (and slow-limit (> secs slow-limit)) (incf (fourth cell))))))
+
 (defun %answer-detail (answer)
   "(VALUES KIND DETAIL) for a liteServer.error ANSWER, else NIL."
   (let ((obj (handler-case (tl-decode answer) (error () nil))))
     (when (tl-is obj "liteServer.error")
       (values (tl-get obj :code)
               (format nil "~A ~A" (tl-get obj :code) (tl-get obj :message))))))
+
+(defun proxy-query-budget (proxy wait)
+  "Seconds a whole query may take: the proxy's query timeout, or longer for a wait request."
+  (if wait
+      (max (lisp-proxy-query-timeout proxy) (+ 1 (/ (tl-get wait :timeout-ms) 1000)))
+      (lisp-proxy-query-timeout proxy)))
 
 (defun proxy-forward (proxy up wait fn-octets started q &optional attempt-limit)
   "One attempt of a query on UP.  Returns (VALUES answer-octets retry-kind): ANSWER is
@@ -754,15 +833,16 @@ caps the seconds this attempt may wait (it never raises the budget)."
                      (proxy-rewrite-wait proxy up (tl-get wait :seqno) (tl-get wait :timeout-ms) elapsed-ms)
                      (make-array 0 :element-type '(unsigned-byte 8))))
          (payload (tl-encode (tl-make "liteServer.query" :data (%cat prefix fn-octets))))
-         (budget (if wait
-                     (max (lisp-proxy-query-timeout proxy)
-                          (+ 1 (/ (tl-get wait :timeout-ms) 1000)))
-                     (lisp-proxy-query-timeout proxy)))
+         (budget (proxy-query-budget proxy wait))
          (budget (if attempt-limit (min budget attempt-limit) budget)))
     (handler-case
-        (let* ((answer (proxy-learn-from-answer
+        (let* ((t-send (get-internal-real-time))
+               (answer (proxy-learn-from-answer
                         proxy up (adnl-ext-client-send-query (proxy-upstream-client up) payload budget)))
                (notready (proxy-notready-answer-p answer)))
+          (%note-latency (proxy-upstream-latency up) (qinfo-name q)
+                         (/ (- (get-internal-real-time) t-send) (float internal-time-units-per-second))
+                         (lisp-proxy-lock proxy))
           (multiple-value-bind (code detail) (%answer-detail answer)
             (cond (notready
                    (proxy-record-outcome proxy up q :notready detail)
@@ -797,61 +877,170 @@ caps the seconds this attempt may wait (it never raises the budget)."
           (max (proxy-upstream-penalty-until up)
                (+ (get-internal-real-time) (* seconds internal-time-units-per-second))))))
 
+(defun proxy-note-failure (proxy up)
+  "UP timed out or lost its connection on a query: avoid it, for longer after each repeat."
+  (let ((streak (sb-thread:with-mutex ((lisp-proxy-lock proxy))
+                  (incf (proxy-upstream-fail-streak up)))))
+    (proxy-penalize-for proxy up (min *proxy-failure-penalty-max*
+                                      (* *proxy-failure-penalty* (expt 2 (min 10 (1- streak))))))))
+
+(defun proxy-note-success (proxy up q secs)
+  "UP answered Q in SECS: clear its failure streak and penalty, and update how fast it is
+compared with the usual time for that method (so upstreams are comparable across methods)."
+  (sb-thread:with-mutex ((lisp-proxy-lock proxy))
+    (setf (proxy-upstream-fail-streak up) 0
+          (proxy-upstream-penalty-until up) 0)
+    (let* ((cell (or (gethash (qinfo-name q) (lisp-proxy-method-latency proxy))
+                     (setf (gethash (qinfo-name q) (lisp-proxy-method-latency proxy)) (cons 0 secs))))
+           (usual (max 0.05 (cdr cell)))
+           (factor (max 0.25 (min 4.0 (/ secs usual)))))
+      (when (>= (car cell) 3)           ; the first few answers define "usual"; do not rate against nothing
+        (setf (proxy-upstream-slowness up)
+              (if (proxy-upstream-slowness up)
+                  (+ (* 0.7 (proxy-upstream-slowness up)) (* 0.3 factor))
+                  factor)))
+      (setf (cdr cell) (+ (* 0.8 (cdr cell)) (* 0.2 secs)))
+      (incf (car cell)))))
+
+(defun proxy-hedge-delay (proxy q wait)
+  "Seconds to wait for the first upstream before asking a second one as well; NIL for a wait
+request (those are retried one after the other, never raced).  Adapts to the measured answer time
+of Q's method: slow networks wait longer, fast ones hedge sooner."
+  (unless wait
+    (let ((cell (sb-thread:with-mutex ((lisp-proxy-lock proxy))
+                  (gethash (qinfo-name q) (lisp-proxy-method-latency proxy)))))
+      (if (and cell (>= (car cell) 3))
+          (max *proxy-hedge-min* (min *proxy-hedge-max* (+ 0.3 (* 1.5 (cdr cell)))))
+          *proxy-hedge-delay*))))
+
+(defun proxy-attempt (proxy up wait fn-octets started q limit)
+  "PROXY-FORWARD plus the bookkeeping on UP (penalty, failure streak, speed); runs in its own
+thread, so a late answer of an attempt that lost the race still teaches the proxy about UP."
+  (let ((t0 (get-internal-real-time)))
+    (multiple-value-bind (answer kind) (proxy-forward proxy up wait fn-octets started q limit)
+      (case kind
+        ((nil) (proxy-note-success proxy up q (/ (- (get-internal-real-time) t0)
+                                                 (float internal-time-units-per-second))))
+        (:notready (proxy-penalize proxy up))
+        ((:timeout :dead) (proxy-note-failure proxy up)))
+      (values answer kind))))
+
 (defun proxy-handle-query (proxy server conn query-id query)
-  "The ADNL-EXT-SERVER handler: QUERY is the adnl.message.query payload.
-Returns the answer octets (always -- failures become liteServer.error).  A query is retried
-on another upstream (up to *PROXY-MAX-ATTEMPTS*, within the query timeout) when
-  * the upstream answered \"not ready\" (penalized for *PROXY-LAGGING-PENALTY*),
-  * it stayed silent past the attempt timeout, or its connection died with the query in flight
-    (penalized for *PROXY-FAILURE-PENALTY*),
-  * the query is a block/history query (*PROXY-HISTORY-QUERIES*) and it answered any error.
-When no upstream is left, or the attempts are used up, the last answer is passed through
-unchanged -- with a single upstream that is exactly what the released binary does."
+  "ADNL-EXT-SERVER handler: PROXY-HANDLE-QUERY-1 plus the end-to-end latency tonlib sees."
+  (let* ((t0 (get-internal-real-time))
+         (answer (proxy-handle-query-1 proxy server conn query-id query))
+         (method (handler-case
+                     (let* ((outer (tl-decode query)))
+                       (qinfo-name (proxy-query-info
+                                    (%decode-function (nth-value 1 (proxy-split-query (tl-get outer :data)))))))
+                   (error () "?"))))
+    (%note-latency (lisp-proxy-served proxy) method
+                   (/ (- (get-internal-real-time) t0) (float internal-time-units-per-second))
+                   (lisp-proxy-lock proxy) 8)
+    answer))
+
+(defun proxy-race (proxy q wait fn-octets history started)
+  "Answer one query from the upstreams, returning the answer octets (always: failures become
+liteServer.error).
+  * The first attempt goes to the best upstream.  If it has not answered after the HEDGE DELAY
+    (PROXY-HEDGE-DELAY) a second upstream is asked as well -- the first attempt keeps running --
+    and the first VALID answer wins.  A slow answer is therefore never turned into a failure, and
+    one stalled upstream costs only the hedge delay.
+  * An attempt that fails outright (connection lost, \"not ready\", or -- for a block/history
+    query, see *PROXY-HISTORY-QUERIES* -- any error answer) starts the next one at once.
+  * At most *PROXY-MAX-ATTEMPTS* upstreams are used, and never past the query timeout (below
+    what tonlib will wait: it gives up on a query after about 10 s and reconnects).
+  * Wait requests are never raced, only retried one after the other.
+With a single upstream there is one attempt, with the full timeout: what the released
+proxy-liteserver does."
+  (let* ((itu internal-time-units-per-second)
+         (deadline (+ started (round (* itu (proxy-query-budget proxy wait)))))
+         (sem (sb-thread:make-semaphore))
+         (lock (sb-thread:make-mutex))
+         (results '())                  ; (up answer kind), newest first
+         (tried '()) (launched 0) (collected 0)
+         (last-launch started)
+         (answer nil)
+         (hedge (proxy-hedge-delay proxy q wait))
+         (wait-seqno (and wait (tl-get wait :seqno))))
+    (labels ((now () (get-internal-real-time))
+             (remaining () (/ (- deadline (now)) (float itu)))
+             (pending () (- launched collected))
+             (more-p ()
+               (and (< launched *proxy-max-attempts*) (> (remaining) 0.2)
+                    (remove-if (lambda (u) (member u tried)) (proxy-alive-upstreams proxy q))))
+             (launch (up)
+               (push up tried) (incf launched) (setf last-launch (now))
+               (let ((limit (max 0.5 (remaining))))
+                 (sb-thread:make-thread
+                  (lambda ()
+                    (multiple-value-bind (a kind) (proxy-attempt proxy up wait fn-octets started q limit)
+                      (sb-thread:with-mutex (lock) (push (list up a kind) results))
+                      (sb-thread:signal-semaphore sem)))
+                  :name (format nil "proxy attempt ~A" (proxy-upstream-name up)))))
+             (launch-next (stat)
+               (let ((up (and (more-p) (select-server proxy q wait-seqno tried))))
+                 (when up (proxy-stat proxy stat) (launch up) t)))
+             (finish ()
+               (return-from proxy-race
+                 (or answer (proxy-error-answer "Gateway error: timeout for adnl query q" 652)))))
+      (let ((first (or (select-server proxy q wait-seqno nil)
+                       (and (not (lisp-proxy-ever-alive-p proxy)) (proxy-await-upstream proxy q))
+                       ;; every active session is down: open the standbys now and give them a moment
+                       (and (plusp (proxy-activate-standby proxy (lisp-proxy-max-active proxy)))
+                            (loop repeat 30
+                                  do (let ((up (select-server proxy q wait-seqno nil)))
+                                       (when up (return up)))
+                                     (sleep 0.1))))))
+        (unless first
+          (proxy-stat proxy :no-server)
+          (return-from proxy-race
+            (proxy-error-answer (format nil "Gateway error: no liteserver for query [ ~A ]"
+                                        (qinfo-descriptor q)))))
+        (launch first))
+      (loop
+        (let* ((hedgeable (and hedge (more-p)))
+               (to-hedge (and hedgeable
+                              (/ (- (+ last-launch (round (* hedge itu))) (now)) (float itu))))
+               (wait-for (max 0.01 (if hedgeable (min (remaining) to-hedge) (remaining)))))
+          (let ((signalled (sb-thread:wait-on-semaphore sem :timeout wait-for)))
+            (if signalled
+                ;; collect everything that arrived
+                (let ((batch (sb-thread:with-mutex (lock) (prog1 (reverse results) (setf results '())))))
+                  ;; the semaphore was decremented once; account for any further results already queued
+                  (loop repeat (1- (length batch)) do (sb-thread:try-semaphore sem))
+                  (dolist (r batch)
+                    (destructuring-bind (up a kind) r
+                      (declare (ignore up))
+                      (incf collected)
+                      (case kind
+                        ((nil) (return-from proxy-race a))
+                        (:error (setf answer a)
+                         (unless history (return-from proxy-race a))
+                         (launch-next :failover))
+                        (t (setf answer a)
+                           (launch-next :failover)))))
+                  (when (and (zerop (pending)) (not (more-p))) (finish)))
+                ;; nothing arrived within WAIT-FOR
+                (cond ((<= (remaining) 0.0) (finish))
+                      (hedgeable (launch-next :hedge))
+                      (t nil)))
+            (when (and (<= (remaining) 0.0) (zerop (pending))) (finish))
+            (when (<= (remaining) -1.0) (finish))))))))
+
+(defun proxy-handle-query-1 (proxy server conn query-id query)
+  "The ADNL-EXT-SERVER handler: QUERY is the adnl.message.query payload.  Returns the answer
+octets (always -- failures become liteServer.error); see PROXY-RACE for how upstreams are used."
   (declare (ignore server conn query-id))
   (let* ((started (get-internal-real-time))
          (outer (handler-case (tl-decode query) (error () nil))))
     (proxy-stat proxy :queries)
     (unless (tl-is outer "liteServer.query")
-      (return-from proxy-handle-query (proxy-error-answer "Gateway error: expected liteServer.query")))
+      (return-from proxy-handle-query-1 (proxy-error-answer "Gateway error: expected liteServer.query")))
     (multiple-value-bind (wait fn-octets) (proxy-split-query (tl-get outer :data))
-      (let* ((fn (handler-case (tl-decode fn-octets) (error () (cons 0 fn-octets))))
-             (q (proxy-query-info fn))
-             (history (proxy-history-query-p q))
-             (budget (lisp-proxy-query-timeout proxy))
-             (tried '())
-             (answer nil))
-        (loop
-          (let* ((elapsed (/ (- (get-internal-real-time) started) internal-time-units-per-second))
-                 (up (and (or (null tried) (and (< (length tried) *proxy-max-attempts*)
-                                                (or wait (< elapsed budget))))
-                          (or (select-server proxy q (and wait (tl-get wait :seqno)) tried)
-                              (and (null tried) (not (lisp-proxy-ever-alive-p proxy))
-                                   (proxy-await-upstream proxy q))))))
-            (unless up
-              (unless answer
-                (proxy-stat proxy :no-server)
-                (setf answer (proxy-error-answer (format nil "Gateway error: no liteserver for query [ ~A ]"
-                                                         (qinfo-descriptor q)))))
-              (return answer))
-            (let* ((others (and (not wait)
-                                (> (length (remove-if (lambda (u) (or (eq u up) (member u tried)))
-                                                      (proxy-alive-upstreams proxy q)))
-                                   0)
-                                (< (1+ (length tried)) *proxy-max-attempts*)))
-                   (limit (cond (wait nil)
-                                (others *proxy-attempt-timeout*)
-                                (tried (max 1 (- budget elapsed)))
-                                (t nil))))
-              (multiple-value-bind (a kind) (proxy-forward proxy up wait fn-octets started q limit)
-                (setf answer a)
-                (case kind
-                  ((nil) (return a))
-                  (:error (unless history (return a)))
-                  (:notready (proxy-penalize proxy up) (proxy-stat proxy :failover))
-                  (:timeout (proxy-penalize-for proxy up *proxy-failure-penalty*) (proxy-stat proxy :failover))
-                  (:dead (proxy-stat proxy :failover)))
-                (when (eq kind :error) (proxy-stat proxy :failover))
-                (push up tried)))))))))
+      (let* ((fn (%decode-function fn-octets))
+             (q (proxy-query-info fn)))
+        (proxy-race proxy q wait fn-octets (proxy-history-query-p q) started)))))
 
 ;;; --- lifecycle ----------------------------------------------------------------
 
@@ -867,11 +1056,51 @@ unchanged -- with a single upstream that is exactly what the released binary doe
                         (base64-decode (json-get (json-get e "id") "key"))
                         (parse-liteserver-slices e)))))
 
+(defparameter *proxy-max-active-upstreams* 8
+  "How many liteserver sessions the native proxy keeps open at once.  A public global config lists
+a dozen or more, several of them dead or stale; keeping a session to each (with its pings and
+freshness polls) costs bandwidth that matters on a weak link and buys nothing on a fast one -- a few
+good upstreams are enough, and a standby is opened the moment an active one fails.")
+
+(defun %upstream-trying-p (up)
+  "UP's session is being opened and has not failed yet."
+  (let ((c (proxy-upstream-client up)))
+    (and (proxy-upstream-started-p up)
+         (member (adnl-ext-client-stage c) '(:tcp-connecting :tcp-connected :init-sent :ack-received))
+         (zerop (adnl-ext-client-failures c)))))
+
+(defun proxy-activate-standby (proxy &optional (n 1))
+  "Open the session of up to N upstreams that are on standby.  Returns how many were started."
+  (let ((started 0))
+    (dolist (up (lisp-proxy-upstreams proxy) started)
+      (when (>= started n) (return started))
+      (unless (proxy-upstream-started-p up)
+        (setf (proxy-upstream-started-p up) t)
+        (start-adnl-ext-client (proxy-upstream-client up))
+        (incf started)))))
+
+(defun proxy-supervise (proxy)
+  "Keep (LISP-PROXY-MAX-ACTIVE PROXY) sessions alive or being opened: whenever fewer are, start a
+standby (one per second, so a burst of failures does not open everything at once)."
+  (sb-thread:make-thread
+   (lambda ()
+     (loop until (lisp-proxy-stop-p proxy)
+           do (let ((live (count-if (lambda (up) (and (proxy-upstream-started-p up)
+                                                      (or (adnl-ext-client-alive-p (proxy-upstream-client up))
+                                                          (%upstream-trying-p up))))
+                                    (lisp-proxy-upstreams proxy))))
+                (when (< live (lisp-proxy-max-active proxy))
+                  (proxy-activate-standby proxy 1)))
+              (loop repeat 4 until (lisp-proxy-stop-p proxy) do (sleep 0.25))))
+   :name "proxy supervisor"))
+
 (defun open-native-proxy (&key global-config db (port 0) (host "127.0.0.1") (query-timeout *proxy-query-timeout*)
-                            log)
+                            log (max-active *proxy-max-active-upstreams*))
   "Start the native proxy; returns a LISP-PROXY.  LOG, a function of (control &rest args),
 receives one line per upstream event (connecting, handshake ack, first answer, each failure
-with its stage and a hint); see PROXY-DIAGNOSTICS for the same information on demand."
+with its stage and a hint); see PROXY-DIAGNOSTICS for the same information on demand.  MAX-ACTIVE
+upstream sessions are opened at once (in random order, so load spreads over the public servers);
+the others stand by and are opened when an active one fails (see PROXY-SUPERVISE)."
   (let* ((db (uiop:ensure-directory-pathname db))
          (config-file (merge-pathnames "config.json" db))
          (existing (probe-file config-file))
@@ -884,11 +1113,15 @@ with its stage and a hint); see PROXY-DIAGNOSTICS for the same information on de
         (setf keypair (adnl-generate-keypair) listen-port port))
     (let* ((proxy (%make-lisp-proxy :keypair keypair :db db :query-timeout query-timeout :log-fn log))
            (entries (%global-config-liteservers (json-decode (read-global-config global-config)))))
+      (setf (lisp-proxy-max-active proxy) (max 1 max-active))
       (setf (lisp-proxy-upstreams proxy)
-            (loop for (h p pub slices) in entries
+            (loop for (h p pub slices) in (%shuffle entries)
+                  for i from 0
+                  for active = (< i (lisp-proxy-max-active proxy))
                   collect (make-proxy-upstream
                            :name (format nil "~A:~D" h p) :slices slices
-                           :client (open-adnl-ext-client h p pub :log log))))
+                           :host h :port p :public pub :started-p active
+                           :client (open-adnl-ext-client h p pub :log log :start active))))
       (handler-case
           (setf (lisp-proxy-server proxy)
                 (start-adnl-ext-server :keypair keypair :host host :port listen-port
@@ -901,12 +1134,20 @@ with its stage and a hint); see PROXY-DIAGNOSTICS for the same information on de
         (unless existing (write-native-proxy-identity db keypair actual)))
       (setf (lisp-proxy-pollers proxy)
             (mapcar (lambda (up) (start-proxy-poller proxy up)) (lisp-proxy-upstreams proxy)))
+      (setf (lisp-proxy-supervisor proxy) (proxy-supervise proxy))
       proxy)))
+
+(defun %shuffle (list)
+  (let ((v (coerce list 'vector)))
+    (loop for i from (1- (length v)) downto 1
+          do (rotatef (aref v i) (aref v (random (1+ i)))))
+    (coerce v 'list)))
 
 (defun close-native-proxy (proxy)
   (when proxy
     (setf (lisp-proxy-stop-p proxy) t)
-    (dolist (th (lisp-proxy-pollers proxy)) (sb-thread:join-thread th :default nil :timeout 6))
+    (dolist (th (cons (lisp-proxy-supervisor proxy) (lisp-proxy-pollers proxy)))
+      (when th (sb-thread:join-thread th :default nil :timeout 6)))
     (stop-adnl-ext-server (lisp-proxy-server proxy))
     (dolist (up (lisp-proxy-upstreams proxy))
       (close-adnl-ext-client (proxy-upstream-client up))))
@@ -948,8 +1189,14 @@ with its stage and a hint); see PROXY-DIAGNOSTICS for the same information on de
                 :poll-state (proxy-upstream-poll-state up)
                 :poll-detail (proxy-upstream-poll-detail up)
                 :poll-at (proxy-upstream-poll-at up)
+                :standby (not (proxy-upstream-started-p up))
+                :fail-streak (proxy-upstream-fail-streak up)
+                :slowness (proxy-upstream-slowness up)
                 :penalized (and (proxy-upstream-penalized-p up) t)
                 :sliced (and (proxy-upstream-slices up) t)
+                :latency (sb-thread:with-mutex ((lisp-proxy-lock proxy))
+                           (loop for m being the hash-keys of (proxy-upstream-latency up) using (hash-value c)
+                                 collect (list m (first c) (/ (second c) (max 1 (first c))) (third c))))
                 :outcomes (sb-thread:with-mutex ((lisp-proxy-lock proxy))
                             (loop for (method outcome detail) being the hash-keys of (proxy-upstream-outcomes up)
                                     using (hash-value n)
@@ -978,6 +1225,7 @@ method with most failures first.  FAILED counts :timeout :dead :notready and :er
   :HANDSHAKE-REJECTED TCP works but the ADNL handshake does not complete (keys / middlebox)
   :STARTING           nothing has failed yet and nothing is ready: still connecting
   :NO-UPSTREAMS       the global config names no liteserver"
+  (setf upstreams (remove-if (lambda (u) (getf u :standby)) upstreams))
   (flet ((get* (u k) (getf u k)))
     (cond
       ((null upstreams)
@@ -1001,16 +1249,12 @@ method with most failures first.  FAILED counts :timeout :dead :notready and :er
                "TCP connects but the ADNL handshake never completes: the global config's public keys do not match the servers, or a middlebox/proxy is interfering with non-HTTP TCP"))
       (t (values :starting "still connecting; no upstream has failed yet")))))
 
-(defun %native-of (proxy)
-  (etypecase proxy
-    (lisp-proxy proxy)
-    (proxy-liteserver (proxy-liteserver-native proxy))))
 
 (defun proxy-diagnostics (proxy)
   "A property list describing the native PROXY (a LISP-PROXY or a PROXY-LITESERVER
 running :native) right now: :implementation :listen-port :verdict :advice
 :global-max-seqno :stats (alist) :server (:handshakes :rejected :connections
-:last-reject) and :upstreams (one plist each, see ADNL-EXT-CLIENT-STATUS plus
+:last-reject :closed-count :late-answers :live-conns :closed-conns) and :upstreams (one plist each, see ADNL-EXT-CLIENT-STATUS plus
 :seqno :polls :polls-ok :poll-state :poll-detail :poll-at :penalized :sliced :outcomes), plus :methods
 ((method ok failed) ...) summed over the upstreams, most failures first.  An :outcomes entry is
 (method outcome detail count) with outcome :ok :timeout :dead :notready or :error."
@@ -1026,23 +1270,57 @@ running :native) right now: :implementation :listen-port :verdict :advice
                   :listen-port (and server (adnl-ext-server-port server))
                   :verdict verdict :advice advice
                   :methods (proxy-method-table ups)
+                  :served (sb-thread:with-mutex ((lisp-proxy-lock native))
+                            (loop for m being the hash-keys of (lisp-proxy-served native) using (hash-value c)
+                                  collect (list m (first c) (/ (second c) (max 1 (first c))) (third c) (fourth c))))
                   :global-max-seqno (lisp-proxy-global-max-seqno native)
                   :stats (sb-thread:with-mutex ((lisp-proxy-lock native))
                            (loop for k being the hash-keys of (lisp-proxy-stats native) using (hash-value v)
                                  collect (cons k v)))
                   :server (and server
-                               (sb-thread:with-mutex ((adnl-ext-server-lock server))
-                                 (list :handshakes (adnl-ext-server-handshakes server)
-                                       :rejected (adnl-ext-server-rejected server)
-                                       :connections (length (adnl-ext-server-connections server))
-                                       :last-reject (adnl-ext-server-last-reject server))))
+                               (append
+                                (sb-thread:with-mutex ((adnl-ext-server-lock server))
+                                  (list :closed-count (adnl-ext-server-closed-count server)
+                                        :late-answers (adnl-ext-server-late-answers server)
+                                        :handshakes (adnl-ext-server-handshakes server)
+                                        :rejected (adnl-ext-server-rejected server)
+                                        :connections (length (adnl-ext-server-connections server))
+                                        :last-reject (adnl-ext-server-last-reject server)))
+                                (multiple-value-bind (live closed) (adnl-ext-server-connection-stats server)
+                                  (list :live-conns live :closed-conns closed))))
                   :upstreams ups))))))
 
 (defun %upstream-state-word (u)
-  (cond ((and (getf u :alive) (eq (getf u :poll-state) :ok)) :answering)
+  (cond ((getf u :standby) :standby)
+        ((and (getf u :alive) (eq (getf u :poll-state) :ok)) :answering)
         ((getf u :alive) :connected)
         ((getf u :last-failure) :failed)
         (t :connecting)))
+
+(defun proxy-network-summary (proxy)
+  "(VALUES KEYWORD TEXT) describing the link as the proxy has experienced it: :FAST, :OK, :SLOW or
+:UNKNOWN (too few queries).  Judged on the busiest method: its average answer time as tonlib saw
+it (retries included) and the share of upstream attempts that failed."
+  (let* ((d (proxy-diagnostics proxy))
+         (served (sort (copy-list (getf d :served)) #'> :key #'second))
+         (top (first served)))
+    (if (or (null top) (< (second top) 5))
+        (values :unknown "too few queries answered yet to judge the network")
+        (destructuring-bind (method n avg mx slow) top
+          (declare (ignore slow))
+          (let* ((cell (find method (getf d :methods) :key #'first :test #'string=))
+                 (ok (or (second cell) 0)) (bad (or (third cell) 0))
+                 (fail-pct (if (plusp (+ ok bad)) (round (* 100 bad) (+ ok bad)) 0))
+                 (kind (cond ((or (>= avg 2.0) (>= fail-pct 25)) :slow)
+                             ((and (< avg 0.5) (< fail-pct 5)) :fast)
+                             (t :ok))))
+            (values kind
+                    (format nil "~A: ~A answers (~D) take ~,1F s on average, ~,1F s at worst; ~D% of upstream attempts failed~A"
+                            (ecase kind (:slow "slow network") (:ok "network ok") (:fast "fast network"))
+                            method n avg mx fail-pct
+                            (if (eq kind :slow)
+                                " -- the first sync of an empty keystore will be long; later runs reuse the saved state"
+                                ""))))))))
 
 (defun proxy-diagnostics-report (proxy &key verbose)
   "PROXY-DIAGNOSTICS as a compact multi-line string: verdict + advice, a summary count, the
@@ -1053,6 +1331,9 @@ upstream's counters and recent event lines."
     (with-output-to-string (out)
       (format out "proxy-liteserver (~(~A~)) verdict: ~A~%  ~A~%"
               (getf d :implementation) (getf d :verdict) (getf d :advice))
+      (when (eq (getf d :implementation) :native)
+        (multiple-value-bind (kind text) (proxy-network-summary proxy)
+          (unless (eq kind :unknown) (format out "  ~A~%" text))))
       (when (eq (getf d :implementation) :native)
         (let ((sv (getf d :server)))
           (format out "  listener 127.0.0.1:~A  handshakes ~A  rejected ~A  open connections ~A  best masterchain seqno ~A~%"
@@ -1066,13 +1347,27 @@ upstream's counters and recent event lines."
                     (loop for (k . v) in (sort (copy-list (getf d :stats)) #'string< :key #'princ-to-string)
                           append (list k v)))))
         (let ((n (length ups)))
-          (format out "  upstreams: ~D  answering ~D  connected-only ~D  failed ~D  connecting ~D~%"
+          (format out "  upstreams: ~D  answering ~D  connected-only ~D  failed ~D  connecting ~D  standby ~D~%"
                   n
                   (count :answering ups :key #'%upstream-state-word)
                   (count :connected ups :key #'%upstream-state-word)
                   (count :failed ups :key #'%upstream-state-word)
-                  (count :connecting ups :key #'%upstream-state-word)))
+                  (count :connecting ups :key #'%upstream-state-word)
+                  (count :standby ups :key #'%upstream-state-word)))
         ;; failures grouped by (stage, hint): the cause, and how many upstreams share it
+        (when (getf d :served)
+          (format out "  answer time as tonlib sees it, retries included (n avg/max s, >8s): ~{~A~^  ~}~%"
+                  (loop for (m n avg mx slow) in (sort (copy-list (getf d :served)) #'> :key #'second)
+                        collect (format nil "~A ~D ~,1F/~,1F~@[ slow ~D~]" m n avg mx (and (plusp slow) slow)))))
+        (let ((sv (getf d :server)))
+          (when sv
+            (format out "  tonlib connections: ~D opened, ~D closed, ~D open; answers undeliverable because the client was already gone: ~D~%"
+                    (getf sv :handshakes) (getf sv :closed-count) (getf sv :connections) (getf sv :late-answers))
+            (dolist (c (subseq (getf sv :closed-conns) 0 (min 5 (length (getf sv :closed-conns)))))
+              (format out "    closed ~A after ~Ds: ~D queries, ~D answered, ~D late, ~D in flight, slowest ~,1Fs -- ~A~%"
+                      (%utc-hms (getf c :closed)) (- (getf c :closed) (getf c :opened))
+                      (getf c :queries) (getf c :answered) (getf c :late) (getf c :in-flight-at-close)
+                      (getf c :slowest) (getf c :reason)))))
         (when (getf d :methods)
           (format out "  queries by method (ok/failed): ~{~A~^  ~}~%"
                   (loop for (m ok bad) in (getf d :methods)
@@ -1094,6 +1389,11 @@ upstream's counters and recent event lines."
                     (getf u :name) (%upstream-state-word u) (getf u :stage) (getf u :connects)
                     (or (getf u :poll-state) "none") (getf u :poll-detail)
                     (and f (not (getf u :alive)) (third f)))
+            (let ((lat (getf u :latency)))
+              (when lat
+                (format out "    answer time: ~{~A~^  ~}~%"
+                        (loop for (m n avg mx) in (sort (copy-list lat) #'> :key #'second)
+                              collect (format nil "~A ~D ~,1F/~,1Fs" m n avg mx)))))
             (let ((bad (sort (remove :ok (copy-list (getf u :outcomes)) :key #'second)
                              #'> :key #'fourth)))
               (when bad
@@ -1146,14 +1446,18 @@ report -- stage, error and hint per upstream -- when it is not.  Never blocks th
 mainnet and testnet and lives in the masterchain.")
 
 (defun diagnose-proxy (global-config &key (timeout 25) db tonlib library-path (stream *standard-output*)
-                                       (sync-timeout 120) (account *diagnose-account*))
+                                       (sync-timeout 120) (sync-total-timeout 900) keystore
+                                       (account *diagnose-account*))
   "One-shot check of the NATIVE proxy against GLOBAL-CONFIG (a path): start it on a scratch
 database (or DB) and wait up to TIMEOUT seconds for an upstream to answer.  With TONLIB true,
 go on to what the bot really does: open a tonlib client THROUGH the proxy, run tonlib's full
 synchronisation (the block-proof chain from the config's init block; up to SYNC-TIMEOUT seconds
 per attempt, 8 attempts), time it, and read one account.  The report -- verdict, per-upstream
 state, queries by method and every upstream's failed queries -- is printed to STREAM and
-returned.  ACCOUNT (an address string) is the account read at the end.  Returns (VALUES OK-P
+returned.  The sync is patient (see TONLIB-SYNC): it keeps going while verified block proofs keep
+arriving, up to SYNC-TOTAL-TIMEOUT seconds, and prints its progress.  KEYSTORE, a directory, keeps
+tonlib's validated state between runs, so a second run after one slow first sync is quick.
+ACCOUNT (an address string) is the account read at the end.  Returns (VALUES OK-P
 REPORT-STRING); with TONLIB, OK-P needs the sync and the account read to succeed as well."
   (let* ((scratch (not db))
          (db (or db (format nil "~A/ton-trader-diagnose-~D-~D/"
@@ -1177,9 +1481,15 @@ REPORT-STRING); with TONLIB, OK-P needs the sync and the account read to succeed
                  (handler-case
                      (let ((t0 (get-internal-real-time)))
                        (setf tl (open-tonlib-via-proxy proxy global-config :library-path library-path
+                                                                             :keystore (ensure-keystore keystore)
                                                                              :sync nil))
-                       (say "tonlib: synchronising through the proxy (block proofs from the init block; can take a minute)...")
-                       (let ((seqno (tonlib-sync tl :timeout sync-timeout)))
+                       (say "tonlib: synchronising through the proxy (block proofs from the init block; minutes on a weak link, quick when the keystore already holds the state)...")
+                       (let ((seqno (tonlib-sync tl :timeout sync-timeout :total-timeout sync-total-timeout
+                                                    :progress (proxy-progress-function proxy)
+                                                    :on-attempt (lambda (n e gained now)
+                                                                  (declare (ignore e))
+                                                                  (say "tonlib: sync attempt ~D did not finish: ~D verified step~:P gained, ~D so far"
+                                                                       n gained now)))))
                          (push (format nil "tonlib sync through the proxy: masterchain seqno ~A in ~,1Fs"
                                        seqno (secs t0))
                                tonlib-lines))

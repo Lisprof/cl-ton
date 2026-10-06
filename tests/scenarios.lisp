@@ -711,3 +711,129 @@ captured piece of real DEX contract state.")
                (check "with the library published the same external executes: balance dropped"
                       (< (cl-ton::fakechain-account-balance fc (wallet-address w)) (nano 10))))
           (cl-ton::stop-fakechain fc)))))
+
+;;; --- a flaky, slow link between the proxy and the "liteserver" ---------------------------
+;;;
+;;; The public network is not the loopback.  A CHAOS RELAY sits between the proxy and the
+;;; fakechain: it delays every chunk by a random amount and, every DROP-EVERY chunks of answers,
+;;; resets the connection (a TCP session lost mid-query).  A real tonlib then synchronises and reads
+;;; accounts THROUGH the proxy and two such relays.  Nothing here uses the network.
+
+(defstruct (chaos-relay (:copier nil))
+  listener port (stop nil) (dropped 0) (chunks 0) (lock (sb-thread:make-mutex)) threads)
+
+(defun %relay-pump (relay from to drop-every jitter direction)
+  "Copy FROM -> TO chunk by chunk with a random delay; on the answer direction (:UP) reset both
+sockets every DROP-EVERY chunks."
+  (let ((buf (make-array 65536 :element-type '(unsigned-byte 8))))
+    (handler-case
+        (loop until (chaos-relay-stop relay)
+              do (multiple-value-bind (b len) (sb-bsd-sockets:socket-receive from buf nil)
+                   (declare (ignore b))
+                   (when (or (null len) (zerop len)) (return))
+                   (when (plusp jitter) (sleep (random (float jitter))))
+                   (let ((n (sb-thread:with-mutex ((chaos-relay-lock relay)) (incf (chaos-relay-chunks relay)))))
+                     (when (and (eq direction :up) drop-every (zerop (mod n drop-every)))
+                       (sb-thread:with-mutex ((chaos-relay-lock relay)) (incf (chaos-relay-dropped relay)))
+                       (return)))
+                   (cl-ton::adnl-socket-send-all to (subseq buf 0 len))))
+      (error () nil))
+    (ignore-errors (sb-bsd-sockets:socket-close from))
+    (ignore-errors (sb-bsd-sockets:socket-close to))))
+
+(defun start-chaos-relay (target-port &key (jitter 0.1) drop-every)
+  (let* ((lsock (make-instance 'sb-bsd-sockets:inet-socket :type :stream :protocol :tcp))
+         (relay (make-chaos-relay :listener lsock)))
+    (setf (sb-bsd-sockets:sockopt-reuse-address lsock) t)
+    (sb-bsd-sockets:socket-bind lsock (sb-bsd-sockets:make-inet-address "127.0.0.1") 0)
+    (sb-bsd-sockets:socket-listen lsock 16)
+    (setf (chaos-relay-port relay) (nth-value 1 (sb-bsd-sockets:socket-name lsock)))
+    (push (sb-thread:make-thread
+           (lambda ()
+             (handler-case
+                 (loop until (chaos-relay-stop relay)
+                       do (let* ((client (sb-bsd-sockets:socket-accept lsock))
+                                 (up (make-instance 'sb-bsd-sockets:inet-socket :type :stream :protocol :tcp)))
+                            (handler-case
+                                (progn
+                                  (sb-bsd-sockets:socket-connect up (sb-bsd-sockets:make-inet-address "127.0.0.1") target-port)
+                                  (push (sb-thread:make-thread
+                                         (lambda () (%relay-pump relay client up drop-every jitter :down))) (chaos-relay-threads relay))
+                                  (push (sb-thread:make-thread
+                                         (lambda () (%relay-pump relay up client drop-every jitter :up))) (chaos-relay-threads relay)))
+                              (error () (ignore-errors (sb-bsd-sockets:socket-close client))
+                                        (ignore-errors (sb-bsd-sockets:socket-close up))))))
+               (error () nil)))
+           :name "chaos relay accept")
+          (chaos-relay-threads relay))
+    relay))
+
+(defun stop-chaos-relay (relay)
+  (setf (chaos-relay-stop relay) t)
+  (ignore-errors (sb-bsd-sockets:socket-close (chaos-relay-listener relay)))
+  nil)
+
+(defun test-tonlib-through-flaky-links ()
+  (format t "tonlib -> NATIVE proxy -> two slow, flaky links -> fakechain~%")
+  (if (not (%libs-available-p))
+      (skip-missing "flaky-link resilience (tonlib/libemulator shared libraries)")
+      (let* ((fc (cl-ton::start-fakechain))
+             (dir (%tmpdir "chaos"))
+             (cfg (format nil "~Afc.json" dir))
+             (lib (%lib "tonlibjson-linux-x86_64.so"))
+             (r1 (start-chaos-relay (cl-ton::fakechain-port fc) :jitter 0.25 :drop-every 30))
+             (r2 (start-chaos-relay (cl-ton::fakechain-port fc) :jitter 0.25 :drop-every 45))
+             proxy tl)
+        (unwind-protect
+             (progn
+               (cl-ton::fakechain-advance fc 3)
+               (cl-ton::fakechain-write-global-config fc cfg)
+               ;; point the single liteserver entry at the two relays
+               (let* ((text (uiop:read-file-string cfg))
+                      (entry (cl-ton::fakechain-liteserver-entry fc))
+                      (e1 (%replace-port entry (cl-ton::fakechain-port fc) (chaos-relay-port r1)))
+                      (e2 (%replace-port entry (cl-ton::fakechain-port fc) (chaos-relay-port r2))))
+                 (with-open-file (o cfg :direction :output :if-exists :supersede)
+                   (write-string (%string-replace text entry (format nil "~A,~A" e1 e2)) o)))
+               (setf proxy (cl-ton::open-proxy-liteserver :implementation :native :global-config cfg
+                                                          :db (format nil "~Aproxy/" dir)))
+               (check "flaky links: both relayed upstreams come up"
+                      (cl-ton:proxy-wait-ready proxy :timeout (%scaled 20)))
+               (setf tl (cl-ton::open-tonlib-via-proxy proxy cfg :library-path lib :sync nil))
+               (let ((seqno (cl-ton:tonlib-sync tl :timeout (%scaled 60) :total-timeout (%scaled 120)
+                                                   :progress (cl-ton:proxy-progress-function proxy))))
+                 (check "flaky links: tonlib synchronises through them" (and seqno (>= seqno 3))))
+               (let ((ok 0) (bad 0)
+                     (addr (cl-ton:parse-address "0:1111111111111111111111111111111111111111111111111111111111111111")))
+                 (dotimes (i 25)
+                   (handler-case
+                       (progn (cl-ton::retrying (lambda () (cl-ton:tonlib-account-state tl addr))
+                                                :attempts 4 :delay 0.2)
+                              (incf ok))
+                     (error () (incf bad))))
+                 (check "flaky links: every one of 25 account reads succeeds (the app's retry included)"
+                        (and (= ok 25) (zerop bad))))
+               (let ((d (cl-ton:proxy-diagnostics proxy)))
+                 (check "flaky links: the relays really did reset connections mid-run"
+                        (plusp (+ (chaos-relay-dropped r1) (chaos-relay-dropped r2))))
+                 (check "flaky links: the proxy saw them (a lost session or a failover, then recovery)"
+                        (or (plusp (reduce #'+ (getf d :upstreams)
+                                           :key (lambda (u) (getf u :failures))))
+                            (plusp (or (cl-ton::proxy-stat-value (cl-ton::%native-of proxy) :failover) 0))))
+                 (check "flaky links: at the end the proxy still has a working upstream"
+                        (cl-ton:proxy-wait-ready proxy :timeout (%scaled 20)))
+                 (check "flaky links: the network summary has an opinion (answers were measured)"
+                        (multiple-value-bind (k) (cl-ton:proxy-network-summary proxy)
+                          (member k '(:fast :ok :slow :unknown))))))
+          (ignore-errors (when tl (cl-ton::close-tonlib tl)))
+          (ignore-errors (when proxy (cl-ton::close-proxy-liteserver proxy)))
+          (stop-chaos-relay r1) (stop-chaos-relay r2)
+          (cl-ton::stop-fakechain fc)
+          (ignore-errors (uiop:delete-directory-tree (pathname dir) :validate t :if-does-not-exist :ignore))))))
+
+(defun %string-replace (text old new)
+  (let ((i (search old text)))
+    (if i (concatenate 'string (subseq text 0 i) new (subseq text (+ i (length old)))) text)))
+
+(defun %replace-port (entry old-port new-port)
+  (%string-replace entry (format nil "\"port\":~D" old-port) (format nil "\"port\":~D" new-port)))

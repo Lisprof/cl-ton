@@ -102,7 +102,10 @@
    ;; proxy diagnostics (where does the native proxy stop?)
    :proxy-diagnostics :proxy-diagnostics-report :proxy-verdict :proxy-wait-ready :start-proxy-watch
    :diagnose-proxy :adnl-ext-client-status :adnl-failure-hint
-   :proxy-method-table :proxy-history-query-p :*proxy-max-attempts* :*proxy-attempt-timeout*
+   :adnl-ext-server-connection-stats :proxy-method-table :proxy-history-query-p :*proxy-max-attempts* :*proxy-hedge-delay* :*proxy-hedge-min* :*proxy-hedge-max*
+   :*proxy-failure-penalty-max* :proxy-hedge-delay :*proxy-max-active-upstreams*
+   :proxy-activate-standby :start-adnl-ext-client
+   :*tonlib-sync-retry-delay* :proxy-ok-count :proxy-progress-function :proxy-network-summary :derived-keystore
    :*proxy-failure-penalty* :*proxy-history-queries*
    :emulation-result-success-p :emulation-result-error :emulation-result-exit-code  
    :emulation-result-fees :emulation-result-vm-log :emulation-result-out-messages  

@@ -15,6 +15,18 @@
     (uiop:delete-directory-tree (pathname d) :validate t :if-does-not-exist :ignore)
     (ensure-directories-exist d) d))
 
+(defvar *slowness*
+  (let ((e (uiop:getenv "TON_TRADER_TEST_SLOWNESS")))
+    (or (and e (plusp (length e))
+             (let ((v (ignore-errors (let ((*read-eval* nil)) (read-from-string e)))))
+               (and (realp v) (>= v 1) v)))
+        1))
+  "Multiplier for the time bounds and waits of the timing-sensitive checks.  Set the environment
+variable TON_TRADER_TEST_SLOWNESS (say 3) on a slow machine or a loaded one: the suites then wait
+longer for things to happen and accept proportionally slower answers.  Nothing is skipped.")
+
+(defun %scaled (seconds) (* seconds *slowness*))
+
 (defun %write-global-config (path entries)
   "ENTRIES: list of (port pubkey-base64), all on 127.0.0.1."
   (with-open-file (s path :direction :output :if-exists :supersede)
@@ -38,7 +50,7 @@
     (error (e) (list :exception (type-of e)))))
 
 (defun %wait-ready (client &optional (seconds 8))
-  (loop repeat (* 10 seconds) until (cl-ton::adnl-ext-client-alive-p client) do (sleep 0.1))
+  (loop repeat (round (* 10 (%scaled seconds))) until (cl-ton::adnl-ext-client-alive-p client) do (sleep 0.1))
   (cl-ton::adnl-ext-client-alive-p client))
 
 (defun %client-for-proxy (proxy)
@@ -143,7 +155,7 @@
 (defun %diag-wait (proxy predicate &optional (seconds 12))
   "Poll PROXY-DIAGNOSTICS until PREDICATE (given the plist) is true; returns the last plist."
   (let ((d nil))
-    (loop repeat (* 10 seconds)
+    (loop repeat (round (* 10 (%scaled seconds)))
           do (setf d (cl-ton:proxy-diagnostics proxy))
              (when (funcall predicate d) (return))
              (sleep 0.1))
@@ -442,7 +454,7 @@ where CALLS-CELL is a cons whose car counts the non-poll queries received."
     (check "method table sums outcomes over upstreams, most failures first"
            (equal table '(("b" 1 3) ("a" 6 2)))))
 
-  (setf cl-ton:*proxy-attempt-timeout* 1)   ; global: the query threads do not see a LET binding
+  (setf cl-ton:*proxy-hedge-delay* 1)   ; global: the query threads do not see a LET binding
   (let* ((*print-pretty* nil)
          (dir (%tmpdir "retry")) (seq (list 50)))
     ;; --- one upstream stalls forever, the other is healthy
@@ -454,8 +466,9 @@ where CALLS-CELL is a cons whose car counts the non-poll queries received."
                                                   (cl-ton::base64-encode (keypair-public kp1)))
                                             (list (cl-ton::adnl-ext-server-port good)
                                                   (cl-ton::base64-encode (keypair-public kp2)))))
-            (let* ((np (open-proxy-liteserver :implementation :native :global-config cfg
-                                              :db (format nil "~Astall/" dir)))
+            (let* ((np (let ((cl-ton::*proxy-query-timeout* 4))
+                         (open-proxy-liteserver :implementation :native :global-config cfg
+                                                :db (format nil "~Astall/" dir))))
                    (c (%client-for-proxy np)))
               (unwind-protect
                    (progn
@@ -473,16 +486,19 @@ where CALLS-CELL is a cons whose car counts the non-poll queries received."
                        (let ((secs (/ (- (get-internal-real-time) t0) internal-time-units-per-second)))
                          (check "stall: every query is answered (the silent upstream is retried around)"
                                 (every (lambda (r) (eq (first r) :mc-info)) results))
-                         (check "stall: nobody waits the full 8 s query timeout per query (1 s attempt limit, penalty after the first)"
-                                (< secs 12))))
+                         (check "stall: nobody waits the query timeout: the hedge (1 s) asks the healthy upstream"
+                                (< secs (%scaled 25)))))
+                     ;; the stalled attempt is not cancelled: it ends at the query timeout (4 s) and is then counted
+                     (%diag-wait np (lambda (d) (declare (ignore d))
+                                      (plusp (%outcome-count np "getAccountState" :timeout))) 10)
                      (check "stall: the silent upstream's timeouts were counted by method"
                             (plusp (%outcome-count np "getAccountState" :timeout)))
                      (check "stall: the healthy upstream's answers were counted as ok"
                             (>= (%outcome-count np "getAccountState" :ok) 6))
-                     (check "stall: after a timeout the silent upstream is penalized, so later queries skip it"
+                     (check "stall: after a timeout the silent upstream is penalized (and its failure streak grows)"
                             (let ((u (find-if (lambda (u) (plusp (count :timeout (getf u :outcomes) :key #'second)))
                                               (getf (cl-ton:proxy-diagnostics np) :upstreams))))
-                              (and u (getf u :penalized))))
+                              (and u (getf u :penalized) (plusp (getf u :fail-streak)))))
                      (check "stall: the report shows the failed queries per upstream and per method"
                             (let ((r (cl-ton:proxy-diagnostics-report np)))
                               (and (search "query failures: getAccountState timeout" r)
@@ -580,7 +596,7 @@ where CALLS-CELL is a cons whose car counts the non-poll queries received."
                    (let* ((t0 (get-internal-real-time))
                           (r (%ask-raw c (%account-query) 10))
                           (secs (/ (- (get-internal-real-time) t0) internal-time-units-per-second)))
-                     (check "single upstream: a silent upstream gets the FULL query timeout, not the attempt limit"
+                     (check "single upstream: a silent upstream gets the FULL query timeout (no hedging with one upstream)"
                             (>= secs 1.8))
                      (check "single upstream: answered with the released binary's 652 text"
                             (equal r '(:error 652 "Gateway error: timeout for adnl query q")))
@@ -589,4 +605,392 @@ where CALLS-CELL is a cons whose car counts the non-poll queries received."
               (cl-ton::close-adnl-ext-client c)
               (close-proxy-liteserver np)
               (cl-ton::stop-adnl-ext-server only)))))))
-  (setf cl-ton:*proxy-attempt-timeout* 3))
+  (setf cl-ton:*proxy-hedge-delay* 2))
+
+;;; --- diagnostics: tonlib's connections to the proxy, answer times --------------------
+
+(defun %server-plist (np) (getf (cl-ton:proxy-diagnostics np) :server))
+
+(defun test-proxy-connection-stats ()
+  (format t "native proxy: inbound connection lifecycle and answer-time diagnostics~%")
+  (let* ((*print-pretty* nil) (dir (%tmpdir "connstats")) (seq (list 9)))
+    (multiple-value-bind (up kp) (%scripted-upstream
+                                  (lambda (n) (if (string= n "getBlockProof") '(:stall 2) :ok)) seq)
+      (let ((cfg (format nil "~Aconn.json" dir)))
+        (%write-global-config cfg (list (list (cl-ton::adnl-ext-server-port up)
+                                              (cl-ton::base64-encode (keypair-public kp)))))
+        (let ((np (open-proxy-liteserver :implementation :native :global-config cfg
+                                         :db (format nil "~Aconn/" dir))))
+          (unwind-protect
+               (progn
+                 (cl-ton:proxy-wait-ready np :timeout 10)
+                 ;; 1. an orderly client: three queries, then it hangs up
+                 (let ((c (%client-for-proxy np)))
+                   (%wait-ready c)
+                   (dotimes (i 3) (%ask-raw c (%account-query)))
+                   (check "conn stats: the live connection is listed with its query count"
+                          (let ((live (getf (getf (%diag-wait
+                                                   np (lambda (d) (let ((l (getf (getf d :server) :live-conns)))
+                                                                    (and l (= 3 (getf (first l) :answered)))))
+                                                   4)
+                                                  :server)
+                                            :live-conns)))
+                            (and (= 1 (length live)) (= 3 (getf (first live) :queries))
+                                 (= 3 (getf (first live) :answered)))))
+                   (cl-ton::close-adnl-ext-client c))
+                 (let ((d (%diag-wait np (lambda (d) (plusp (getf (getf d :server) :closed-count))) 6)))
+                   (let ((c1 (first (getf (getf d :server) :closed-conns))))
+                     (check "conn stats: the hang-up is recorded: 3 queries, 3 answered, none late"
+                            (and c1 (= 3 (getf c1 :queries)) (= 3 (getf c1 :answered))
+                                 (zerop (getf c1 :late)) (getf c1 :closed) (stringp (getf c1 :reason))))))
+                 ;; 2. an impatient client: asks a slow query (2 s upstream), gives up after 0.5 s
+                 (let ((c (%client-for-proxy np)))
+                   (%wait-ready c)
+                   (let ((th (sb-thread:make-thread
+                              (lambda () (%ask-raw c (%proof-query) 0.5)))))
+                     (sb-thread:join-thread th :timeout 5 :default nil)
+                     (cl-ton::close-adnl-ext-client c)))
+                 (let ((d (%diag-wait np (lambda (d) (plusp (getf (getf d :server) :late-answers))) 8)))
+                   (check "conn stats: an answer that finished after the client left is counted as late"
+                          (= 1 (getf (getf d :server) :late-answers)))
+                   (let ((c2 (first (getf (getf d :server) :closed-conns))))
+                     (check "conn stats: that connection shows 1 query, 0 answered, 1 late"
+                            (and c2 (= 1 (getf c2 :queries)) (zerop (getf c2 :answered)) (= 1 (getf c2 :late))))
+                     (check "conn stats: ...and it had 1 query in flight when the client left"
+                            (and c2 (= 1 (getf c2 :in-flight-at-close))))))
+                 ;; 3. answer times: the stalled getBlockProof shows as slow, per upstream and as served
+                 (let* ((d (cl-ton:proxy-diagnostics np))
+                        (served (assoc "getBlockProof" (getf d :served) :test #'string=))
+                        (u (first (getf d :upstreams)))
+                        (lat (assoc "getBlockProof" (getf u :latency) :test #'string=)))
+                   (check "latency: the proxy's served time for getBlockProof reflects the 2 s upstream"
+                          (and served (>= (fourth served) 1.8)))
+                   (check "latency: the upstream's own answer time is recorded too"
+                          (and lat (>= (fourth lat) 1.8)))
+                   (check "latency: account queries (instant) are fast"
+                          (let ((a (assoc "getAccountState" (getf d :served) :test #'string=)))
+                            (and a (< (third a) 1.0)))))
+                 (let ((r (cl-ton:proxy-diagnostics-report np)))
+                   (flet ((has (x) (or (search x r) (progn (format t "    (report lacks: ~A)~%~A~%" x r) nil))))
+                     (check "report: shows tonlib connections, closed ones with their reason, and answer times"
+                            (and (has "tonlib connections: 2 opened, 2 closed")
+                                 (has "answers undeliverable because the client was already gone: 1")
+                                 (has "answer time as tonlib sees it")
+                                 (has "1 late, 1 in flight")
+                                 (has "    answer time: ")
+                                 (has "getBlockProof 1 2."))))))
+            (close-proxy-liteserver np)
+            (cl-ton::stop-adnl-ext-server up)))))))
+
+;;; --- hedging, adaptive delay, escalating penalty, preference for fast upstreams, standby ---
+
+(defun %cfg-for (dir name &rest servers)
+  "Write a global config for the (SERVER . KEYPAIR) pairs in SERVERS; returns its path."
+  (let ((cfg (format nil "~A~A.json" dir name)))
+    (%write-global-config cfg (loop for (srv . kp) in servers
+                                    collect (list (cl-ton::adnl-ext-server-port srv)
+                                                  (cl-ton::base64-encode (keypair-public kp)))))
+    cfg))
+
+(defun %scripted (behaviour seqno)
+  "(SERVER KEYPAIR CALLS) from %SCRIPTED-UPSTREAM as a list, so the caller can destructure it."
+  (multiple-value-list (%scripted-upstream behaviour seqno)))
+
+(defun test-proxy-hedging ()
+  (format t "native proxy: hedged requests, adaptive delay, penalties, speed preference, standby~%")
+  ;; --- pure: the adaptive hedge delay
+  (let ((p (cl-ton::%make-lisp-proxy :keypair nil :db nil))
+        (q (cl-ton::proxy-query-info (cl-ton::tl-make "liteServer.getBlockProof" :mode 1
+                                                      :known-block (cl-ton::tl-block-id-ext))))
+        (cl-ton:*proxy-hedge-delay* 2))
+    (check "hedge delay: before enough samples it is the configured initial delay"
+           (= 2 (cl-ton:proxy-hedge-delay p q nil)))
+    (setf (gethash "getBlockProof" (cl-ton::lisp-proxy-method-latency p)) (cons 5 2.0))
+    (check "hedge delay: follows the measured answer time (0.3 + 1.5 x 2.0 s)"
+           (< (abs (- 3.3 (cl-ton:proxy-hedge-delay p q nil))) 1e-6))
+    (setf (gethash "getBlockProof" (cl-ton::lisp-proxy-method-latency p)) (cons 5 0.05))
+    (check "hedge delay: a fast network hedges early, but not below the minimum"
+           (= cl-ton:*proxy-hedge-min* (cl-ton:proxy-hedge-delay p q nil)))
+    (setf (gethash "getBlockProof" (cl-ton::lisp-proxy-method-latency p)) (cons 5 30.0))
+    (check "hedge delay: a very slow network is capped at the maximum"
+           (= cl-ton:*proxy-hedge-max* (cl-ton:proxy-hedge-delay p q nil)))
+    (check "hedge delay: a wait request is never raced"
+           (null (cl-ton:proxy-hedge-delay p q (cl-ton::tl-make "liteServer.waitMasterchainSeqno"
+                                                               :seqno 1 :timeout-ms 1000)))))
+  ;; --- pure: escalating penalty
+  (let* ((p (cl-ton::%make-lisp-proxy :keypair nil :db nil))
+         (up (cl-ton::make-proxy-upstream :name "x"))
+         (q (cl-ton::proxy-query-info (cl-ton::tl-make "liteServer.getMasterchainInfo")))
+         (itu internal-time-units-per-second))
+    (flet ((penalty-secs () (round (/ (- (cl-ton::proxy-upstream-penalty-until up) (get-internal-real-time)) itu))))
+      (cl-ton::proxy-note-failure p up)
+      (let ((a (penalty-secs)))
+        (cl-ton::proxy-note-failure p up)
+        (let ((b (penalty-secs)))
+          (cl-ton::proxy-note-failure p up)
+          (let ((c (penalty-secs)))
+            (check "penalty: doubles with every consecutive failure (10, 20, 40 s)"
+                   (and (<= 9 a 10) (<= 19 b 20) (<= 39 c 40)))
+            (dotimes (i 10) (cl-ton::proxy-note-failure p up))
+            (check "penalty: capped (at 120 s)" (<= (penalty-secs) 120))
+            (check "penalty: the failure streak is counted"
+                   (= 13 (cl-ton::proxy-upstream-fail-streak up)))
+            (cl-ton::proxy-note-success p up q 0.1)
+            (check "penalty: an answer clears the streak and the penalty"
+                   (and (zerop (cl-ton::proxy-upstream-fail-streak up))
+                        (not (cl-ton::proxy-upstream-penalized-p up))))))))
+    ;; weights
+    (let ((fast (cl-ton::make-proxy-upstream :name "f" :slowness 0.25))
+          (slow (cl-ton::make-proxy-upstream :name "s" :slowness 2.0))
+          (flaky (cl-ton::make-proxy-upstream :name "k" :slowness 1.0 :fail-streak 3)))
+      (check "weight: a fast upstream outweighs a slow one by a wide margin"
+             (> (cl-ton::proxy-upstream-weight fast) (* 10 (cl-ton::proxy-upstream-weight slow))))
+      (check "weight: recent failures lower it, but never to zero"
+             (and (< (cl-ton::proxy-upstream-weight flaky) 0.5) (plusp (cl-ton::proxy-upstream-weight flaky))))))
+
+  (let* ((*print-pretty* nil) (dir (%tmpdir "hedge")) (seq (list 30)))
+    ;; --- both upstreams slow but VALID: nothing is killed, nothing fails
+    (destructuring-bind (a kpa ca) (%scripted (lambda (n) (declare (ignore n)) '(:stall 2.5)) seq)
+      (declare (ignore ca))
+      (destructuring-bind (b kpb cb) (%scripted (lambda (n) (declare (ignore n)) '(:stall 2.5)) seq)
+        (declare (ignore cb))
+        (setf cl-ton:*proxy-hedge-delay* 1)
+        (let* ((cfg (%cfg-for dir "slowboth" (cons a kpa) (cons b kpb)))
+               (np (open-proxy-liteserver :implementation :native :global-config cfg
+                                          :db (format nil "~Aslowboth/" dir)))
+               (c (%client-for-proxy np)))
+          (unwind-protect
+               (progn
+                 (%wait-ready c) (cl-ton:proxy-wait-ready np :timeout 10)
+                 (let* ((t0 (get-internal-real-time))
+                        (rs (loop repeat 4 collect (%ask-raw c (%proof-query) 12)))
+                        (secs (/ (- (get-internal-real-time) t0) internal-time-units-per-second)))
+                   (check "slow but valid: every query gets its answer"
+                          (every (lambda (r) (eq (first r) :mc-info)) rs))
+                   (check "slow but valid: no answer was turned into a timeout"
+                          (zerop (%outcome-count np "getBlockProof" :timeout)))
+                   (check "slow but valid: ~2.5 s per query, not a multiple of it"
+                          (< secs (%scaled 16)))))
+            (cl-ton::close-adnl-ext-client c) (close-proxy-liteserver np)
+            (cl-ton::stop-adnl-ext-server a) (cl-ton::stop-adnl-ext-server b)))))
+
+    ;; --- the hedge: one upstream silent, one fine -> answered after about the hedge delay
+    (destructuring-bind (dead kpd cd) (%scripted (lambda (n) (declare (ignore n)) '(:stall 30)) seq)
+      (declare (ignore cd))
+      (destructuring-bind (ok kpo co) (%scripted (lambda (n) (declare (ignore n)) :ok) seq)
+        (declare (ignore co))
+        (setf cl-ton:*proxy-hedge-delay* 1)
+        (let* ((cfg (%cfg-for dir "hedge" (cons dead kpd) (cons ok kpo)))
+               (np (let ((cl-ton::*proxy-query-timeout* 6))
+                     (open-proxy-liteserver :implementation :native :global-config cfg
+                                            :db (format nil "~Ahedge/" dir))))
+               (c (%client-for-proxy np)))
+          (unwind-protect
+               (progn
+                 (%wait-ready c) (cl-ton:proxy-wait-ready np :timeout 10)
+                 (let ((slowest 0))
+                   ;; keep asking until the silent upstream was picked first at least once (a hedge)
+                   (loop repeat 60
+                         do (let ((t0 (get-internal-real-time)))
+                              (%ask-raw c (%account-query) 10)
+                              (setf slowest (max slowest (/ (- (get-internal-real-time) t0)
+                                                            internal-time-units-per-second))))
+                         until (plusp (or (cl-ton::proxy-stat-value (cl-ton::%native-of np) :hedge) 0)))
+                   (check "hedge: a query that went to the silent upstream first was hedged"
+                          (plusp (or (cl-ton::proxy-stat-value (cl-ton::%native-of np) :hedge) 0)))
+                   (check "hedge: ... and was still answered within the hedge delay + margin, not the timeout"
+                          (< slowest (%scaled 3.5)))))
+            (cl-ton::close-adnl-ext-client c) (close-proxy-liteserver np)
+            (cl-ton::stop-adnl-ext-server dead) (cl-ton::stop-adnl-ext-server ok)))))
+
+    ;; --- speed preference: a fast and a slow (0.6 s) upstream, answers always valid
+    (destructuring-bind (fast kpf cf) (%scripted (lambda (n) (declare (ignore n)) :ok) seq)
+      (destructuring-bind (slow kps cs) (%scripted (lambda (n) (declare (ignore n)) '(:stall 0.6)) seq)
+        (setf cl-ton:*proxy-hedge-delay* 5)   ; no hedging here: we measure the choice, not the race
+        (let* ((cfg (%cfg-for dir "speed" (cons fast kpf) (cons slow kps)))
+               (np (open-proxy-liteserver :implementation :native :global-config cfg
+                                          :db (format nil "~Aspeed/" dir)))
+               (c (%client-for-proxy np)))
+          (unwind-protect
+               (progn
+                 (%wait-ready c) (cl-ton:proxy-wait-ready np :timeout 10)
+                 (dotimes (i 14) (%ask-raw c (%account-query) 10))   ; learn who is fast
+                 (let ((f0 (car cf)) (s0 (car cs)))
+                   (dotimes (i 24) (%ask-raw c (%account-query) 10))
+                   (let ((f (- (car cf) f0)) (s (- (car cs) s0)))
+                     (check "speed preference: after learning, the fast upstream gets most queries"
+                            (> f (* 2 s))))))
+            (cl-ton::close-adnl-ext-client c) (close-proxy-liteserver np)
+            (cl-ton::stop-adnl-ext-server fast) (cl-ton::stop-adnl-ext-server slow)))))
+    (setf cl-ton:*proxy-hedge-delay* 2)
+
+    ;; --- standby sessions
+    (let* ((servers (loop repeat 6 collect (%scripted (lambda (n) (declare (ignore n)) :ok) seq)))
+           (cfg (apply #'%cfg-for dir "standby" (mapcar (lambda (s) (cons (first s) (second s))) servers)))
+           (np (let ((cl-ton:*proxy-max-active-upstreams* 2))
+                 (open-proxy-liteserver :implementation :native :global-config cfg
+                                        :db (format nil "~Astandby/" dir))))
+           (c (%client-for-proxy np)))
+      (unwind-protect
+           (progn
+             (%wait-ready c)
+             (cl-ton:proxy-wait-ready np :timeout 10)
+             (let* ((d (cl-ton:proxy-diagnostics np)) (ups (getf d :upstreams)))
+               (check "standby: only MAX-ACTIVE sessions are open, the rest stand by"
+                      (and (= 2 (count-if-not (lambda (u) (getf u :standby)) ups))
+                           (= 4 (count-if (lambda (u) (getf u :standby)) ups))))
+               (check "standby: the report counts them"
+                      (search "standby 4" (cl-ton:proxy-diagnostics-report np)))
+               (check "standby: the verdict looks at the active ones only"
+                      (eq :ok (getf d :verdict)))
+               (check "standby: queries are answered by the active ones"
+                      (eq :mc-info (first (%ask-raw c (%account-query) 8)))))
+             (flet ((active-servers ()
+                      (let ((names (mapcar (lambda (u) (getf u :name))
+                                           (remove-if (lambda (u) (getf u :standby))
+                                                      (getf (cl-ton:proxy-diagnostics np) :upstreams)))))
+                        (remove-if-not (lambda (s) (member (format nil "127.0.0.1:~D" (cl-ton::adnl-ext-server-port (first s)))
+                                                           names :test #'string=))
+                                       servers)))
+                    (alive-active ()
+                      (count-if (lambda (u) (and (getf u :alive) (not (getf u :standby))))
+                                (getf (cl-ton:proxy-diagnostics np) :upstreams))))
+               ;; one active upstream's server stops: the supervisor opens a standby in its place
+               (let ((act (active-servers)))
+                 (check "standby: (setup) two servers are the active ones" (= 2 (length act)))
+                 (cl-ton::stop-adnl-ext-server (first (first act)))
+                 (%diag-wait np (lambda (d) (declare (ignore d)) (and (= 3 (length (active-servers))) (>= (alive-active) 2))) 20)
+                 (check "standby: when an active session dies a standby is opened in its place"
+                        (and (= 3 (length (active-servers))) (>= (alive-active) 2))))
+               ;; every active server stops at once: the next query wakes the standbys itself
+               (dolist (s (active-servers)) (ignore-errors (cl-ton::stop-adnl-ext-server (first s))))
+               (sleep 1.5)
+               (check "standby: with every active session gone a query is still answered, by a standby"
+                      (eq :mc-info (first (%ask-raw c (%account-query) 12))))))
+        (cl-ton::close-adnl-ext-client c) (close-proxy-liteserver np)
+        (dolist (s servers) (ignore-errors (cl-ton::stop-adnl-ext-server (first s))))))))
+
+
+;;; --- weak-network resilience: patient sync, keystores, network summary, naming ------------
+
+(defmacro %with-fake-sync ((script) &body body)
+  "Run BODY with TONLIB-CALL replaced by (funcall SCRIPT): the sync request answers {\"seqno\":42}
+or signals whatever SCRIPT signals."
+  `(progn
+     (sb-int:encapsulate 'cl-ton::tonlib-call 'fake-sync
+                         (lambda (f &rest args) (declare (ignore f args)) (funcall ,script)))
+     (unwind-protect (progn ,@body)
+       (sb-int:unencapsulate 'cl-ton::tonlib-call 'fake-sync))))
+
+(defun %lite-timeout () (make-condition 'cl-ton::tonlib-error :code 500 :message "LITE_SERVER_TIMEOUT: x"))
+
+(defun test-patient-sync ()
+  (format t "tonlib sync: patient while verified steps keep arriving~%")
+  (let ((cl-ton:*tonlib-sync-retry-delay* 0.01))
+    ;; progress grows with every failed attempt: far more attempts than the old fixed 8
+    (let ((calls 0) (progress 0) (log '()))
+      (%with-fake-sync ((lambda ()
+                          (incf calls)
+                          (if (< calls 12)
+                              (progn (incf progress 10) (error (%lite-timeout)))
+                              (cl-ton::json-decode "{\"seqno\":42}"))))
+        (let ((r (cl-ton:tonlib-sync nil :progress (lambda () progress)
+                                         :on-attempt (lambda (n e gained now) (declare (ignore e))
+                                                       (push (list n gained now) log)))))
+          (check "patient: 11 failed attempts that each verified steps, then success" (and (eql r 42) (= calls 12)))
+          (check "patient: ON-ATTEMPT saw the steps gained each time"
+                 (and (= 11 (length log)) (every (lambda (l) (= 10 (second l))) log))))))
+    ;; no progress at all: gives up after 3 stalled attempts
+    (let ((calls 0))
+      (%with-fake-sync ((lambda () (incf calls) (error (%lite-timeout))))
+        (check "patient: with no verified progress it stops after 3 attempts in a row"
+               (and (handler-case (progn (cl-ton:tonlib-sync nil :progress (lambda () 0)) nil)
+                      (cl-ton::tonlib-error () t))
+                    (= calls 3)))))
+    ;; progress then stall: the stall counter restarts when progress resumes
+    (let ((calls 0) (progress 0))
+      (%with-fake-sync ((lambda ()
+                          (incf calls)
+                          (cond ((member calls '(1 4)) (incf progress 5) (error (%lite-timeout)))
+                                ((< calls 7) (error (%lite-timeout)))
+                                (t (cl-ton::json-decode "{\"seqno\":7}")))))
+        (check "patient: two stalled attempts, then progress, then two more stalled: still within the limit"
+               (eql 7 (cl-ton:tonlib-sync nil :progress (lambda () progress))))))
+    ;; an error retrying cannot help
+    (let ((calls 0) (progress 0))
+      (%with-fake-sync ((lambda () (incf calls) (incf progress)
+                          (error 'cl-ton::tonlib-error :code 400 :message "bad request")))
+        (check "patient: a non-retryable error is raised at once, however much progress there is"
+               (and (handler-case (progn (cl-ton:tonlib-sync nil :progress (lambda () progress)) nil)
+                      (cl-ton::tonlib-error () t))
+                    (= calls 1)))))
+    ;; total timeout
+    (let ((calls 0) (progress 0))
+      (%with-fake-sync ((lambda () (incf calls) (incf progress) (error (%lite-timeout))))
+        (check "patient: the total timeout ends it even while progress continues"
+               (and (handler-case (progn (cl-ton:tonlib-sync nil :progress (lambda () progress) :total-timeout -1) nil)
+                      (cl-ton::tonlib-error () t))
+                    (= calls 1)))))
+    ;; without PROGRESS: the old fixed number of attempts
+    (let ((calls 0))
+      (%with-fake-sync ((lambda () (incf calls) (error (%lite-timeout))))
+        (check "no progress function: exactly ATTEMPTS tries, as before"
+               (and (handler-case (progn (cl-ton:tonlib-sync nil :attempts 2) nil)
+                      (cl-ton::tonlib-error () t))
+                    (= calls 2)))))))
+
+(defun test-keystores ()
+  (format t "tonlib keystores: private directories, one per client~%")
+  (let* ((dir (%tmpdir "keystore")) (main (format nil "~Amain/" dir)))
+    (let ((path (cl-ton:ensure-keystore main)))
+      (check "keystore: created and returned as a namestring" (and (stringp path) (probe-file path)))
+      (check "keystore: owner-only (mode 700)"
+             (= #o700 (logand #o777 (sb-posix:stat-mode (sb-posix:stat (string-right-trim "/" path)))))))
+    (let ((a (cl-ton:derived-keystore main "head-poller"))
+          (b (cl-ton:derived-keystore main "scanner")))
+      (check "derived keystore: one directory per client, under the main one"
+             (and (search "main/head-poller/" a) (search "main/scanner/" b) (not (string= a b))
+                  (probe-file a) (probe-file b)))
+      (check "derived keystore: owner-only as well"
+             (= #o700 (logand #o777 (sb-posix:stat-mode (sb-posix:stat (string-right-trim "/" a)))))))
+    (check "keystore: :in-memory and NIL stay in memory"
+           (and (eq :in-memory (cl-ton:ensure-keystore nil)) (eq :in-memory (cl-ton:ensure-keystore :in-memory))
+                (eq :in-memory (cl-ton:derived-keystore nil "x")) (eq :in-memory (cl-ton:derived-keystore :in-memory "x"))))))
+
+(defun %summary-proxy (n total max ok failed)
+  "A bare proxy whose served table and one upstream's outcomes say: N getBlockProof answers taking
+TOTAL seconds in all, the slowest MAX, and OK / FAILED upstream attempts."
+  (let* ((p (cl-ton::%make-lisp-proxy :keypair nil :db nil))
+         (client (cl-ton::open-adnl-ext-client "127.0.0.1" 1 (make-array 32 :element-type '(unsigned-byte 8)
+                                                                          :initial-element 0)
+                                               :start nil))
+         (up (cl-ton::make-proxy-upstream :name "u" :client client)))
+    (setf (cl-ton::lisp-proxy-upstreams p) (list up))
+    (setf (gethash "getBlockProof" (cl-ton::lisp-proxy-served p)) (list n total max 0))
+    (setf (gethash '("getBlockProof" :ok nil) (cl-ton::proxy-upstream-outcomes up)) ok)
+    (when (plusp failed) (setf (gethash '("getBlockProof" :timeout nil) (cl-ton::proxy-upstream-outcomes up)) failed))
+    p))
+
+(defun test-network-summary ()
+  (format t "network summary: fast / ok / slow / unknown~%")
+  (check "summary: too few queries -> :unknown"
+         (eq :unknown (cl-ton:proxy-network-summary (%summary-proxy 3 3.0 1.0 3 0))))
+  (check "summary: quick answers, no failures -> :fast"
+         (eq :fast (cl-ton:proxy-network-summary (%summary-proxy 100 10.0 0.4 100 0))))
+  (check "summary: middling -> :ok"
+         (eq :ok (cl-ton:proxy-network-summary (%summary-proxy 100 100.0 2.0 98 2))))
+  (multiple-value-bind (k text) (cl-ton:proxy-network-summary (%summary-proxy 100 300.0 9.0 90 10))
+    (check "summary: 3 s per answer -> :slow, and the text says what it means for the first sync"
+           (and (eq k :slow) (search "slow network" text) (search "keystore" text))))
+  (check "summary: many failed attempts -> :slow even when answers are quick"
+         (eq :slow (cl-ton:proxy-network-summary (%summary-proxy 100 20.0 1.0 60 40))))
+  (check "summary: it is part of the report"
+         (search "slow network" (cl-ton:proxy-diagnostics-report (%summary-proxy 100 300.0 9.0 90 10)))))
+
+(defun test-unknown-query-naming ()
+  (format t "proxy: queries the schema does not know are named by constructor~%")
+  (let* ((octets (coerce '(#xBD #x93 #x76 #xD9 1 2 3) '(simple-array (unsigned-byte 8) (*))))
+         (fn (cl-ton::%decode-function octets)))
+    (check "unknown query: decoded to (constructor . octets)" (and (consp fn) (= #xD97693BD (car fn))))
+    (check "unknown query: named unknown-<constructor id> in the statistics"
+           (string= "unknown-D97693BD" (cl-ton::qinfo-name (cl-ton::proxy-query-info fn))))))

@@ -280,7 +280,7 @@ when the connection should be torn down."
 
 (defun open-adnl-ext-client (host port server-public &key name on-ready on-not-ready
                                                         (ping-interval 10) (silence-limit 35)
-                                                        (reconnect-delay 1) log)
+                                                        (reconnect-delay 1) log (start t))
   "Start a client thread for the liteserver at HOST:PORT whose ed25519 public key
 is SERVER-PUBLIC (32 octets).  Returns at once; the thread connects (and
 reconnects) in the background.  ON-READY / ON-NOT-READY are called with the
@@ -292,10 +292,17 @@ client on each transition."
                                        :ping-interval ping-interval :silence-limit silence-limit
                                        :reconnect-delay reconnect-delay
                                        :log-fn (or log *adnl-log-function*))))
+    (when start (start-adnl-ext-client client))
+    client))
+
+(defun start-adnl-ext-client (client)
+  "Start CLIENT's connection thread (a no-op when it is running).  OPEN-ADNL-EXT-CLIENT does this
+itself unless called with :START NIL, which leaves the client idle -- a STANDBY session."
+  (unless (or (adnl-ext-client-thread client) (adnl-ext-client-stop-p client))
     (setf (adnl-ext-client-thread client)
           (sb-thread:make-thread (lambda () (%client-loop client))
-                                 :name (format nil "adnl-ext-client ~A" (adnl-ext-client-name client))))
-    client))
+                                 :name (format nil "adnl-ext-client ~A" (adnl-ext-client-name client)))))
+  client)
 
 (defun close-adnl-ext-client (client)
   (when client

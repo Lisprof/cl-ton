@@ -226,7 +226,7 @@ The old one-second receive timeout was polling cadence, not a latency floor."
     (let ((s (make-string (file-length in))))
       (subseq s 0 (read-sequence s in)))))
 
-(defun initialize-tonlib-client (config keystore sync sync-timeout sync-attempts)
+(defun initialize-tonlib-client (config keystore sync sync-timeout sync-attempts &optional sync-progress)
   (let ((tl (create-tonlib-client)))
     (handler-case
         (progn
@@ -244,34 +244,85 @@ The old one-second receive timeout was polling cadence, not a latency floor."
                                                        (list :|@type| "keyStoreTypeDirectory"
                                                              :|directory| keystore)))))
           (when sync
-            (tonlib-sync tl :attempts sync-attempts :timeout sync-timeout))
+            (tonlib-sync tl :attempts sync-attempts :timeout sync-timeout :progress sync-progress))
           tl)
       (error (e)
         (close-tonlib tl)
         (error e)))))
 
 (defun ensure-keystore (dir)
-  "tonlib needs an existing directory; returns its namestring (or :in-memory)."
+  "tonlib needs an existing directory; returns its namestring (or :in-memory).  The directory is
+made private to the owner (mode 700): it holds tonlib's validated sync state, which tonlib trusts
+when it reads it back."
   (if (or (null dir) (eq dir :in-memory))
       :in-memory
-      (namestring (ensure-directories-exist (uiop:ensure-directory-pathname dir)))))
+      (let ((path (ensure-directories-exist (uiop:ensure-directory-pathname dir))))
+        (ignore-errors (sb-posix:chmod (string-right-trim "/" (namestring path)) #o700))
+        (namestring path))))
 
-(defun open-tonlib (config-path &key library-path (verbosity 0) (keystore :in-memory) (sync t))
+(defun derived-keystore (dir name)
+  "The keystore directory of the tonlib client called NAME, kept under the main keystore DIR
+(each client needs a directory of its own).  :IN-MEMORY when DIR is."
+  (if (or (null dir) (eq dir :in-memory))
+      :in-memory
+      (ensure-keystore (merge-pathnames (format nil "~A/" name) (uiop:ensure-directory-pathname dir)))))
+
+(defun open-tonlib (config-path &key library-path (verbosity 0) (keystore :in-memory) (sync t) sync-progress)
   "Create and initialise a tonlib client from a global config file (normally
 the single-entry config the liteserver-proxy writes; see
 EFFECTIVE-GLOBAL-CONFIG in bot.lisp). With SYNC (default) the client is
 synchronised to the latest masterchain block before returning, so later
-queries are fast and not racing the liteserver handshake."
+queries are fast and not racing the liteserver handshake.  SYNC-PROGRESS, a function returning
+a count that grows as verified work is done (the proxy's answered block-proof queries), makes
+that sync patient: see TONLIB-SYNC."
   (load-tonlib-library library-path)
   (%tl-set-verbosity verbosity)
-  (initialize-tonlib-client (read-global-config config-path) keystore sync 120.0d0 8))
+  (initialize-tonlib-client (read-global-config config-path) keystore sync 120.0d0 8 sync-progress))
 
-(defun tonlib-sync (tl &key (attempts 8) (timeout 120.0d0))
+(defparameter *tonlib-sync-retry-delay* 2
+  "Seconds between the attempts of a patient TONLIB-SYNC.")
+
+(defun %retryable-tonlib-error-p (e)
+  (typecase e
+    (tonlib-error (or (eql (tonlib-error-code e) 500)
+                      (search "LITE_SERVER" (tonlib-error-message e))))
+    (ton-error (search "timed out" (princ-to-string e)))))
+
+(defun tonlib-sync (tl &key (attempts 8) (timeout 120.0d0) progress (total-timeout 1800) (max-stalled 3)
+                         on-attempt)
   "Block until tonlib has the latest masterchain block; returns its seqno.
-Liteservers frequently time out during the first sync, so this retries."
-  (retrying (lambda ()
-              (json-get (tonlib-call tl (list :|@type| "sync") :timeout timeout) "seqno"))
-            :attempts attempts :delay 2.0))
+Liteservers frequently time out during the first sync, so this retries.
+
+The first sync of a fresh keystore walks a chain of block proofs from the config's init block, one
+verified step after another; over a weak link that takes minutes, and a failed attempt does not
+undo the steps already verified.  With PROGRESS (a function returning a number that grows with
+every verified step) the sync is therefore PATIENT: it keeps retrying as long as an attempt added
+progress, and gives up only after MAX-STALLED attempts in a row added none, after TOTAL-TIMEOUT
+seconds, or on an error that retrying cannot help.  ON-ATTEMPT is called after each failed
+attempt with (attempt-number error steps-gained progress-now).  Without PROGRESS it is simply
+ATTEMPTS tries, as before."
+  (if (null progress)
+      (retrying (lambda ()
+                  (json-get (tonlib-call tl (list :|@type| "sync") :timeout timeout) "seqno"))
+                :attempts attempts :delay 2.0)
+      (let ((deadline (+ (get-universal-time) total-timeout))
+            (last (funcall progress))
+            (stalled 0))
+        (loop for attempt from 1
+              do (handler-case
+                     (return (json-get (tonlib-call tl (list :|@type| "sync") :timeout timeout) "seqno"))
+                   ((or tonlib-error ton-error) (e)
+                     (let* ((now (funcall progress)) (gained (- now last)))
+                       (setf last now)
+                       (if (plusp gained) (setf stalled 0) (incf stalled))
+                       (when on-attempt (funcall on-attempt attempt e gained now))
+                       (warn-atomically "tonlib sync: ~A (attempt ~D, ~D verified step~:P gained, ~D in total)"
+                                        e attempt gained now)
+                       (when (or (not (%retryable-tonlib-error-p e))
+                                 (>= stalled max-stalled)
+                                 (> (get-universal-time) deadline))
+                         (error e))
+                       (sleep *tonlib-sync-retry-delay*))))))))
 
 (defun close-tonlib (tl)  
   (when (tonlib-alive-p tl)  
