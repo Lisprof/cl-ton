@@ -41,9 +41,6 @@ struct."))
 (defgeneric dex-swap-ton->usdt (dex &rest keys &key user amount min-out deadline query-id)
   (:documentation "A MESSAGE-SPEC swapping native TON for USDT on DEX."))
 
-(defgeneric dex-swap-usdt->ton (dex &rest keys &key user user-usdt-wallet amount min-out deadline query-id)
-  (:documentation "A MESSAGE-SPEC swapping USDT for native TON on DEX."))
-
 (defgeneric dex-swap-cycle (dex &rest keys)
   (:documentation "A single MESSAGE-SPEC executing a whole multi-hop cycle
 atomically on DEX, when DEX supports one; signals an error otherwise."))

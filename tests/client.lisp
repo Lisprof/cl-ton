@@ -382,7 +382,7 @@ loader's complaint once, when it dies on a missing shared library."
 deployed -- see cl-ton/src/files.lisp), then TON_PROXY_LITESERVER_BINARY
 for a manual override. NIL if neither resolves, in which case the
 proxy-liteserver cross-check below is skipped, not failed."
-  (let ((path (or (bundled-env-binary "proxy-liteserver")
+  (let ((path (or (cl-ton::bundled-env-binary "proxy-liteserver")
                   (let ((p (uiop:getenv "TON_PROXY_LITESERVER_BINARY")))
                     (and p (probe-file p) p)))))
     (and path (binary-runs-p path) path)))
@@ -402,28 +402,28 @@ mask a process that's still genuinely running after it."
 
 (defun test-bundled-env-binary ()
   (format t "bundled-env-binary (resolver)~%")
-  (clear-bundled-env-binary-cache)
+  (cl-ton::clear-bundled-env-binary-cache)
   (check "an unknown name resolves to NIL, never an error"
-         (null (bundled-env-binary "no-such-binary-xyzzy")))
+         (null (cl-ton::bundled-env-binary "no-such-binary-xyzzy")))
   (check "the negative result is cached (second call agrees)"
-         (null (bundled-env-binary "no-such-binary-xyzzy")))
-  (let ((p (bundled-env-binary "proxy-liteserver")))
+         (null (cl-ton::bundled-env-binary "no-such-binary-xyzzy")))
+  (let ((p (cl-ton::bundled-env-binary "proxy-liteserver")))
     (check "proxy-liteserver resolves from cl-ton/tests/ in a checkout"
            (and p (search "proxy-liteserver" (file-namestring p))))
     (check "resolution is cached and stable"
-           (equal p (bundled-env-binary "proxy-liteserver"))))
+           (equal p (cl-ton::bundled-env-binary "proxy-liteserver"))))
   (check "fift resolves from cl-ton/tests/ in a checkout"
-         (let ((p (bundled-env-binary "fift"))) (and p (search "fift" (file-namestring p)))))
+         (let ((p (cl-ton::bundled-env-binary "fift"))) (and p (search "fift" (file-namestring p)))))
   ;; In a DEPLOYED build (built by builder.lisp) the checkout no longer exists
   ;; for ASDF, so the only way these resolve is the <bin>/env/ branch.
   (when (and (find-package :deploy)
              (funcall (find-symbol "DEPLOYED-P" :deploy)))
     (let ((dir (namestring (funcall (find-symbol "RUNTIME-DIRECTORY" :deploy))))
-          (p (bundled-env-binary "proxy-liteserver")))
+          (p (cl-ton::bundled-env-binary "proxy-liteserver")))
       (check "deployed build: proxy-liteserver resolves from <bin>/env/ or beside the binary"
              (and p (uiop:string-prefix-p dir (namestring (truename p)))))
       (check "deployed build: fift resolves from <bin>/env/ or beside the binary"
-             (let ((f (bundled-env-binary "fift")))
+             (let ((f (cl-ton::bundled-env-binary "fift")))
                (and f (uiop:string-prefix-p dir (namestring (truename f))))))))
   (check "env var name follows the TON_<NAME>_BINARY convention"
          (equal (cl-ton::%env-binary-var-name "proxy-liteserver") "TON_PROXY_LITESERVER_BINARY")))
@@ -699,7 +699,7 @@ cl-ton/src/files.lisp), then TON_FIFT_BINARY for a manual override. NIL
 if neither resolves. Only fift's own built-in kernel words are used below
 (<b, u,, i,, ref,, b>, hash, boc+>B) -- none of this needs Fift.fif/Asm.fif,
 which this environment doesn't have either."
-  (let ((path (or (bundled-env-binary "fift")
+  (let ((path (or (cl-ton::bundled-env-binary "fift")
                   (let ((p (uiop:getenv "TON_FIFT_BINARY")))
                     (and p (probe-file p) p)))))
     (and path (binary-runs-p path) path)))
@@ -941,6 +941,8 @@ Skipped when TON_FIFT_BINARY isn't set."
     (test-base64)
     (test-skip-policy)
     (test-tl-adnl-ext)   ; Phase A/B unit tests (tests/tl-adnl-ext.lisp)
+    (test-tlapi)         ; typed tonlib API (tests/tlapi.lisp)
+    (test-cells)         ; cell levels / pruned branches / Merkle proofs (tests/cells.lisp)
     (test-proxy-ext)     ; Phase C/D: client + native proxy vs Lisp upstream (tests/proxy-ext.lisp)
     (test-patient-sync)      ; sync keeps going while verified steps arrive
     (test-keystores)         ; private, per-client keystore directories

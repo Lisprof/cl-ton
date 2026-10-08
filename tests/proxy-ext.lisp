@@ -601,7 +601,12 @@ where CALLS-CELL is a cons whose car counts the non-poll queries received."
                      (check "single upstream: answered with the released binary's 652 text"
                             (equal r '(:error 652 "Gateway error: timeout for adnl query q")))
                      (check "single upstream: exactly one attempt was made"
-                            (= 1 (%outcome-count np "getAccountState" :timeout)))))
+                            (let ((n (%outcome-count np "getAccountState" :timeout)))
+                              (or (= 1 n)
+                                  (progn (format t "    timeouts recorded: ~D (outcomes: ~S)~%" n
+                                                 (mapcar (lambda (u) (getf u :outcomes))
+                                                         (getf (cl-ton:proxy-diagnostics np) :upstreams)))
+                                         nil))))))
               (cl-ton::close-adnl-ext-client c)
               (close-proxy-liteserver np)
               (cl-ton::stop-adnl-ext-server only)))))))

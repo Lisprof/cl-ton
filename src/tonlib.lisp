@@ -32,7 +32,6 @@
 (cffi:defcfun ("tonlib_client_json_destroy" %tl-destroy) :void (client :pointer))
 (cffi:defcfun ("tonlib_client_json_send" %tl-send) :void (client :pointer) (request :string))
 (cffi:defcfun ("tonlib_client_json_receive" %tl-receive) :string (client :pointer) (timeout :double))
-(cffi:defcfun ("tonlib_client_json_execute" %tl-execute) :string (client :pointer) (request :string))
 (cffi:defcfun ("tonlib_client_set_verbosity_level" %tl-set-verbosity) :void (level :int))
 
 (defvar *tonlib-loaded* nil)
@@ -655,16 +654,6 @@ Returns the raw list of raw.transaction hash tables."
 ;;; TONLIB-TRANSACTIONS returns Jonathan hash tables shaped like tonlib's
 ;;; raw.transaction: utime, transaction_id {lt hash}, in_msg (raw.message:
 ;;; source destination value hash body_hash ...), out_msgs [raw.message].
-
-(defun transaction-utime (tx) (json-get tx "utime"))
-
-(defun transaction-lt (tx)
-  (let ((lt (json-get tx "transaction_id" "lt")))
-    (if (stringp lt) (parse-integer lt) lt)))
-
-(defun transaction-in-msg-source (tx)
-  "The consumed message's source address string; \"\" for an external message."
-  (json-get tx "in_msg" "source"))
 
 (defun transaction-out-count (tx)
   (length (json-get tx "out_msgs")))

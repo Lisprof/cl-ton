@@ -811,15 +811,36 @@ sockets every DROP-EVERY chunks."
                                                 :attempts 4 :delay 0.2)
                               (incf ok))
                      (error () (incf bad))))
-                 (check "flaky links: every one of 25 account reads succeeds (the app's retry included)"
-                        (and (= ok 25) (zerop bad))))
-               (let ((d (cl-ton:proxy-diagnostics proxy)))
+                 ;; The relays reset a connection every N chunks of ANSWERS; how many chunks 25 reads
+                 ;; produce depends on how TCP happens to segment them (and on machine load), so keep
+                 ;; reading -- bounded -- until the chaos has really happened at least once.
+                 (let ((extra 0))
+                   (loop while (and (< extra 120)
+                                    (zerop (+ (chaos-relay-dropped r1) (chaos-relay-dropped r2))))
+                         do (incf extra)
+                            (handler-case
+                                (progn (cl-ton::retrying (lambda () (cl-ton:tonlib-account-state tl addr))
+                                                         :attempts 4 :delay 0.2)
+                                       (incf ok))
+                              (error () (incf bad)))))
+                 (check "flaky links: every account read succeeds (the app's retry included)"
+                        (and (>= ok 25) (zerop bad))))
+               (progn
                  (check "flaky links: the relays really did reset connections mid-run"
                         (plusp (+ (chaos-relay-dropped r1) (chaos-relay-dropped r2))))
+                 ;; The relay counts a drop the moment it closes the sockets; the proxy notices that
+                 ;; asynchronously (its reader thread sees the EOF), so give it a bounded moment
+                 ;; instead of sampling the counters at the very instant of the drop.
                  (check "flaky links: the proxy saw them (a lost session or a failover, then recovery)"
-                        (or (plusp (reduce #'+ (getf d :upstreams)
-                                           :key (lambda (u) (getf u :failures))))
-                            (plusp (or (cl-ton::proxy-stat-value (cl-ton::%native-of proxy) :failover) 0))))
+                        (loop repeat (ceiling (* 50 (%scaled 5)))
+                              do (let ((d (cl-ton:proxy-diagnostics proxy)))
+                                   (when (or (plusp (reduce #'+ (getf d :upstreams)
+                                                            :key (lambda (u) (getf u :failures))))
+                                             (plusp (or (cl-ton::proxy-stat-value
+                                                         (cl-ton::%native-of proxy) :failover) 0)))
+                                     (return t)))
+                                 (sleep 0.02)
+                              finally (return nil)))
                  (check "flaky links: at the end the proxy still has a working upstream"
                         (cl-ton:proxy-wait-ready proxy :timeout (%scaled 20)))
                  (check "flaky links: the network summary has an opinion (answers were measured)"

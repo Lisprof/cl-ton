@@ -60,15 +60,6 @@
       (sb-thread:with-mutex ((adnl-ext-server-lock server))
         (push query (cdr cell))))))
 
-(defun adnl-ext-server-enable-query-log (server)
-  (setf (adnl-ext-server-query-log server) (list :log))
-  server)
-
-(defun adnl-ext-server-logged-queries (server)
-  "Inner query octets received so far, oldest first."
-  (sb-thread:with-mutex ((adnl-ext-server-lock server))
-    (reverse (cdr (adnl-ext-server-query-log server)))))
-
 (defstruct (adnl-conn-stat (:copier nil))
   "What happened on one inbound connection, for diagnostics (ADNL-EXT-SERVER-CONNECTION-STATS)."
   (opened (get-universal-time))

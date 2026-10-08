@@ -153,29 +153,71 @@ integer -- the value that goes on the wire little-endian."
 (defvar *tl-by-name* (make-hash-table :test #'equal))
 (defvar *tl-by-id* (make-hash-table))
 
-(defun tl-normalize-declaration (text)
-  "Collapse whitespace and drop the trailing semicolon."
-  (let* ((s (string-trim '(#\Space #\Tab #\Newline #\Return #\;) text))
-         (out (make-string-output-stream))
-         (prev-space nil))
-    (loop for c across s
-          do (if (member c '(#\Space #\Tab #\Newline #\Return))
-                 (unless prev-space (write-char #\Space out) (setf prev-space t))
-                 (progn (write-char c out) (setf prev-space nil))))
-    (get-output-stream-string out)))
+(eval-when (:compile-toplevel :load-toplevel :execute)
+  ;; These run when a file is COMPILED too (DEFINE-TL-SCHEMA / DEFINE-TLAPI-SCHEMA read the .tl
+  ;; files while expanding), hence the EVAL-WHEN.
 
-(defun tl-split-top-level (s)
-  "Split S on spaces that are not inside parentheses."
-  (let ((parts '()) (depth 0) (start nil))
-    (loop for i from 0 below (length s)
-          for c = (char s i)
-          do (cond ((char= c #\() (incf depth) (unless start (setf start i)))
-                   ((char= c #\)) (decf depth))
-                   ((and (char= c #\Space) (zerop depth))
-                    (when start (push (subseq s start i) parts) (setf start nil)))
-                   (t (unless start (setf start i)))))
-    (when start (push (subseq s start) parts))
-    (nreverse parts)))
+  (defun tl-normalize-declaration (text)
+    "Collapse whitespace and drop the trailing semicolon."
+    (let* ((s (string-trim '(#\Space #\Tab #\Newline #\Return #\;) text))
+           (out (make-string-output-stream))
+           (prev-space nil))
+      (loop for c across s
+            do (if (member c '(#\Space #\Tab #\Newline #\Return))
+                   (unless prev-space (write-char #\Space out) (setf prev-space t))
+                   (progn (write-char c out) (setf prev-space nil))))
+      (get-output-stream-string out)))
+
+  (defun tl-split-top-level (s)
+    "Split S on spaces that are not inside parentheses."
+    (let ((parts '()) (depth 0) (start nil))
+      (loop for i from 0 below (length s)
+            for c = (char s i)
+            do (cond ((char= c #\() (incf depth) (unless start (setf start i)))
+                     ((char= c #\)) (decf depth))
+                     ((and (char= c #\Space) (zerop depth))
+                      (when start (push (subseq s start i) parts) (setf start nil)))
+                     (t (unless start (setf start i)))))
+      (when start (push (subseq s start) parts))
+      (nreverse parts)))
+
+  (defun tl-schema-chunks (path)
+    "The declarations of the .tl file at PATH, in file order: a list of (TEXT . KIND), TEXT
+normalized (comments, markers and the semicolon removed), KIND :TYPE or :FUNCTION."
+    (let* ((text (with-open-file (in path :external-format :utf-8)
+                   (with-output-to-string (out)
+                     (loop for line = (read-line in nil) while line
+                           do (let ((c (search "//" line)))
+                                (write-line (if c (subseq line 0 c) line) out))))))
+           (kind :type) (result '()) (start 0))
+      (loop for semi = (position #\; text :start start)
+            while semi
+            do (let ((chunk (subseq text start semi)))
+                 (loop for (marker new) in '(("---functions---" :function) ("---types---" :type))
+                       for pos = (search marker chunk)
+                       when pos do (setf kind new
+                                         chunk (concatenate 'string (subseq chunk 0 pos)
+                                                            (subseq chunk (+ pos (length marker))))))
+                 (let ((norm (tl-normalize-declaration chunk)))
+                   (when (plusp (length norm)) (push (cons norm kind) result))))
+               (setf start (1+ semi)))
+      (nreverse result)))
+
+  (defun tl-split-explicit-id (text)
+    "A declaration's text -> (VALUES PLAIN-TEXT EXPLICIT-ID): `name#1a2b3c4d f:T = C` gives
+`name f:T = C` and #x1A2B3C4D; EXPLICIT-ID is NIL when the name carries no #id (then the
+constructor id is the CRC32 of the text)."
+    (let* ((space (or (position #\Space text) (length text)))
+           (hash (position #\# text :end space)))
+      (if hash
+          (values (concatenate 'string (subseq text 0 hash) (subseq text space))
+                  (parse-integer text :start (1+ hash) :end space :radix 16))
+          (values text nil))))
+
+  (defparameter *tl-builtin-names*
+    '("int" "long" "double" "string" "object" "function" "vector" "bytes" "true" "int128" "int256")
+    "Constructors every .tl file declares for the language itself; the codec knows them as
+types (TL-PARSE-TYPE), so they are not registered as constructors."))
 
 (defun tl-parse-type (text)
   "Type expression -> internal form:
@@ -197,12 +239,16 @@ integer -- the value that goes on the wire little-endian."
               ((string= text "#") :flags)
               ((string= text "true") :true)
               ((string= text "Bool") :bool)
+              ;; the builtins `object` / `function`: a boxed value of any constructor
+              ((string= text "object") (list :boxed "Object"))
+              ((string= text "function") (list :boxed "Function"))
               ((and (> (length text) 2) (char= (char text 0) #\())
                (let* ((inner (subseq text 1 (1- (length text))))
                       (parts (tl-split-top-level inner)))
-                 (unless (string= (first parts) "vector")
-                   (error "unsupported TL type application: ~A" text))
-                 (list :vector (tl-parse-type (second parts)))))
+                 (cond ((string= (first parts) "vector")
+                        (list :vector (tl-parse-type (second parts))))
+                       ((null (rest parts)) (tl-parse-type (first parts))) ; redundant parentheses: (T)
+                       (t (error "unsupported TL type application: ~A" text)))))
               (t (let* ((dot (position #\. text :from-end t))
                         (leaf (if dot (subseq text (1+ dot)) text)))
                    (if (upper-case-p (char leaf 0))
@@ -210,11 +256,19 @@ integer -- the value that goes on the wire little-endian."
                        (list :bare text))))))))
 
 (defun tl-crc-text (decl)
-  "The text tl-parser feeds to CRC32: as written, but with `(vector T)`
-spelled `vector T` (no parentheses).  Verified against the ids compiled into
-libtonlibjson (e.g. liteServer.getConfigParams)."
+  "The text tl-parser feeds to CRC32: as written, but with `(vector T)` spelled `vector T`
+(no parentheses) and a redundant `(T)` spelled `T` (only
+engine.validator.shardBlockVerifierConfig.shard uses it).  Both verified against the ids compiled
+into libtonlibjson: 727 of the schema's 744 constructors occur there, the other 17 are ones
+tonlib never parses (see *ABSENT-FROM-TONLIB-BINARY* in the tests)."
   (let ((out decl))
     (loop for pos = (search "(vector " out)
+          while pos
+          do (let ((end (position #\) out :start pos)))
+               (setf out (concatenate 'string (subseq out 0 pos)
+                                      (subseq out (1+ pos) end)
+                                      (subseq out (1+ end))))))
+    (loop for pos = (position #\( out)
           while pos
           do (let ((end (position #\) out :start pos)))
                (setf out (concatenate 'string (subseq out 0 pos)
@@ -223,8 +277,9 @@ libtonlibjson (e.g. liteServer.getConfigParams)."
     out))
 
 (defun tl-parse-declaration (text)
-  (let* ((decl (tl-normalize-declaration text))
-         (eq-pos (search " = " decl))
+  "TEXT (`name#id fields = Class`, the #id optional) -> a TL-CON."
+  (multiple-value-bind (decl explicit-id) (tl-split-explicit-id (tl-normalize-declaration text))
+   (let* ((eq-pos (search " = " decl))
          (lhs (subseq decl 0 eq-pos))
          (result (subseq decl (+ eq-pos 3)))
          (parts (tl-split-top-level lhs))
@@ -232,11 +287,20 @@ libtonlibjson (e.g. liteServer.getConfigParams)."
          (fields (loop for p in (rest parts)
                        for colon = (position #\: p)
                        collect (cons (subseq p 0 colon) (tl-parse-type (subseq p (1+ colon)))))))
-    (make-tl-con :name name :id (tl-crc32-id (tl-crc-text decl)) :fields fields
-                 :result result :declaration decl)))
+    (make-tl-con :name name :id (or explicit-id (tl-crc32-id (tl-crc-text decl))) :fields fields
+                 :result result :declaration decl))))
 
 (defun tl-register (declaration)
-  (let ((con (tl-parse-declaration declaration)))
+  "Parse and register DECLARATION; refuses a name or constructor id that is already taken by a
+different declaration (re-registering the same one is harmless)."
+  (let* ((con (tl-parse-declaration declaration))
+         (same-name (gethash (tl-con-name con) *tl-by-name*))
+         (same-id (gethash (tl-con-id con) *tl-by-id*)))
+    (when (or (and same-name (/= (tl-con-id same-name) (tl-con-id con)))
+              (and same-id (string/= (tl-con-name same-id) (tl-con-name con))))
+      (ton-error "TL declaration conflict: ~A (~8,'0X) against ~A (~8,'0X)"
+                 (tl-con-name con) (tl-con-id con)
+                 (tl-con-name (or same-name same-id)) (tl-con-id (or same-name same-id))))
     (setf (gethash (tl-con-name con) *tl-by-name*) con
           (gethash (tl-con-id con) *tl-by-id*) con)
     con))
@@ -319,9 +383,6 @@ libtonlibjson (e.g. liteServer.getConfigParams)."
   "OBJ as a boxed TL value (constructor id first) -> octet vector."
   (tl-out-octets (tl-encode-into (make-tl-out) obj t)))
 
-(defun tl-encode-bare (obj)
-  (tl-out-octets (tl-encode-into (make-tl-out) obj nil)))
-
 ;;; --- decode ----------------------------------------------------------------
 
 (defun tl-read-value (in type fields-so-far)
@@ -333,7 +394,9 @@ libtonlibjson (e.g. liteServer.getConfigParams)."
     (:int128 (coerce (tl-get-raw in 16) 'tl-octets))
     (:int256 (tl-get-int256 in))
     (:bytes (tl-get-bytes in))
-    (:string (sb-ext:octets-to-string (tl-get-bytes in) :external-format :utf-8))
+    (:string (handler-case (sb-ext:octets-to-string (tl-get-bytes in) :external-format :utf-8)
+               (tl-decode-error (e) (error e))
+               (error () (tl-fail "TL: a string field is not valid UTF-8"))))
     (:true t)
     (:bool (let ((b (tl-decode-boxed in)))
              (cond ((tl-is b "boolTrue") t)
@@ -387,87 +450,29 @@ a known constructor are an error; an unknown constructor decodes to
          (obj (tl-decode-boxed in)))
     (values obj (tl-rest in))))
 
-;;; --- the schema subset -----------------------------------------------------
+;;; --- the schema: lite_api.tl and ton_api.tl --------------------------------------
+;;;
+;;; The constructors are the vendored files' (cl-ton/tl/), read when this file is compiled, so
+;;; the codec cannot disagree with them: names, field layouts, explicit `#id`s and CRC32 ids all
+;;; come from the schema the TON nodes are built from.  Updating the schema means replacing
+;;; the files and running the cl-ton test system, which checks the ids against the ones
+;;; compiled into tonlibjson and round-trips every constructor.
 
-(defparameter *tl-schema-declarations*
-  '(;; --- ton_api.tl: transport ---
-    "boolFalse = Bool"
-    "boolTrue = Bool"
-    "adnl.message.query query_id:int256 query:bytes = adnl.Message"
-    "adnl.message.answer query_id:int256 answer:bytes = adnl.Message"
-    "tcp.ping random_id:long = tcp.Pong"
-    "tcp.pong random_id:long = tcp.Pong"
-    "tcp.authentificate nonce:bytes = tcp.Message"
-    "tcp.authentificationNonce nonce:bytes = tcp.Message"
-    "tcp.authentificationComplete key:PublicKey signature:bytes = tcp.Message"
-    "pk.ed25519 key:int256 = PrivateKey"
-    "pub.ed25519 key:int256 = PublicKey"
-    "adnl.id.short id:int256 = adnl.id.Short"
-    ;; --- ton_api.tl: blocks ---
-    "tonNode.blockId workchain:int shard:long seqno:int = tonNode.BlockId"
-    "tonNode.blockIdExt workchain:int shard:long seqno:int root_hash:int256 file_hash:int256 = tonNode.BlockIdExt"
-    "tonNode.zeroStateIdExt workchain:int root_hash:int256 file_hash:int256 = tonNode.ZeroStateIdExt"
-    "ton.blockId root_cell_hash:int256 file_hash:int256 = ton.BlockId"
-    ;; --- lite_api.tl: results ---
-    "liteServer.error code:int message:string = liteServer.Error"
-    "liteServer.accountId workchain:int id:int256 = liteServer.AccountId"
-    "liteServer.masterchainInfo last:tonNode.blockIdExt state_root_hash:int256 init:tonNode.zeroStateIdExt = liteServer.MasterchainInfo"
-    "liteServer.masterchainInfoExt mode:# version:int capabilities:long last:tonNode.blockIdExt last_utime:int now:int state_root_hash:int256 init:tonNode.zeroStateIdExt = liteServer.MasterchainInfoExt"
-    "liteServer.currentTime now:int = liteServer.CurrentTime"
-    "liteServer.version mode:# version:int capabilities:long now:int = liteServer.Version"
-    "liteServer.blockData id:tonNode.blockIdExt data:bytes = liteServer.BlockData"
-    "liteServer.blockHeader id:tonNode.blockIdExt mode:# header_proof:bytes = liteServer.BlockHeader"
-    "liteServer.sendMsgStatus status:int = liteServer.SendMsgStatus"
-    "liteServer.accountState id:tonNode.blockIdExt shardblk:tonNode.blockIdExt shard_proof:bytes proof:bytes state:bytes = liteServer.AccountState"
-    "liteServer.runMethodResult mode:# id:tonNode.blockIdExt shardblk:tonNode.blockIdExt shard_proof:mode.0?bytes proof:mode.0?bytes state_proof:mode.1?bytes init_c7:mode.3?bytes lib_extras:mode.4?bytes exit_code:int result:mode.2?bytes = liteServer.RunMethodResult"
-    "liteServer.shardInfo id:tonNode.blockIdExt shardblk:tonNode.blockIdExt shard_proof:bytes shard_descr:bytes = liteServer.ShardInfo"
-    "liteServer.allShardsInfo id:tonNode.blockIdExt proof:bytes data:bytes = liteServer.AllShardsInfo"
-    "liteServer.transactionInfo id:tonNode.blockIdExt proof:bytes transaction:bytes = liteServer.TransactionInfo"
-    "liteServer.transactionList ids:(vector tonNode.blockIdExt) transactions:bytes = liteServer.TransactionList"
-    "liteServer.transactionId mode:# account:mode.0?int256 lt:mode.1?long hash:mode.2?int256 = liteServer.TransactionId"
-    "liteServer.transactionId3 account:int256 lt:long = liteServer.TransactionId3"
-    "liteServer.signature node_id_short:int256 signature:bytes = liteServer.Signature"
-    "liteServer.signatureSet validator_set_hash:int catchain_seqno:int signatures:(vector liteServer.signature) = liteServer.SignatureSet"
-    "liteServer.blockLinkBack to_key_block:Bool from:tonNode.blockIdExt to:tonNode.blockIdExt dest_proof:bytes proof:bytes state_proof:bytes = liteServer.BlockLink"
-    "liteServer.blockLinkForward to_key_block:Bool from:tonNode.blockIdExt to:tonNode.blockIdExt dest_proof:bytes config_proof:bytes signatures:liteServer.SignatureSet = liteServer.BlockLink"
-    "liteServer.blockTransactions id:tonNode.blockIdExt req_count:# incomplete:Bool ids:(vector liteServer.transactionId) proof:bytes = liteServer.BlockTransactions"
-    "liteServer.configInfo mode:# id:tonNode.blockIdExt state_proof:bytes config_proof:bytes = liteServer.ConfigInfo"
-    ;; --- lite_api.tl: functions ---
-    "liteServer.getMasterchainInfo = liteServer.MasterchainInfo"
-    "liteServer.getMasterchainInfoExt mode:# = liteServer.MasterchainInfoExt"
-    "liteServer.getTime = liteServer.CurrentTime"
-    "liteServer.getVersion = liteServer.Version"
-    "liteServer.getBlock id:tonNode.blockIdExt = liteServer.BlockData"
-    "liteServer.getBlockHeader id:tonNode.blockIdExt mode:# = liteServer.BlockHeader"
-    "liteServer.sendMessage body:bytes = liteServer.SendMsgStatus"
-    "liteServer.getAccountState id:tonNode.blockIdExt account:liteServer.accountId = liteServer.AccountState"
-    "liteServer.runSmcMethod mode:# id:tonNode.blockIdExt account:liteServer.accountId method_id:long params:bytes = liteServer.RunMethodResult"
-    "liteServer.getShardInfo id:tonNode.blockIdExt workchain:int shard:long exact:Bool = liteServer.ShardInfo"
-    "liteServer.getAllShardsInfo id:tonNode.blockIdExt = liteServer.AllShardsInfo"
-    "liteServer.getOneTransaction id:tonNode.blockIdExt account:liteServer.accountId lt:long = liteServer.TransactionInfo"
-    "liteServer.getTransactions count:# account:liteServer.accountId lt:long hash:int256 = liteServer.TransactionList"
-    "liteServer.lookupBlock mode:# id:tonNode.blockId lt:mode.1?long utime:mode.2?int = liteServer.BlockHeader"
-    "liteServer.listBlockTransactions id:tonNode.blockIdExt mode:# count:# after:mode.7?liteServer.transactionId3 reverse_order:mode.6?true want_proof:mode.5?true = liteServer.BlockTransactions"
-    "liteServer.partialBlockProof complete:Bool from:tonNode.blockIdExt to:tonNode.blockIdExt steps:(vector liteServer.BlockLink) = liteServer.PartialBlockProof"
-    "liteServer.getBlockProof mode:# known_block:tonNode.blockIdExt target_block:mode.0?tonNode.blockIdExt = liteServer.PartialBlockProof"
-    "liteServer.getConfigAll mode:# id:tonNode.blockIdExt = liteServer.ConfigInfo"
-    "liteServer.getConfigParams mode:# id:tonNode.blockIdExt param_list:(vector int) = liteServer.ConfigInfo"
-    "liteServer.libraryEntry hash:int256 data:bytes = liteServer.LibraryEntry"
-    "liteServer.libraryResult result:(vector liteServer.libraryEntry) = liteServer.LibraryResult"
-    "liteServer.getLibraries library_list:(vector int256) = liteServer.LibraryResult"
-    ;; --- lite_api.tl: envelope / prefixes ---
-    "liteServer.query data:bytes = Object"
-    "liteServer.queryPrefix = Object"
-    "liteServer.waitMasterchainSeqno seqno:int timeout_ms:int = Object"))
+(defmacro define-tl-schema (&rest relative-paths)
+  "Register every non-builtin declaration of the .tl files RELATIVE-PATHS (relative to the file
+being compiled), read now, at compile time, when the compiled file loads."
+  (let ((base (or *compile-file-truename* *load-truename*)))
+    `(dolist (declaration
+              ',(loop for path in relative-paths
+                      append (loop for (text . nil) in (tl-schema-chunks (merge-pathnames path base))
+                                   unless (member (subseq text 0 (position-if (lambda (c) (member c '(#\Space #\#))) text))
+                                                  *tl-builtin-names* :test #'string=)
+                                     collect text)))
+       (tl-register declaration))))
 
-(dolist (d *tl-schema-declarations*) (tl-register d))
+(define-tl-schema "../tl/ton_api.tl" "../tl/lite_api.tl")
 
 ;;; --- small conveniences used by the proxy / fakechain ----------------------
-
-(defun tl-bytes32 (octets)
-  "Left-pad/truncate nothing: assert a 32-octet int256 value."
-  (unless (= (length octets) 32) (ton-error "expected 32 octets, got ~D" (length octets)))
-  (coerce octets 'tl-octets))
 
 (defun tl-random-int256 ()
   (coerce (ironclad:random-data 32) 'tl-octets))
@@ -477,3 +482,257 @@ a known constructor are an error; an unknown constructor decodes to
                           (file-hash (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)))
   (tl-make "tonNode.blockIdExt" :workchain workchain :shard shard :seqno seqno
                                 :root-hash root-hash :file-hash file-hash))
+
+;;; --- tonlib_api.tl: the typed tonlib API ------------------------------------
+;;;
+;;; tonlib's API objects (cl-ton/tl/tonlib_api.tl) are not wire formats on this path: tonlib
+;;; hands them around in memory and tonlibjson shows them as JSON.  So this section does not
+;;; encode them to octets; it gives them a SCHEMA (read from the vendored file when this file
+;;; is compiled, so the .tl text is not needed at run time), validated typed objects
+;;; (TLAPI-MAKE / TLAPI-VALIDATE) and a bridge to and from tonlib's JSON conventions
+;;; (TLAPI->PLIST / JSON->TLAPI) that the JSON backend and the test oracle use until the native
+;;; engine replaces them.
+;;;
+;;; Types: int32 int53 int64 int256 bytes string secureBytes secureString Bool double, `#` flags
+;;; with `flag.N?T` conditional fields, `vector<T>` / `(vector T)`, a bare constructor reference
+;;; (lower-case leaf, exactly that constructor) or a class reference (upper-case leaf, any
+;;; constructor of the class), plus the untyped Object and Function.
+;;;
+;;; JSON conventions (tonlib's tl_json): int32/int53 numbers, int64 a decimal string (a number is
+;;; accepted when reading), int256/bytes/secureBytes base64 strings, Bool true/false, vectors
+;;; arrays, objects hash tables or plists with "@type".
+
+(eval-when (:compile-toplevel :load-toplevel :execute)
+
+  (defun tlapi-parse-type (text)
+    "Type text -> :int32 :int53 :int64 :int256 :bytes :string :secure-bytes :secure-string :bool
+:double :flags :object :function, (:vector T), (:bare NAME), (:class NAME) or (:if FLAG BIT T)."
+    (let ((q (position #\? text)))
+      (cond
+        (q (let* ((cond-part (subseq text 0 q)) (dot (position #\. cond-part)))
+             (list :if (subseq cond-part 0 dot) (parse-integer cond-part :start (1+ dot))
+                   (tlapi-parse-type (subseq text (1+ q))))))
+        ((string= text "int32") :int32)
+        ((string= text "int53") :int53)
+        ((string= text "int64") :int64)
+        ((string= text "int256") :int256)
+        ((string= text "bytes") :bytes)
+        ((string= text "string") :string)
+        ((string= text "secureBytes") :secure-bytes)
+        ((string= text "secureString") :secure-string)
+        ((string= text "Bool") :bool)
+        ((string= text "double") :double)
+        ((string= text "#") :flags)
+        ((string= text "Object") :object)
+        ((string= text "Function") :function)
+        ((and (> (length text) 8) (string= "(vector " text :end2 8))
+         (list :vector (tlapi-parse-type (tl-normalize-declaration (subseq text 8 (1- (length text)))))))
+        ((and (> (length text) 7) (string= "vector<" text :end2 7))
+         (list :vector (tlapi-parse-type (subseq text 7 (1- (length text))))))
+        (t (let* ((dot (position #\. text :from-end t))
+                  (leaf (if dot (subseq text (1+ dot)) text)))
+             (if (upper-case-p (char leaf 0)) (list :class text) (list :bare text)))))))
+
+  (defparameter *tlapi-builtin-names*
+    '("double" "string" "int32" "int53" "int64" "int256" "bytes" "secureString" "secureBytes"
+      "object" "function" "boolFalse" "boolTrue" "vector"))
+
+  (defun tlapi-parse-declaration (text kind)
+    "One declaration (no trailing semicolon) -> (NAME KIND CLASS FIELDS), or NIL for a builtin."
+    (let* ((decl (tl-normalize-declaration text))
+           (eq-pos (search " = " decl :from-end t))
+           (lhs (subseq decl 0 eq-pos))
+           (class (subseq decl (+ eq-pos 3)))
+           (parts (tl-split-top-level lhs))
+           (name (first parts)))
+      (unless (member name *tlapi-builtin-names* :test #'string=)
+        (list name kind class
+              (loop for p in (rest parts)
+                    for colon = (position #\: p)
+                    collect (cons (subseq p 0 colon) (tlapi-parse-type (subseq p (1+ colon)))))))))
+
+  (defun tlapi-read-declarations (path)
+    "Every non-builtin declaration of the tonlib .tl file at PATH, in file order, each
+(NAME KIND CLASS FIELDS) with KIND :type or :function."
+    (loop for (text . kind) in (tl-schema-chunks path)
+          for d = (tlapi-parse-declaration text kind)
+          when d collect d)))
+
+(defstruct (tlapi-con (:copier nil))
+  name kind class fields)
+
+(defvar *tlapi-cons* (make-hash-table :test #'equal)
+  "Constructor name -> TLAPI-CON, for every non-builtin declaration of tonlib_api.tl.")
+
+(defun tlapi-install (declarations)
+  (dolist (d declarations)
+    (destructuring-bind (name kind class fields) d
+      (setf (gethash name *tlapi-cons*)
+            (make-tlapi-con :name name :kind kind :class class :fields fields)))))
+
+(defmacro define-tlapi-schema (relative-path)
+  "Read the .tl file at RELATIVE-PATH (relative to the file being compiled) now, at compile
+time, and install its declarations when the compiled file loads."
+  (let ((path (merge-pathnames relative-path (or *compile-file-truename* *load-truename*))))
+    `(tlapi-install ',(tlapi-read-declarations path))))
+
+(define-tlapi-schema "../tl/tonlib_api.tl")
+
+(defun tlapi-find (name)
+  (or (gethash name *tlapi-cons*) (ton-error "unknown tonlib API constructor ~A" name)))
+
+(defun tlapi-constructor-names ()
+  (let ((names '())) (maphash (lambda (k v) (declare (ignore v)) (push k names)) *tlapi-cons*) (sort names #'string<)))
+
+(defun tlapi-function-p (name)
+  (let ((con (gethash name *tlapi-cons*))) (and con (eq (tlapi-con-kind con) :function))))
+
+;;; --- typed objects ------------------------------------------------------------
+
+(defstruct (tlapi-obj (:constructor %make-tlapi-obj (name fields)) (:copier nil))
+  (name nil :read-only t)       ; constructor name, e.g. "raw.getAccountState"
+  (fields nil))                 ; plist keyed like :ACCOUNT-ADDRESS (TL-FIELD-KEY)
+
+(defun tlapi-get (obj key) (getf (tlapi-obj-fields obj) key))
+
+(defun tlapi-is (obj name) (and (tlapi-obj-p obj) (string= (tlapi-obj-name obj) name)))
+
+(defun %tlapi-bad (path control &rest args)
+  (ton-error "tonlib API ~A: ~?" path control args))
+
+(defun %tlapi-octets-p (v) (typep v '(vector (unsigned-byte 8))))
+
+(defun %tlapi-check (type value path)
+  (flet ((need (ok what) (unless ok (%tlapi-bad path "expected ~A, got ~S" what value))))
+    (ecase (if (consp type) (first type) type)
+      (:int32 (need (typep value '(signed-byte 32)) "an int32"))
+      (:int53 (need (typep value '(integer -9007199254740991 9007199254740991)) "an int53"))
+      (:int64 (need (typep value '(signed-byte 64)) "an int64"))
+      (:flags (need (typep value '(unsigned-byte 32)) "uint32 flags"))
+      (:int256 (need (and (%tlapi-octets-p value) (= (length value) 32)) "32 octets"))
+      ((:bytes :secure-bytes) (need (%tlapi-octets-p value) "an octet vector"))
+      ((:string :secure-string) (need (stringp value) "a string"))
+      (:bool (need (member value '(t nil)) "T or NIL"))
+      (:double (need (realp value) "a real"))
+      (:vector (need (or (listp value) (and (vectorp value) (not (stringp value)))) "a list or vector")
+       (loop for e across (coerce value 'vector) for i from 0
+             do (%tlapi-check (second type) e (format nil "~A[~D]" path i))))
+      (:bare (need (tlapi-obj-p value) "an object")
+       (unless (string= (tlapi-obj-name value) (second type))
+         (%tlapi-bad path "expected a ~A, got a ~A" (second type) (tlapi-obj-name value)))
+       (tlapi-validate value path))
+      (:class (need (tlapi-obj-p value) "an object")
+       (unless (string= (tlapi-con-class (tlapi-find (tlapi-obj-name value))) (second type))
+         (%tlapi-bad path "expected a ~A, got a ~A" (second type) (tlapi-obj-name value)))
+       (tlapi-validate value path))
+      (:object (need (tlapi-obj-p value) "an object") (tlapi-validate value path))
+      (:function (need (tlapi-obj-p value) "a function object")
+       (unless (tlapi-function-p (tlapi-obj-name value))
+         (%tlapi-bad path "~A is not a function" (tlapi-obj-name value)))
+       (tlapi-validate value path)))))
+
+(defun tlapi-validate (obj &optional (path nil))
+  "OBJ if it is a well-formed typed object of the schema, else a TON-ERROR naming the offending
+field.  Every field must be present (a conditional one exactly when its flag bit is set), no field
+may be unknown, and every value must have its declared type (recursively)."
+  (unless (tlapi-obj-p obj) (%tlapi-bad (or path "?") "not a typed object: ~S" obj))
+  (let* ((con (tlapi-find (tlapi-obj-name obj)))
+         (fields (tlapi-obj-fields obj))
+         (path (if path (format nil "~A" path) (tlapi-obj-name obj)))
+         (known '()))
+    (dolist (f (tlapi-con-fields con))
+      (let* ((fname (car f)) (type (cdr f)) (key (tl-field-key fname))
+             (fpath (format nil "~A.~A" path fname))
+             (conditional (and (consp type) (eq (first type) :if)))
+             (expected (or (not conditional)
+                           (logbitp (third type) (getf fields (tl-field-key (second type)) 0))))
+             (present (tl-plist-has-key-p fields key)))
+        (push key known)
+        (cond ((and expected (not present)) (%tlapi-bad fpath "missing"))
+              ((and present (not expected)) (%tlapi-bad fpath "present but its flag bit is clear"))
+              (present (%tlapi-check (if conditional (fourth type) type) (getf fields key) fpath)))))
+    (loop for (k nil) on fields by #'cddr
+          unless (member k known) do (%tlapi-bad path "unknown field ~A" k))
+    obj))
+
+(defun tlapi-make (name &rest fields)
+  "A validated typed object of constructor NAME; FIELDS is a plist keyed like :ACCOUNT-ADDRESS
+(the TL field names, underscores as hyphens).  Nested objects are TLAPI-MAKE results."
+  (tlapi-find name)
+  (tlapi-validate (%make-tlapi-obj name (copy-list fields))))
+
+;;; --- the JSON bridge ------------------------------------------------------------
+
+(defun %tlapi->json (type value)
+  (ecase (if (consp type) (first type) type)
+    ((:int32 :int53 :flags) value)
+    (:int64 (format nil "~D" value))
+    ((:int256 :bytes :secure-bytes) (base64-encode value))
+    ((:string :secure-string) value)
+    (:bool (if value t :false))
+    (:double value)
+    (:vector (map 'list (lambda (e) (%tlapi->json (second type) e)) (coerce value 'vector)))
+    ((:bare :class :object :function) (tlapi->plist value))))
+
+(defun tlapi->plist (obj)
+  "OBJ as the plist tonlibjson takes: (:|@type| NAME :|field_name| VALUE ...), fields in schema
+order, nested objects as nested plists, int64 as a decimal string, bytes as base64, Bool as
+T / :FALSE (what Jonathan turns into true / false)."
+  (let ((con (tlapi-find (tlapi-obj-name obj))) (fields (tlapi-obj-fields obj)))
+    (list* :|@type| (tlapi-obj-name obj)
+           (loop for (fname . type) in (tlapi-con-fields con)
+                 for key = (tl-field-key fname)
+                 when (tl-plist-has-key-p fields key)
+                   append (list (intern fname :keyword)
+                                (%tlapi->json (if (eq (and (consp type) (first type)) :if) (fourth type) type)
+                                              (getf fields key)))))))
+
+(defun %json->tlapi (type json path)
+  (flet ((need (ok what) (unless ok (%tlapi-bad path "expected ~A in JSON, got ~S" what json))))
+    (ecase (if (consp type) (first type) type)
+      ((:int32 :int53 :flags) (need (integerp json) "a number") json)
+      (:int64 (cond ((integerp json) json)
+                    ((stringp json) (or (ignore-errors (parse-integer json))
+                                        (%tlapi-bad path "bad int64 string ~S" json)))
+                    (t (need nil "an int64"))))
+      ((:int256 :bytes :secure-bytes)
+       (need (stringp json) "a base64 string")
+       (let ((octets (coerce (base64-decode json) 'tl-octets)))
+         (when (and (eq type :int256) (/= (length octets) 32))
+           (%tlapi-bad path "int256 of ~D octets" (length octets)))
+         octets))
+      ((:string :secure-string) (need (stringp json) "a string") json)
+      (:bool (and json (not (eq json :false)) t))
+      (:double (need (realp json) "a number") (float json 1d0))
+      (:vector (need (listp json) "an array")
+       (loop for e in json for i from 0
+             collect (%json->tlapi (second type) e (format nil "~A[~D]" path i))))
+      ((:bare :class :object :function)
+       (need (hash-table-p json) "an object")
+       (let ((obj (%json->obj json path)))
+         (case (if (consp type) (first type) type)
+           (:bare (unless (string= (tlapi-obj-name obj) (second type))
+                    (%tlapi-bad path "expected a ~A, got a ~A" (second type) (tlapi-obj-name obj))))
+           (:class (unless (string= (tlapi-con-class (tlapi-find (tlapi-obj-name obj))) (second type))
+                     (%tlapi-bad path "expected a ~A, got a ~A" (second type) (tlapi-obj-name obj)))))
+         obj)))))
+
+(defun %json->obj (json path)
+  (let* ((name (gethash "@type" json))
+         (con (progn (unless (stringp name) (%tlapi-bad path "JSON object without @type"))
+                     (tlapi-find name)))
+         (path (if (equal path "") name path)))
+    (%make-tlapi-obj
+     name
+     (loop for (fname . type) in (tlapi-con-fields con)
+           for json-value = (multiple-value-list (gethash fname json))
+           when (second json-value)
+             append (list (tl-field-key fname)
+                          (%json->tlapi (if (eq (and (consp type) (first type)) :if) (fourth type) type)
+                                        (first json-value) (format nil "~A.~A" path fname)))))))
+
+(defun json->tlapi (json)
+  "A decoded tonlibjson answer (a Jonathan hash table with \"@type\") -> a typed object.  Lenient
+about what tonlib may add or omit (unknown JSON fields are dropped, absent ones stay absent -- use
+TLAPI-VALIDATE to demand a complete object); strict about types and constructor classes."
+  (%json->obj json ""))

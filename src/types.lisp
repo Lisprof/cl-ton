@@ -117,9 +117,6 @@ Returns (values ADDRESS BOUNCEABLE-P TESTNET-P); raw addresses report T NIL."
   "Either X ^X, always taking the ^X branch."
   (store-ref (store-bit b 1) cell))
 
-(defun store-string-tail (b string)
-  (store-bytes b (sb-ext:string-to-octets string :external-format :utf-8)))
-
 (defun nano (ton)
   "TON (rational or float) -> nanoTON integer."
   (values (round (* (rational ton) 1000000000))))

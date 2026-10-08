@@ -26,12 +26,6 @@
     :serial t  
     :components
     ((:file "package")
-     (:file "files" :pathname "../tests/files")   ; BUNDLED-ENV-BINARY: locates the fift/proxy-liteserver
-                        ; released binaries: <bin>/env/ or beside the binary
-                        ; (builder.lisp --with-tests puts them in bin/tests/),
-                        ; cl-ton/tests/ in a checkout, TON_*_BINARY, PATH. No
-                        ; dependency on DEPLOY itself -- looked up by name at
-                        ; runtime so cl-ton/cl-ton-test stay buildable without it.
      (:file "ton-boc")
      (:file "errors")  
      (:file "base64")  
@@ -48,7 +42,6 @@
      (:file "adnl-ext-server")     ; Phase D: inbound listener/handshake, shared with fakechain
      (:file "proxy-liteserver")    ; uses CONFIG-WITH-LITESERVERS/JSON-GET from tonlib
      (:file "dex")  
-     (:file "fakechain" :pathname "../tests/fakechain")           ; Phase F.1: emulator-backed liteserver (the test network)
      (:file "indexer")     ; before chain: chain-close calls stop-flow-scanner  
      (:file "chain"))))  
   :in-order-to ((test-op (test-op "cl-ton/test"))))  
@@ -60,10 +53,17 @@
   :components ((:module "tests"  
                 :serial t  
                 :components (
+			     (:file "files")         ; BUNDLED-ENV-BINARY: locates the fift/proxy-liteserver released
+                                             ; binaries (test environment only): <bin>/env/ or beside the
+                                             ; binary, cl-ton/tests/ in a checkout, TON_*_BINARY, PATH
+			     (:file "fakechain")     ; the emulator-backed liteserver (the test network), tests only
 			     (:file "client")
 			     (:file "fake-chain")
 			     (:file "tl-adnl-ext")
 			     (:file "proxy-ext")
-			     (:file "scenarios"))))  
+			     (:file "scenarios")
+			     (:file "tlapi")
+			     (:file "cells"))))   ; cell levels, pruned branches, Merkle proofs   ; the typed tonlib API: schema, validation, JSON bridge, A/B vs tonlibjson
+
   :perform (test-op (o c)  
              (uiop:symbol-call :cl-ton/test :run-tests)))  

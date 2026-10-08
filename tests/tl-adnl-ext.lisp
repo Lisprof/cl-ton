@@ -35,12 +35,27 @@
     ;; vector-bearing ids: wrong unless the tl-parser paren normalisation is applied
     ("liteServer.getConfigParams" #x2A111C19) ("liteServer.transactionList" #x6F26C60B)))
 
-(defparameter *tonlib-present-ids*
-  ;; every schema constructor except the four absent from the binary
-  (remove-if (lambda (n) (member n '("liteServer.currentTime" "liteServer.blockData"
-                                     "liteServer.shardInfo" "liteServer.transactionInfo")
-                                 :test #'string=))
-             (mapcar (lambda (d) (subseq d 0 (position #\Space d))) cl-ton::*tl-schema-declarations*)))
+(defparameter *absent-from-tonlib-binary*
+  '("liteServer.currentTime" "liteServer.blockData" "liteServer.blockState" "liteServer.shardInfo"
+    "liteServer.transactionInfo" "liteServer.validatorStats" "liteServer.accountDispatchQueueInfo"
+    "liteServer.dispatchQueueInfo" "liteServer.dispatchQueueMessage" "liteServer.dispatchQueueMessages"
+    "liteServer.debug.verbosity" "liteServer.nonfinal.candidateId" "liteServer.nonfinal.candidate"
+    "liteServer.nonfinal.candidateInfo" "liteServer.nonfinal.validatorGroupInfo"
+    "liteServer.nonfinal.validatorGroups" "liteServer.nonfinal.pendingShardBlocks")
+  "The schema constructors whose ids do not occur in libtonlibjson: tonlib forwards or never
+parses these (results it does not look into, queries it does not send, validator-engine
+control objects).  Every other constructor's id must occur there.")
+
+(defun %ids-in-so (so)
+  "The set (hash table) of 32-bit little-endian words of SO, restricted to registered constructor
+ids -- one pass over the library."
+  (declare (type (simple-array (unsigned-byte 8) (*)) so) (optimize speed))
+  (let ((found (make-hash-table)))
+    (loop for i of-type fixnum from 0 below (- (length so) 3)
+          for w of-type (unsigned-byte 32) = (logior (aref so i) (ash (aref so (+ i 1)) 8)
+                                                     (ash (aref so (+ i 2)) 16) (ash (aref so (+ i 3)) 24))
+          when (gethash w cl-ton::*tl-by-id*) do (setf (gethash w found) t))
+    found))
 
 (defun test-tl-ids ()
   (format t "tl constructor ids (pinned against the tonlib binary)~%")
@@ -51,11 +66,15 @@
            (= (cl-ton::tl-id-of (first p)) (second p))))
   (let ((so (%tonlib-so)))
     (if so
-        (let ((missing (remove-if (lambda (n) (search (%id-le (cl-ton::tl-id-of n)) so))
-                                  *tonlib-present-ids*)))
-          (check (format nil "all ~D expected ids occur in tonlibjson.so (missing: ~{~A~^ ~})"
-                         (length *tonlib-present-ids*) missing)
-                 (null missing)))
+        (let* ((found (%ids-in-so so))
+               (absent (sort (loop for name being the hash-keys of cl-ton::*tl-by-name* using (hash-value con)
+                                   unless (gethash (cl-ton::tl-con-id con) found) collect name)
+                             #'string<)))
+          (check (format nil "~D of the ~D schema ids occur in tonlibjson.so; the absent ones are exactly the ~D tonlib never parses (differences: ~S)"
+                         (- (hash-table-count cl-ton::*tl-by-name*) (length absent))
+                         (hash-table-count cl-ton::*tl-by-name*) (length *absent-from-tonlib-binary*)
+                         (set-exclusive-or absent *absent-from-tonlib-binary* :test #'string=))
+                 (null (set-exclusive-or absent *absent-from-tonlib-binary* :test #'string=))))
         (format t "  skip tonlib .so not present~%"))))
 
 (defun test-tl-codec ()

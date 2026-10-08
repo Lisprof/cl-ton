@@ -52,10 +52,16 @@
 ;;;;     https://docs.ton.org/foundations/serialization/boc
 ;;;;   - PARSE-BOC, the inverse, which verifies inlined hashes and the CRC32C
 ;;;;
+;;;; Levels (crypto/vm/cells/DataCell.cpp)
+;;;;   A cell has a level MASK (3 bits): bit i-1 set means the cell has a hash of its own at
+;;;;   level i.  Ordinary cells inherit the OR of their children's masks; exotic cells (the
+;;;;   first data byte is the type) follow their type: pruned branch (1) states its mask, library
+;;;;   reference (2) has none, Merkle proof (3) and Merkle update (4) shift their children's mask
+;;;;   down by one.  A cell carries one hash and depth per significant level (level 0 always), the
+;;;;   highest being its representation hash; a parent hashes its children at its own level, one
+;;;;   higher under a Merkle proof/update.  Exotic cells are validated as the C++ does.
+;;;;
 ;;;; Not implemented
-;;;;   - Exotic cells' level / higher-hash rules (pruned branch, library ref,
-;;;;     merkle proof, merkle update).  The EXOTIC flag is carried into d1 so
-;;;;     hand-built exotic bodies serialize, but every cell is level 0 here.
 ;;;;   - has_cache_bits.
 ;;;;
 ;;;; Wire format (cross-checked against ton-blockchain/ton, crypto/vm/boc.cpp
@@ -194,8 +200,8 @@ have finished."
 ;;; Descriptor bytes and data layout shared by hashing and serialization
 ;;; ---------------------------------------------------------------------
 
-(defun d1-byte (refs-count exotic-p level &key with-hashes)
-  (+ refs-count (if exotic-p 8 0) (if with-hashes 16 0) (* 32 level)))
+(defun d1-byte (refs-count exotic-p level-mask &key with-hashes)
+  (+ refs-count (if exotic-p 8 0) (if with-hashes 16 0) (* 32 level-mask)))
 
 (defun d2-byte (bit-length)
   (+ (floor bit-length 8) (ceiling bit-length 8)))
@@ -217,12 +223,16 @@ multiple of 8 a completion tag (a 1 followed by zeros) fills the last byte."
 ;;; ---------------------------------------------------------------------
 
 (defstruct (node (:constructor nil) (:copier nil) (:predicate node-p))
-  (hash (octets) :type octets :read-only t)
-  (depth 0 :type (unsigned-byte 16) :read-only t)
-  (level 0 :type (integer 0 3) :read-only t))
+  (hash (octets) :type octets :read-only t)        ; the representation hash: the highest level's
+  (depth 0 :type (unsigned-byte 16) :read-only t)  ; ... and its depth
+  (level 0 :type (integer 0 3) :read-only t)       ; the highest significant level
+  (level-mask 0 :type (integer 0 7) :read-only t)  ; bit i-1: a hash of its own at level i
+  (hashes #() :type simple-vector :read-only t)    ; one per significant level, lowest first
+  (depths #() :type simple-vector :read-only t))
 
 (defstruct (cell (:include node)
-                 (:constructor %make-cell (hash depth level bits bit-length refs exotic-p))
+                 (:constructor %make-cell (hash depth level level-mask hashes depths
+                                           bits bit-length refs exotic-p))
                  (:copier nil)
                  (:predicate cell-p))
   (bits 0 :type unsigned-byte :read-only t)              ; data, MSB first
@@ -231,7 +241,7 @@ multiple of 8 a completion tag (a 1 followed by zeros) fills the last byte."
   (exotic-p nil :type boolean :read-only t))
 
 (defstruct (absent-cell (:include node)
-                        (:constructor %make-absent-cell (hash depth level))
+                        (:constructor %make-absent-cell (hash depth level level-mask hashes depths))
                         (:copier nil)
                         (:predicate absent-cell-p)))
 
@@ -255,18 +265,110 @@ multiple of 8 a completion tag (a 1 followed by zeros) fills the last byte."
   (print-unreadable-object (c stream :type t)
     (format stream "depth ~D, ~A.." (node-depth c) (subseq (node-hash-hex c) 0 16))))
 
-(defun representation-octets (d1 bits bit-length refs)
-  "Standard cell representation: d1 d2 data depth_i* hash_i* (REFS as a sequence)."
-  (concat-octets (list* (octets d1 (d2-byte bit-length))
-                        (data-octets bits bit-length)
-                        (append (map 'list (lambda (r) (uint->octets (node-depth r) 2)) refs)
-                                (map 'list #'node-hash refs)))))
+;;; --- levels ---------------------------------------------------------------
+
+(defun level-hash-index (level-mask level)
+  "The index into a cell's hashes/depths vectors of its hash at LEVEL (level_mask.apply(level)
+.get_hash_i()): how many significant levels lie below LEVEL."
+  (logcount (ldb (byte level 0) level-mask)))
+
+(defun node-hash-at (node level)
+  "NODE's hash as seen at LEVEL (0..3, a Merkle proof's children are read one higher)."
+  (svref (node-hashes node) (level-hash-index (node-level-mask node) level)))
+
+(defun node-depth-at (node level)
+  (svref (node-depths node) (level-hash-index (node-level-mask node) level)))
+
+(defun %field (bits bit-length start width)
+  "The WIDTH bits of cell data BITS (BIT-LENGTH bits, most significant first) from bit START."
+  (ldb (byte width (- bit-length start width)) bits))
+
+(defun %field-octets (bits bit-length start width-bytes)
+  (uint->octets (%field bits bit-length start (* 8 width-bytes)) width-bytes))
+
+(defun %special-type (exotic-p bits bit-length)
+  (cond ((not exotic-p) 0)
+        ((< bit-length 8) (boc-error "An exotic cell has a type byte, but this one has ~D bits" bit-length))
+        (t (%field bits bit-length 0 8))))
+
+(defmacro %need (test control &rest arguments)
+  "Signal a BOC-ERROR unless TEST: the checks of an exotic cell's layout read as a list of facts."
+  `(unless ,test (boc-error ,control ,@arguments)))
+
+(defun %validate-exotic (type bits bit-length refs)
+  "Check an exotic cell of TYPE as DataCell.cpp does; (VALUES LEVEL-MASK STORED-HASHES STORED-DEPTHS),
+the stored lists only for a pruned branch."
+  (let ((nrefs (length refs)))
+    (case type
+      (1                                ; pruned branch: type, level mask, hashes, depths
+       (%need (and (zerop nrefs) (>= bit-length 16)) "A pruned branch has no references and a level mask byte")
+       (let* ((mask (%field bits bit-length 8 8)) (k (logcount mask)))
+         (%need (<= 1 mask 7) "A pruned branch's level mask must be 1..7, got ~D" mask)
+         (%need (= bit-length (* 8 (+ 2 (* 34 k))))
+                "A pruned branch of level mask ~D has ~D bits, expected ~D" mask bit-length (* 8 (+ 2 (* 34 k))))
+         (values mask
+                 (loop for j below k collect (%field-octets bits bit-length (+ 16 (* 256 j)) 32))
+                 (loop for j below k collect (%field bits bit-length (+ 16 (* 256 k) (* 16 j)) 16)))))
+      (2                                ; library reference: type, hash
+       (%need (and (= bit-length 264) (zerop nrefs)) "A library reference is 264 bits and has no references")
+       (values 0 nil nil))
+      (3                                ; Merkle proof: type, hash, depth; one child
+       (%need (and (= bit-length 280) (= nrefs 1)) "A Merkle proof is 280 bits with one reference")
+       (let ((child (svref refs 0)))
+         (%need (equalp (%field-octets bits bit-length 8 32) (node-hash-at child 0))
+                "A Merkle proof's hash does not match its subtree")
+         (%need (= (%field bits bit-length 264 16) (node-depth-at child 0))
+                "A Merkle proof's depth does not match its subtree")
+         (values (ash (node-level-mask child) -1) nil nil)))
+      (4                                ; Merkle update: type, two hashes, two depths; two children
+       (%need (and (= bit-length 552) (= nrefs 2)) "A Merkle update is 552 bits with two references")
+       (let ((old (svref refs 0)) (new (svref refs 1)))
+         (%need (and (equalp (%field-octets bits bit-length 8 32) (node-hash-at old 0))
+                     (equalp (%field-octets bits bit-length 264 32) (node-hash-at new 0)))
+                "A Merkle update's hashes do not match its subtrees")
+         (%need (and (= (%field bits bit-length 520 16) (node-depth-at old 0))
+                     (= (%field bits bit-length 536 16) (node-depth-at new 0)))
+                "A Merkle update's depths do not match its subtrees")
+         (values (ash (logior (node-level-mask old) (node-level-mask new)) -1) nil nil)))
+      (t (boc-error "Unknown exotic cell type ~D" type)))))
+
+(defun %compute-levels (type mask exotic-p bits bit-length refs stored-hashes stored-depths)
+  "(VALUES HASHES DEPTHS), one entry per significant level of MASK, lowest first.  Each hash is the
+SHA-256 of d1 (with the mask below that level), d2, then the cell's data for the first hash or the
+previous hash for the others, then the children's depths and hashes at that level (one higher
+under a Merkle proof/update).  A pruned branch computes only its highest hash: the lower ones
+are the ones it stores."
+  (let* ((total (1+ (logcount mask)))
+         (offset (if (= type 1) (1- total) 0))
+         (merkle (if (member type '(3 4)) 1 0))
+         (hashes (make-array total)) (depths (make-array total)) (i 0))
+    (loop for level from 0 to 3
+          when (or (zerop level) (logbitp (1- level) mask))
+            do (if (< i offset)
+                   (setf (svref hashes i) (as-octets (pop stored-hashes))
+                         (svref depths i) (pop stored-depths))
+                   (let* ((child-level (+ level merkle))
+                          (d1 (d1-byte (length refs) exotic-p (ldb (byte level 0) mask))))
+                     (setf (svref hashes i)
+                           (sha256 (concat-octets
+                                    (list* (octets d1 (d2-byte bit-length))
+                                           (if (= i offset) (data-octets bits bit-length) (svref hashes (1- i)))
+                                           (append (map 'list (lambda (r) (uint->octets (node-depth-at r child-level) 2)) refs)
+                                                   (map 'list (lambda (r) (node-hash-at r child-level)) refs)))))
+                           (svref depths i)
+                           (if (zerop (length refs))
+                               0
+                               (1+ (reduce #'max refs :key (lambda (r) (node-depth-at r child-level))))))
+                     (unless (< (svref depths i) 65536)
+                       (boc-error "Cell depth ~D exceeds 65535" (svref depths i)))))
+               (incf i))
+    (values hashes depths)))
 
 (defun make-cell (&key (bits 0) (bit-length 0) (refs '()) exotic)
-  "Construct an immutable cell.  BITS is the data as a non-negative integer
-of BIT-LENGTH bits (most significant bit first); REFS is a sequence of at
-most four NODEs.  The representation hash, depth and level are computed
-here, once, from the (already hashed) children."
+  "Construct an immutable cell.  BITS is the data as a non-negative integer of BIT-LENGTH bits
+(most significant bit first); REFS is a sequence of at most four NODEs.  The level mask, the
+hashes and the depths are computed here, once, from the (already built) children; an exotic cell
+is validated as DataCell.cpp does."
   (let ((refs (coerce refs 'simple-vector)))
     (unless (and (integerp bit-length) (<= 0 bit-length 1023))
       (boc-error "Cell data must be 0..1023 bits, got ~A" bit-length))
@@ -277,27 +379,79 @@ here, once, from the (already hashed) children."
     (unless (every #'node-p refs)
       (boc-error "References must be cells or absent cells: ~S" refs))
     (let* ((exotic-p (and exotic t))
-           (depth (if (zerop (length refs))
-                      0
-                      (1+ (reduce #'max refs :key #'node-depth))))
-           (level (reduce #'max refs :key #'node-level :initial-value 0))
-           (d1 (d1-byte (length refs) exotic-p level)))
-      (unless (< depth 65536)
-        (boc-error "Cell depth ~D exceeds 65535" depth))
-      (%make-cell (sha256 (representation-octets d1 bits bit-length refs))
-                  depth level bits bit-length refs exotic-p))))
+           (type (%special-type exotic-p bits bit-length)))
+      (multiple-value-bind (mask stored-hashes stored-depths)
+          (if exotic-p
+              (%validate-exotic type bits bit-length refs)
+              (values (reduce #'logior refs :key #'node-level-mask :initial-value 0) nil nil))
+        (multiple-value-bind (hashes depths)
+            (%compute-levels type mask exotic-p bits bit-length refs stored-hashes stored-depths)
+          (%make-cell (svref hashes (1- (length hashes))) (svref depths (1- (length depths)))
+                      (integer-length mask) mask hashes depths bits bit-length refs exotic-p))))))
 
 (defun make-absent-cell (hash &key (depth 0))
-  "A reference to a cell that is not part of the BOC and is known only by
-its 32-byte representation HASH (octets or hex string) and its DEPTH."
+  "A reference to a cell that is not part of the BOC and is known only by its 32-byte
+representation HASH (octets or hex string) and its DEPTH; it has level mask 0."
   (let ((hash (if (stringp hash) (hex->octets hash) (as-octets hash))))
     (unless (= (length hash) 32)
       (boc-error "A cell hash has 32 bytes, got ~D" (length hash)))
     (unless (and (integerp depth) (<= 0 depth 65535))
       (boc-error "Depth must be 0..65535, got ~A" depth))
-    (%make-absent-cell hash depth 0)))
+    (%make-absent-cell hash depth 0 0 (vector hash) (vector depth))))
 
 ;; CELL-HASH, CELL-DEPTH and CELL-LEVEL are the inherited slot accessors.
+
+;;; --- exotic cells: pruned branches and Merkle proofs/updates ---------------------
+
+(defun cell-special-type (cell)
+  "0 for an ordinary cell, else its type byte: 1 pruned branch, 2 library reference,
+3 Merkle proof, 4 Merkle update."
+  (%special-type (cell-exotic-p cell) (cell-bits cell) (cell-bit-length cell)))
+
+(defun pruned-branch-p (node)
+  (and (cell-p node) (= 1 (cell-special-type node))))
+
+(defun make-pruned-branch (node &key (level 1))
+  "The pruned branch standing in for NODE as seen at LEVEL (1..3, above NODE's own level): it
+keeps every hash and depth NODE has, and adds LEVEL to the level mask."
+  (unless (and (<= 1 level 3) (> level (node-level node)))
+    (boc-error "A pruned branch at level ~D needs a node below that level (this one has level ~D)"
+               level (node-level node)))
+  (let* ((mask (logior (node-level-mask node) (ash 1 (1- level))))
+         (b (store-uint (store-uint (begin-cell :exotic t) 1 8) mask 8)))
+    (loop for h across (node-hashes node) do (setf b (store-bytes b h)))
+    (loop for d across (node-depths node) do (setf b (store-uint b d 16)))
+    (end-cell b)))
+
+(defun %hash-arg (hash)
+  (if (stringp hash) (hex->octets hash) (as-octets hash)))
+
+(defun merkle-proof-root (proof)
+  "The tree a Merkle proof cell attests (pruned branches included)."
+  (unless (and (cell-p proof) (= 3 (cell-special-type proof)))
+    (boc-error "Not a Merkle proof: ~S" proof))
+  (svref (cell-refs proof) 0))
+
+(defun verify-merkle-proof (proof expected-hash)
+  "The tree PROOF attests, provided PROOF is a Merkle proof of a tree whose (level-0) hash is
+EXPECTED-HASH.  Cell construction has already checked that the proof's stated hash and depth are
+the tree's, pruned branches seen at level 0 as the subtrees they stand for."
+  (let ((root (merkle-proof-root proof)))
+    (unless (equalp (node-hash-at root 0) (%hash-arg expected-hash))
+      (boc-error "Merkle proof is of ~A, expected ~A"
+                 (octets->hex (node-hash-at root 0)) (octets->hex (%hash-arg expected-hash))))
+    root))
+
+(defun verify-merkle-update (update expected-old-hash)
+  "(VALUES NEW-HASH OLD-TREE NEW-TREE) of a Merkle update cell, provided it transforms the state
+whose hash is EXPECTED-OLD-HASH."
+  (unless (and (cell-p update) (= 4 (cell-special-type update)))
+    (boc-error "Not a Merkle update: ~S" update))
+  (let ((old (svref (cell-refs update) 0)) (new (svref (cell-refs update) 1)))
+    (unless (equalp (node-hash-at old 0) (%hash-arg expected-old-hash))
+      (boc-error "Merkle update starts from ~A, expected ~A"
+                 (octets->hex (node-hash-at old 0)) (octets->hex (%hash-arg expected-old-hash))))
+    (values (node-hash-at new 0) old new)))
 (defun cell-hash-hex (cell) (node-hash-hex cell))
 
 (defun cell-uint (cell start bit-length)
@@ -316,11 +470,6 @@ its 32-byte representation HASH (octets or hex string) and its DEPTH."
 (defun cell-data-octets (cell)
   (data-octets (cell-bits cell) (cell-bit-length cell)))
 
-(defun cell-representation (cell)
-  "The bytes whose SHA-256 is the cell's representation hash."
-  (representation-octets (d1-byte (length (cell-refs cell)) (cell-exotic-p cell) (node-level cell))
-                         (cell-bits cell) (cell-bit-length cell) (cell-refs cell)))
-
 ;;; ---------------------------------------------------------------------
 ;;; Builder: an immutable accumulator of bits and references.
 ;;;
@@ -335,9 +484,6 @@ its 32-byte representation HASH (octets or hex string) and its DEPTH."
   (bit-length 0 :type (integer 0 1023) :read-only t)
   (refs '() :type list :read-only t)            ; most recently stored first
   (exotic-p nil :type boolean :read-only t))
-
-(defun builder-refs-count (builder)
-  (length (builder-refs builder)))
 
 (defun begin-cell (&key exotic)
   (%make-builder 0 0 '() (and exotic t)))
@@ -493,18 +639,19 @@ real cell wins."
            (uint->octets (gethash (hash-key ref) index) ref-bytes)))
     (etypecase node
       (absent-cell
-       (concat-octets (list (octets (d1-byte 7 nil (node-level node) :with-hashes t) 0)
+       (concat-octets (list (octets (d1-byte 7 nil (node-level-mask node) :with-hashes t) 0)
                             (node-hash node)
                             (uint->octets (node-depth node) 2))))
       (cell
        (let ((refs (cell-refs node)))
          (concat-octets
-          (list* (octets (d1-byte (length refs) (cell-exotic-p node) (node-level node)
+          (list* (octets (d1-byte (length refs) (cell-exotic-p node) (node-level-mask node)
                                   :with-hashes inline-hash-p)
                          (d2-byte (cell-bit-length node)))
-                 ;; level is always 0 here, hence exactly one hash and depth
+                 ;; every significant level's hash, then every depth
                  (if inline-hash-p
-                     (concat-octets (list (node-hash node) (uint->octets (node-depth node) 2)))
+                     (concat-octets (append (coerce (node-hashes node) 'list)
+                                            (map 'list (lambda (d) (uint->octets d 2)) (node-depths node))))
                      (octets))
                  (cell-data-octets node)
                  (map 'list #'ref-index refs))))))))
@@ -581,8 +728,9 @@ a BOC, returned as OCTETS.
   "One cell body as read from the wire, before references are resolved."
   (absent-p nil :read-only t)
   (exotic-p nil :read-only t)
-  (hash nil :read-only t)                ; only when h = 1
-  (depth nil :read-only t)               ; only when h = 1
+  (level-mask 0 :read-only t)
+  (hashes nil :read-only t)              ; only when h = 1: one per significant level
+  (depths nil :read-only t)              ; ... likewise
   (bits 0 :read-only t)
   (bit-length 0 :read-only t)
   (ref-indices '() :read-only t))
@@ -618,12 +766,14 @@ a BOC, returned as OCTETS.
            (absent-p (= refs-count 7)))
       (when (and (> refs-count 4) (not (and absent-p with-hashes)))
         (boc-error "Invalid descriptor byte #x~2,'0x at offset ~D" d1 pos))
-      (unless (zerop level-mask)
-        (boc-error "Cell at offset ~D has level mask ~D; only level-0 cells are supported"
-                   pos level-mask))
-      (let* ((hash (and with-hashes (sub (+ pos 2) 32)))
-             (depth (and with-hashes (u (+ pos 34) 2)))
-             (data-pos (+ pos 2 (if with-hashes 34 0)))
+      (when (and absent-p (plusp level-mask))
+        (boc-error "An absent cell at offset ~D has level mask ~D" pos level-mask))
+      (let* ((hash-count (1+ (logcount level-mask)))
+             (hashes (and with-hashes
+                          (loop for j below hash-count collect (sub (+ pos 2 (* 32 j)) 32))))
+             (depths (and with-hashes
+                          (loop for j below hash-count collect (u (+ pos 2 (* 32 hash-count) (* 2 j)) 2))))
+             (data-pos (+ pos 2 (if with-hashes (* 34 hash-count) 0)))
              (data-length (ceiling d2 2))
              (refs-pos (+ data-pos data-length))
              (ref-indices (if absent-p
@@ -631,7 +781,8 @@ a BOC, returned as OCTETS.
                               (loop for j below refs-count
                                     collect (u (+ refs-pos (* j ref-bytes)) ref-bytes)))))
         (multiple-value-bind (bits bit-length) (unpack-data (sub data-pos data-length) (oddp d2))
-          (cons (make-raw-cell :absent-p absent-p :exotic-p exotic-p :hash hash :depth depth
+          (cons (make-raw-cell :absent-p absent-p :exotic-p exotic-p :level-mask level-mask
+                               :hashes hashes :depths depths
                                :bits bits :bit-length bit-length :ref-indices ref-indices)
                 (+ refs-pos (* (length ref-indices) ref-bytes))))))))
 
@@ -654,7 +805,7 @@ building from the last cell backwards always finds finished children."
          (nodes (make-array n)))
     (flet ((build (i raw)
              (if (raw-cell-absent-p raw)
-                 (make-absent-cell (raw-cell-hash raw) :depth (raw-cell-depth raw))
+                 (make-absent-cell (first (raw-cell-hashes raw)) :depth (first (raw-cell-depths raw)))
                  (let ((cell (make-cell
                               :bits (raw-cell-bits raw)
                               :bit-length (raw-cell-bit-length raw)
@@ -664,10 +815,13 @@ building from the last cell backwards always finds finished children."
                                                 (boc-error "Cell ~D references cell ~D; references must point forward" i j))
                                               (aref nodes j))
                                             (raw-cell-ref-indices raw)))))
-                   (when (and (raw-cell-hash raw)
-                              (not (and (equalp (raw-cell-hash raw) (node-hash cell))
-                                        (= (raw-cell-depth raw) (node-depth cell)))))
-                     (boc-error "Inlined hash/depth of cell ~D do not match its contents" i))
+                   (unless (= (raw-cell-level-mask raw) (node-level-mask cell))
+                     (boc-error "Cell ~D declares level mask ~D but its contents give ~D"
+                                i (raw-cell-level-mask raw) (node-level-mask cell)))
+                   (when (and (raw-cell-hashes raw)
+                              (not (and (every #'equalp (raw-cell-hashes raw) (node-hashes cell))
+                                        (every #'= (raw-cell-depths raw) (node-depths cell)))))
+                     (boc-error "Inlined hashes/depths of cell ~D do not match its contents" i))
                    cell))))
       (loop for i from (1- n) downto 0
             do (setf (aref nodes i) (build i (aref raws i))))
@@ -704,6 +858,8 @@ is verified unless CHECK-CRC is NIL."
              (expected-length (+ data-end (if has-crc32c 4 0))))
         (unless (zerop (logand flags #x18))
           (boc-error "Reserved BOC flags are set: #x~2,'0x" flags))
+        (when (logbitp 5 flags)
+          (boc-error "BOC has_cache_bits is not supported"))
         (unless (and (<= 1 ref-bytes 4) (<= 1 offset-bytes 8))
           (boc-error "Invalid size fields: size ~D, off_bytes ~D" ref-bytes offset-bytes))
         (unless (and (<= 1 root-count) (<= (+ root-count absent-count) cell-count))
@@ -736,14 +892,6 @@ is verified unless CHECK-CRC is NIL."
          (leaf-b (build-cell (store-uint #x0aaaaa 24)))
          (mid (build-cell (store-uint #xfe 8) (store-ref leaf-b))))
     (build-cell (store-uint #b01 2) (store-ref leaf-a) (store-ref mid))))
-
-(defun demo ()
-  (let ((root (demo-root)))
-    (format t "root hash:     ~A~%" (cell-hash-hex root))
-    (format t "cells in tree: 4, cells in BOC: ~D~%" (length (collect-nodes root)))
-    (format t "boc (idx):     ~A~%" (octets->hex (serialize-boc root :has-idx t :has-crc32c nil)))
-    (format t "boc (crc32c):  ~A~%" (octets->hex (serialize-boc root)))
-    root))
 
 ;;; ---------------------------------------------------------------------
 ;;; Self-test.  Reference values were produced with @ton/core.

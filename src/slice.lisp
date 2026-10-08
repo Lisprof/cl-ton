@@ -28,6 +28,14 @@
   (ref-pos 0 :type (integer 0 4) :read-only t))
 
 (defun cell-slice (cell)
+  "A slice reading CELL from its first bit.  An exotic cell (pruned branch, library reference,
+Merkle proof or update) is not data: its bytes are a type, a level mask and hashes, and reading
+them as TL-B would let a pruned subtree pass for content -- the C++ VM's virtualization error."
+  (when (cell-exotic-p cell)
+    (ton-error "virtualization error: cannot read ~A as data"
+               (case (cell-special-type cell)
+                 (1 "a pruned branch") (2 "a library reference") (3 "a Merkle proof") (4 "a Merkle update")
+                 (t "an exotic cell"))))
   (%make-slice cell 0 0))
 
 (defun slice-remaining-bits (s)

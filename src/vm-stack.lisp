@@ -26,8 +26,6 @@
 
 (in-package :cl-ton)
 
-(defun stack-int (x) x)
-(defun stack-cell (c) c)
 (defun stack-slice (c) (if (slice-p c) c (cell-slice c)))
 (defconstant +stack-null+ :null)
 (defun stack-null () :null)

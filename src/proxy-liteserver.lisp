@@ -436,9 +436,6 @@ once the process has exited (or the hard kill's own TIMEOUT has passed)."
 name (workchain,shard-hex)."
   (format nil "~A (~D,~(~16,'0X~))" (qinfo-name q) (qinfo-workchain q) (%unsigned64 (qinfo-shard q))))
 
-(defun %lower-first (name)
-  (concatenate 'string (string-downcase (subseq name 0 1)) (subseq name 1)))
-
 (defun %decode-function (fn-octets)
   "The decoded liteServer function in FN-OCTETS, or (CONSTRUCTOR-ID . FN-OCTETS) when the schema
 does not know it."

@@ -20,27 +20,28 @@
   (:nicknames :ton-client)
   (:use :cl)  
   (:export
-   ;; files.lisp: locating BUILDER.LISP's bundled env/ binaries
-   :bundled-env-binary :clear-bundled-env-binary-cache
    ;; tonlib.lisp: resolve-time getter retry
    :call-with-getter-retry :definitive-getter-failure-p :*getter-retry-attempts* :*getter-retry-delay*
    ;; boc (formerly the separate :ton-boc package; see src/ton-boc.lisp)
    :boc-error
    :builder :builder-p :begin-cell :build-cell
-   :builder-bits :builder-bit-length :builder-refs :builder-refs-count :builder-exotic-p
+   :builder-bits :builder-bit-length :builder-refs :builder-exotic-p
    :store-bit :store-bits :store-uint :store-int :store-bytes
    :store-bit-vector :store-ref :store-builder :end-cell
    :node :node-p :node-hash :node-hash-hex :node-depth :node-level :node-equal
+   :node-level-mask :node-hashes :node-depths :node-hash-at :node-depth-at
+   :cell-special-type :pruned-branch-p :make-pruned-branch
+   :merkle-proof-root :verify-merkle-proof :verify-merkle-update
    :cell :cell-p :make-cell
    :cell-bits :cell-bit-length :cell-refs :cell-exotic-p
    :cell-bit :cell-uint :cell-bit-vector :cell-data-octets
-   :cell-hash :cell-hash-hex :cell-depth :cell-level :cell-representation
+   :cell-hash :cell-hash-hex :cell-depth :cell-level 
    :absent-cell :absent-cell-p :make-absent-cell
    :collect-nodes :parse-boc :crc32c
    :pmap :*worker-count* :*parallel-threshold*
    :octets :octets->hex :hex->octets
    :as-octets :uint->octets :octets->uint :concat-octets :sha256
-   :demo :run-boc-tests
+   :run-boc-tests
    ;; conditions  
    :ton-error :tonlib-error :tonlib-error-code :tonlib-error-message :emulator-error  
    ;; tl.lisp: TL serialization primitives
@@ -49,6 +50,9 @@
    :tl-write-bytes :tl-write-string :tl-write-vector
    :make-tl-reader :tl-reader-remaining :tl-reader-eof-p :tl-take :tl-read-uint
    :tl-read-int32 :tl-read-int64 :tl-read-int256 :tl-read-bytes :tl-read-string :tl-read-vector
+   ;; tl.lisp: the typed tonlib API (cl-ton/tl/tonlib_api.tl)
+   :tlapi-make :tlapi-validate :tlapi-get :tlapi-is :tlapi-obj :tlapi-obj-p :tlapi-obj-name
+   :tlapi-function-p :tlapi-constructor-names :tlapi->plist :json->tlapi
    ;; adnl-crypto.lisp
    :x25519 :x25519-reference :adnl-shared-secret :adnl-key-id :ed25519-public-from-seed :ed25519-pub->x25519-pub
    :ed25519-clamped-scalar-octets :make-aes-ctr :aes-ctr-process :adnl-handshake-key-iv
@@ -73,11 +77,11 @@
    :address :address-p :make-address :address-workchain :address-hash  
    :parse-address :address->string :address->raw-string :address-equal  
    :store-address :store-coins :store-maybe-ref :store-either-ref  
-   :store-string-tail :nano :from-nano :usdt-units :from-usdt-units  
+   :nano :from-nano :usdt-units :from-usdt-units  
    :make-state-init :state-init-address  
    :internal-message-relaxed :external-message :serialize-boc  
    ;; vm-stack  
-   :stack-int :stack-cell :stack-slice :stack-null  
+   :stack-slice :stack-null  
    :serialize-vm-stack :parse-vm-stack  
    ;; tonlib  
    :tonlib :open-tonlib :close-tonlib :with-tonlib :tonlib-call :ensure-keystore
@@ -87,7 +91,7 @@
    :account-state-last-lt :account-state-last-hash :account-state-status  
    :tonlib-run-get-method :make-tonlib-getter :make-local-getter :tonlib-send-message :*get-method-block*
    :tonlib-config-cell :tonlib-shard-account-cell :tonlib-libraries :collect-library-hashes :library-cell-hash :tonlib-transactions
-   :transaction-utime :transaction-lt :transaction-in-msg-source :transaction-out-count
+   :transaction-out-count
    :transaction-matches-broadcast-p
    ;; emulator  
    :load-emulator-library :run-get-method-local :emulate-external-message :emulate-message :parse-message-header :funded-shard-account :emulation-result  
@@ -96,7 +100,7 @@
    :proxy-liteserver :proxy-liteserver-p :proxy-liteserver-port :proxy-liteserver-process
    :proxy-liteserver-binary :proxy-liteserver-db :proxy-liteserver-global-config
    :validate-proxy-liteserver-preconditions
-   :open-proxy-liteserver :*proxy-liteserver-implementation* :close-proxy-liteserver :proxy-liteserver-alive-p :open-tonlib-via-proxy :check-routed-config :write-account-fixture :read-account-fixture :fakechain-load-fixture
+   :open-proxy-liteserver :*proxy-liteserver-implementation* :close-proxy-liteserver :proxy-liteserver-alive-p :open-tonlib-via-proxy :check-routed-config
    :read-proxy-liteserver-identity :proxy-liteserver-entry :proxy-liteserver-config
    :proxy-liteserver-global-config-path :ipv4-string->ip-int
    ;; proxy diagnostics (where does the native proxy stop?)
@@ -122,7 +126,7 @@
    ;; dex-dedust.lisp/dex-storm.lisp).
    :message-spec :message-spec-to :message-spec-value :message-spec-body :message-spec-state-init :make-message-spec
    :dex-resolve :dex-id :dex-pool-address :dex-pool-state
-   :dex-swap-ton->usdt :dex-swap-usdt->ton :dex-swap-cycle
+   :dex-swap-ton->usdt :dex-swap-cycle
    ;; wallet  
    :keypair :keypair-public :mnemonic->keypair :seed->keypair  
    :wallet-v5r1 :make-wallet-v5r1 :wallet-v5r1-p :wallet-address :wallet-state-init  

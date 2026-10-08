@@ -88,18 +88,36 @@ validator set; tonlib recomputes it and compares.")
   (make-cell :bits bits :bit-length nbits :refs refs :exotic t))
 
 (defun make-merkle-proof (node)
-  "MerkleProof exotic cell over NODE (level-0 tree, unpruned)."
-  (%exotic-cell (logior (ash 3 272) (ash (%hash->int (node-hash node)) 16) (node-depth node))
+  "MerkleProof exotic cell over NODE: its hash and depth are NODE's at level 0, so NODE may
+contain pruned branches (see PRUNE-TREE)."
+  (%exotic-cell (logior (ash 3 272) (ash (%hash->int (node-hash-at node 0)) 16) (node-depth-at node 0))
                 (+ 8 256 16) (list node)))
 
 (defun make-merkle-update (old new)
-  "MerkleUpdate: type 4, old_hash, new_hash, old_depth, new_depth."
+  "MerkleUpdate: type 4, old_hash, new_hash, old_depth, new_depth (all at level 0)."
   (let ((bits (logior (ash 4 (+ 256 256 16 16))
-                      (ash (%hash->int (node-hash old)) (+ 256 16 16))
-                      (ash (%hash->int (node-hash new)) (+ 16 16))
-                      (ash (node-depth old) 16)
-                      (node-depth new))))
+                      (ash (%hash->int (node-hash-at old 0)) (+ 256 16 16))
+                      (ash (%hash->int (node-hash-at new 0)) (+ 16 16))
+                      (ash (node-depth-at old 0) 16)
+                      (node-depth-at new 0))))
     (%exotic-cell bits (+ 8 256 256 16 16) (list old new))))
+
+(defun prune-tree (root visible-p &key (level 1))
+  "ROOT rebuilt so that every cell for which VISIBLE-P (called once per distinct cell, never for
+ROOT or for a cell that is already a pruned branch) answers false is a pruned branch at LEVEL, and
+the rest is kept whole.  Sharing is preserved.  The result, wrapped by MAKE-MERKLE-PROOF, is a
+proof of ROOT's hash that reveals only the visible cells."
+  (let ((done (make-hash-table :test #'equalp)))
+    (labels ((walk (node top)
+               (cond ((or (not (cell-p node)) (pruned-branch-p node)) node)
+                     (t (or (gethash (node-hash node) done)
+                            (setf (gethash (node-hash node) done)
+                                  (if (or top (funcall visible-p node))
+                                      (make-cell :bits (cell-bits node) :bit-length (cell-bit-length node)
+                                                 :exotic (cell-exotic-p node)
+                                                 :refs (map 'list (lambda (r) (walk r nil)) (cell-refs node)))
+                                      (make-pruned-branch node :level level))))))))
+      (walk root t))))
 
 (defun boc-of (&rest roots)
   (serialize-boc roots :has-crc32c nil))
@@ -396,10 +414,6 @@ BALANCE nanoTON.  STATE-INIT overrides CODE/DATA when given."
       (setf (gethash (fc-address-key addr) (fakechain-accounts fc)) sa)
       sa)))
 
-(defun fakechain-set-shard-account (fc addr shard-account)
-  (with-fc-lock (fc)
-    (setf (gethash (fc-address-key addr) (fakechain-accounts fc)) shard-account)))
-
 (defun fakechain-account-balance (fc addr)
   (%safe-balance (fc-shard-account fc addr)))
 
@@ -501,11 +515,14 @@ KeyMaxLt = key:Bool(0) max_end_lt:uint64 aggregated as the max over the subtree.
                      (store-bit mb 0)))))
       (end-cell (%store-cc (store-ref b (end-cell mb)) 0)))))
 
-;;; --- Merkle update (unpruned: both trees kept whole, every cell level 0) ---------
+;;; --- Merkle update (over pruned states, as real blocks have it) ------------------
 
 (defun make-state-update (old new)
-  "MERKLE_UPDATE (exotic type 4) from OLD to NEW state roots."
-  (make-merkle-update old new))
+  "MERKLE_UPDATE (exotic type 4) from OLD to NEW state roots.  As in a real block its two subtrees
+are the state roots with everything below them pruned: an update reads its children one level up,
+so pruning below it later (in a header proof) would change its hash; built this way it never does."
+  (flet ((pruned (root) (prune-tree root (constantly nil))))
+    (make-merkle-update (pruned old) (pruned new))))
 
 ;;; --- blocks ----------------------------------------------------------------------
 
@@ -771,10 +788,6 @@ masterchain + workchain-0 block pair.  Returns the new FC-BLOCK."
   (tl-block-id-ext :workchain 0 :shard (- (expt 2 63)) :seqno (fc-block-seqno blk)
                    :root-hash (fc-block-sh-root blk) :file-hash (fc-block-sh-file blk)))
 
-(defun fc-zero-id (fc)
-  (tl-block-id-ext :workchain -1 :shard (- (expt 2 63)) :seqno 0
-                   :root-hash (fakechain-zero-root fc) :file-hash (fakechain-zero-file fc)))
-
 (defun fc-zero-state-id (fc)
   (tl-make "tonNode.zeroStateIdExt" :workchain -1
            :root-hash (fakechain-zero-root fc) :file-hash (fakechain-zero-file fc)))
@@ -785,6 +798,101 @@ masterchain + workchain-0 block pair.  Returns the new FC-BLOCK."
 (defun fc-find-block (fc seqno)
   (let ((blocks (fakechain-blocks fc)))
     (find seqno blocks :key #'fc-block-seqno)))
+
+(defun fc-header-proof-node (block)
+  "BLOCK as a liteserver reveals it in a header proof: BlockInfo and the state_update (already over
+pruned states, see MAKE-STATE-UPDATE) whole, and ValueFlow and BlockExtra pruned -- a Merkle proof of the
+block's hash that shows only what a client needs to read the header."
+  (destructuring-bind (info value-flow state-update extra) (coerce (cell-refs block) 'list)
+    (declare (ignore value-flow extra))
+    (let ((visible (make-hash-table :test #'equalp)))
+      (dolist (n (append (collect-nodes info) (collect-nodes state-update)))
+        (setf (gethash (node-hash n) visible) t))
+      (prune-tree block (lambda (c) (gethash (node-hash c) visible))))))
+
+(defun dict-path-cells (root key key-bits)
+  "The cells a lookup of KEY visits in the Hashmap(Aug) whose root edge cell is ROOT: an edge
+cell is a label and then either the value (no bits left) or two forks."
+  (let ((path '()))
+    (labels ((walk (cell m consumed)
+               (push cell path)
+               (multiple-value-bind (label n s) (load-hm-label (cell-slice cell) m)
+                 (declare (ignore label))
+                 (when (> m n)
+                   (multiple-value-bind (left s2) (load-ref s)
+                     (let ((right (load-ref s2))
+                           (bit (ldb (byte 1 (- key-bits consumed n 1)) key)))
+                       (walk (if (zerop bit) left right) (- m n 1) (+ consumed n 1))))))))
+      (walk root key-bits 0))
+    (nreverse path)))
+
+(defun fc-state-proof-node (state key &optional account-present)
+  "The shard STATE as a liteserver reveals it for the account KEY: the header fields, the
+ShardAccounts cell and the dictionary cells on the lookup path of KEY (with, when the account
+exists, its ShardAccount value and the Account below it); everything else (the other accounts,
+the message queue, the balances) pruned."
+  (let ((accounts (svref (cell-refs state) 1))
+        (visible (make-hash-table :test #'equalp)))
+    (flet ((show (c) (setf (gethash (node-hash c) visible) t)))
+      (show accounts)
+      ;; the ^[overload_history ... total_balance ... master_ref] cell: unpacking the state record
+      ;; reads its fields, not just its hash
+      (show (svref (cell-refs state) 2))
+      (when (= 1 (cell-uint accounts 0 1))
+        (let ((path (dict-path-cells (first-ref-cell accounts) key 256)))
+          (mapc #'show path)
+          (when (and account-present (plusp (length (cell-refs (car (last path))))))
+            (mapc #'show (collect-nodes (first-ref-cell (car (last path)))))))))
+    (prune-tree state (lambda (c) (gethash (node-hash c) visible)))))
+
+(defun fc-mc-state-proof-node (state workchain)
+  "The masterchain STATE as a liteserver reveals it to locate a shard block: the header fields,
+the tail cell, McStateExtra with its flags/validator-info cell, and the shard_hashes dictionary
+path of WORKCHAIN down to its BinTree of shard descriptions; everything else pruned."
+  (let* ((visible (make-hash-table :test #'equalp))
+         (custom (svref (cell-refs state) 3))
+         (refs (cell-refs custom)))
+    (flet ((show (c) (setf (gethash (node-hash c) visible) t)))
+      (show (svref (cell-refs state) 2))
+      (show custom)
+      (when (= 3 (length refs))          ; shard_hashes present: its root, the config, the ^[...] cell
+        (show (svref refs 2))
+        (let ((path (dict-path-cells (svref refs 0) workchain 32)))
+          (mapc #'show path)
+          (mapc #'show (collect-nodes (first-ref-cell (car (last path))))))))
+    (prune-tree state (lambda (c) (gethash (node-hash c) visible)))))
+
+(defparameter *fc-config-proof-params* '(8 28 29 32 33 34 35 36 37)
+  "The configuration parameters a config proof reveals: what a client syncing along key blocks
+reads -- the validator sets (past, current, next and their temporary variants, 32..37), and what
+it needs to derive the signing subset from them (catchain and consensus configuration, 28 and 29,
+and the global version, 8).")
+
+(defun fc-config-proof-node (state &optional (params *fc-config-proof-params*))
+  "The masterchain STATE as a liteserver reveals it to prove configuration parameters: the header
+fields, the tail cell, McStateExtra with its flags cell, and for each of PARAMS the dictionary
+path in the config down to the parameter's value; everything else (shard descriptions, the other
+parameters, the accounts) pruned.  PARAMS may be :ALL for the whole configuration (what
+getConfigAll serves: the client reads the config out of the proof)."
+  (let* ((visible (make-hash-table :test #'equalp))
+         (custom (svref (cell-refs state) 3))
+         (refs (cell-refs custom))
+         (dict-present (= 3 (length refs)))
+         (config (svref refs (if dict-present 1 0))))
+    (flet ((show (c) (setf (gethash (node-hash c) visible) t)))
+      (show (svref (cell-refs state) 2))
+      (show custom)
+      (show (svref refs (1- (length refs))))
+      (when (eq params :all)
+        (mapc #'show (collect-nodes custom)))
+      (dolist (key (if (eq params :all) '() params))
+        (let ((path (dict-path-cells config key 32)))
+          (mapc #'show path)
+          ;; a parameter's value is the ^Cell the leaf points to; absent parameters end the path early
+          (let ((leaf (car (last path))))
+            (when (plusp (length (cell-refs leaf)))
+              (mapc #'show (collect-nodes (first-ref-cell leaf))))))))
+    (prune-tree state (lambda (c) (gethash (node-hash c) visible)))))
 
 (defun fc-proof-boc (&rest nodes)
   (serialize-boc (mapcar #'make-merkle-proof nodes) :has-crc32c nil))
@@ -797,9 +905,9 @@ masterchain + workchain-0 block pair.  Returns the new FC-BLOCK."
 (defun fc-forward-link (fc from-id blk)
   (tl-make "liteServer.blockLinkForward"
            :to-key-block nil :from from-id :to (fc-mc-id blk)
-           :dest-proof (fc-proof-boc (fc-block-mc-block blk))
-           :config-proof (fc-proof-boc (fakechain-zero-state fc))
-           :signatures (tl-make "liteServer.signatureSet"
+           :dest-proof (fc-proof-boc (fc-header-proof-node (fc-block-mc-block blk)))
+           :config-proof (fc-proof-boc (fc-config-proof-node (fakechain-zero-state fc)))
+           :signatures (tl-make "liteServer.signatureSet.ordinary"
                                 :validator-set-hash (fc-validator-set-hash) :catchain-seqno 0
                                 :signatures (vector (tl-make "liteServer.signature"
                                                              :node-id-short (adnl-short-id (keypair-public (fakechain-validator fc)))
@@ -850,13 +958,16 @@ masterchain + workchain-0 block pair.  Returns the new FC-BLOCK."
   (let* ((id (tl-get fn :id))
          (blk (or (fc-find-block fc (tl-get id :seqno)) (fc-head fc)))
          (addr (tl-get fn :account)))
-    (multiple-value-bind (sa) (fc-account-from-blk blk addr)
+    (multiple-value-bind (sa key) (fc-account-from-blk blk addr)
       (let ((acc (and sa (fc-account-cell sa))))
         (tl-encode
          (tl-make "liteServer.accountState"
                   :id (fc-mc-id blk) :shardblk (fc-sh-id blk)
-                  :shard-proof (fc-proof-boc (fc-block-mc-block blk) (fc-block-mc-state blk))
-                  :proof (fc-proof-boc (fc-block-sh-block blk) (fc-block-sh-state blk))
+                  :shard-proof (fc-proof-boc (fc-header-proof-node (fc-block-mc-block blk))
+                                             (fc-mc-state-proof-node (fc-block-mc-state blk)
+                                                                     (tl-get addr :workchain)))
+                  :proof (fc-proof-boc (fc-header-proof-node (fc-block-sh-block blk))
+                                       (fc-state-proof-node (fc-block-sh-state blk) key (and sa t)))
                   :state (if acc (fc-cells-boc (list acc)) (fc-cells-boc '()))))))))
 
 (defun fc-tx-lt (tx)
@@ -933,15 +1044,15 @@ when more transactions remain than COUNT."
   (declare (ignore fn))
   (let ((h (fc-head fc)))
     (tl-encode (tl-make "liteServer.configInfo" :mode 0 :id (fc-mc-id h)
-                                               :state-proof (fc-proof-boc (fc-block-mc-block h))
-                                               :config-proof (fc-proof-boc (fc-block-mc-state h))))))
+                                               :state-proof (fc-proof-boc (fc-header-proof-node (fc-block-mc-block h)))
+                                               :config-proof (fc-proof-boc (fc-config-proof-node (fc-block-mc-state h) :all))))))
 
 (defun fc-answer-block-header (fc fn)
   (let* ((id (tl-get fn :id))
          (blk (fc-find-block fc (tl-get id :seqno))))
     (if blk
         (tl-encode (tl-make "liteServer.blockHeader" :id (fc-mc-id blk) :mode 0
-                                                     :header-proof (fc-proof-boc (fc-block-mc-block blk))))
+                                                     :header-proof (fc-proof-boc (fc-header-proof-node (fc-block-mc-block blk)))))
         (fc-error 651 "block not found"))))
 
 (defun fc-wait-for-seqno (fc seqno timeout-ms)
