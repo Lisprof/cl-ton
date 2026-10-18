@@ -216,25 +216,6 @@ obtained so far (every one is a step of tonlib's verified chain).  NIL for the r
 which has no such counter -- the sync is then simply retried a fixed number of times."
   (and (%native-of proxy) (lambda () (proxy-ok-count proxy "getBlockProof"))))
 
-(defun open-tonlib-via-proxy (proxy global-config-path &key library-path (verbosity 0)
-                                                           (keystore :in-memory) (sync t) output-path)
-  "Phase E.  Route a tonlib client through PROXY (either implementation): write
-GLOBAL-CONFIG-PATH's JSON with its liteservers replaced by PROXY's single
-127.0.0.1 entry (PROXY-LITESERVER-GLOBAL-CONFIG-PATH), then OPEN-TONLIB on that.
-Returns (VALUES TONLIB ROUTED-CONFIG-PATH).  The routed config is checked to name
-exactly one liteserver, on loopback, before tonlib ever sees it: a tonlib that
-could reach anything else would defeat the point of the proxy (and of tests that
-must touch no real network)."
-  (let* ((out (or output-path
-                  (merge-pathnames "tonlib-via-proxy.global.json"
-                                   (uiop:ensure-directory-pathname (proxy-liteserver-db proxy)))))
-         (path (proxy-liteserver-global-config-path proxy global-config-path out)))
-    (check-routed-config path)
-    (values (open-tonlib path :library-path library-path :verbosity verbosity
-                              :keystore keystore :sync sync
-                              :sync-progress (proxy-progress-function proxy))
-            path)))
-
 (defun proxy-liteserver-alive-p (proxy)
   (and proxy
        (if (proxy-liteserver-native proxy)
@@ -1770,11 +1751,11 @@ REPORT-STRING); with TONLIB, OK-P needs the sync and the account read to succeed
                (when (and ready tonlib)
                  (handler-case
                      (let ((t0 (get-internal-real-time)))
-                       (setf tl (open-tonlib-via-proxy proxy global-config :library-path library-path
+                       (setf tl (funcall (tonlib-oracle :open-via-proxy) proxy global-config :library-path library-path
                                                                              :keystore (ensure-keystore keystore)
                                                                              :sync nil))
                        (say "tonlib: synchronising through the proxy (block proofs from the init block; minutes on a weak link, quick when the keystore already holds the state)...")
-                       (let ((seqno (tonlib-sync tl :timeout sync-timeout :total-timeout sync-total-timeout
+                       (let ((seqno (funcall (tonlib-oracle :sync) tl :timeout sync-timeout :total-timeout sync-total-timeout
                                                     :progress (proxy-progress-function proxy)
                                                     :on-attempt (lambda (n e gained now)
                                                                   (declare (ignore e))

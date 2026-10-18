@@ -16,7 +16,9 @@
                 (and (find-package :deploy)
                      (funcall (find-symbol "DEPLOYED-P" :deploy))
                      (merge-pathnames "lib/" (funcall (find-symbol "RUNTIME-DIRECTORY" :deploy))))
-                (ignore-errors (merge-pathnames "lib/" (asdf:system-source-directory "cl-ton"))))))
+                (ignore-errors (merge-pathnames "lib/" (asdf:system-source-directory "cl-ton")))
+                ;; the test-only libraries: tonlibjson (the JSON tonlib oracle) and compat/
+                (ignore-errors (merge-pathnames "tests/lib/" (asdf:system-source-directory "cl-ton"))))))
 
 (defun %lib (name)
   "Namestring of the native library NAME (e.g. \"tonlibjson-linux-x86_64.so\"), or NIL."

@@ -96,7 +96,7 @@
    :stack-slice :stack-null  
    :serialize-vm-stack :parse-vm-stack  
    ;; tonlib  
-   :tonlib :open-tonlib :close-tonlib :with-tonlib :tonlib-call :ensure-keystore
+   :tonlib :tonlib-oracle :tonlib-json-op :*tonlib-oracle* :open-tonlib :close-tonlib :with-tonlib :tonlib-call :ensure-keystore
    :tonlib-masterchain-info :tonlib-masterchain-block :tonlib-shards  
    :tonlib-block-transactions :tonlib-sync :tonlib-account-state :account-state  
    :account-state-balance :account-state-code :account-state-data  

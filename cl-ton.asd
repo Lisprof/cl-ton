@@ -61,6 +61,7 @@
 			     (:file "files")         ; BUNDLED-ENV-BINARY: locates the fift/proxy-liteserver released
                                              ; binaries (test environment only): <bin>/env/ or beside the
                                              ; binary, cl-ton/tests/ in a checkout, TON_*_BINARY, PATH
+			     (:file "tonlib-oracle") ; the JSON tonlib (libtonlibjson via CFFI): a TEST ORACLE, not part of the lean build
 			     (:file "fakechain")     ; the emulator-backed liteserver (the test network), tests only
 			     (:file "client")
 			     (:file "fake-chain")
