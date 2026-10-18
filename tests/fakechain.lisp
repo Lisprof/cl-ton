@@ -436,7 +436,22 @@ BALANCE nanoTON.  STATE-INIT overrides CODE/DATA when given."
 (defun %bt-leaf (&rest descr-args)
   (end-cell (apply #'%shard-descr (store-bit (begin-cell) 0) descr-args)))
 
-(defun build-shard-state (&key workchain shard seqno utime lt accounts-root total master-ref custom)
+(defun %libraries-dict-bits (b libraries)
+  "HashmapE 256 LibDescr over LIBRARIES (alist hash-hex . lib cell): the presence bit and the root reference."
+  (if (null libraries)
+      (store-bit b 0)
+      (store-ref (store-bit b 1)
+                 (cl-ton::hashmap-cell
+                  (mapcar (lambda (e)
+                            (cons (parse-integer (car e) :radix 16)
+                                  (let ((lib (cdr e)))
+                                    (lambda (vb)
+                                      ;; shared_lib_descr$00 lib:^Cell publishers:(Hashmap 256 True), one publisher
+                                      (cl-ton::store-hm-label (store-ref (store-uint vb 0 2) lib) 1 256 256)))))
+                          libraries)
+                  256))))
+
+(defun build-shard-state (&key workchain shard seqno utime lt accounts-root total master-ref custom libraries)
   "ShardStateUnsplit."
   (let* ((b (begin-cell))
          (b (store-uint b #x9023afe2 32))
@@ -451,7 +466,7 @@ BALANCE nanoTON.  STATE-INIT overrides CODE/DATA when given."
          (tail (let* ((tb (begin-cell))
                       (tb (store-uint tb 0 64)) (tb (store-uint tb 0 64))
                       (tb (%store-cc tb total)) (tb (%store-cc tb 0))
-                      (tb (store-bit tb 0)))
+                      (tb (%libraries-dict-bits tb libraries)))
                  (end-cell (if master-ref
                                (destructuring-bind (end-lt seqno root file) master-ref
                                  (%store-ext-blk-ref (store-bit tb 1) end-lt seqno root file))
@@ -552,24 +567,67 @@ so pruning below it later (in a header proof) would change its hash; built this 
          (b (end-cell (%store-cc (%store-cc (%store-cc (%store-cc (begin-cell) 0) 0) 0) 0))))
     (end-cell (store-ref (store-ref (%store-cc (store-uint (begin-cell) #xb8e48dfb 32) 0) a) b))))
 
-(defun %block-extra-cell (utime)
+(defun %mc-block-extra-cell (shard-entries)
+  "McBlockExtra#cca5 key_block:(## 1) shard_hashes:ShardHashes shard_fees:ShardFees ^[...]: the shard
+hashes of SHARD-ENTRIES (a list of (WORKCHAIN . BT-LEAF-CELL)), no fees, no signatures."
+  (let* ((b (store-uint (begin-cell) #xcca5 16))
+         (b (store-bit b 0))                                    ; key_block
+         (b (store-dict b (mapcar (lambda (e) (cons (car e) (let ((c (cdr e))) (lambda (vb) (store-ref vb c)))))
+                                  shard-entries)
+                        32))
+         (b (%store-cc (%store-cc (store-bit b 0) 0) 0))        ; shard_fees: empty HashmapAugE + its extra
+         (b (store-ref b (end-cell (store-bit (store-bit (store-bit (begin-cell) 0) 0) 0)))))
+    (end-cell b)))
+
+(defun %fc-coins0 (b) (store-bit (store-coins b 0) 0))
+
+(defun %fc-inline-into (b root)
+  "B with the cell ROOT's data and references appended: a dictionary stored inline."
+  (let ((b (store-bits b (cell-bits root) (cell-bit-length root))))
+    (loop for r across (cell-refs root) do (setf b (store-ref b r)))
+    b))
+
+(defun %account-blocks-cell (processed)
+  "The ShardAccountBlocks of a block that holds the transactions PROCESSED, a list of (TX . ADDRESS): per
+account an AccountBlock whose transaction dictionary maps each lt to its Transaction (the extras of the
+fork nodes are zeros; no reader here looks at them)."
+  (let ((by-account (make-hash-table)) (update (end-cell (store-uint (begin-cell) 77 64))))
+    (dolist (p processed)
+      (push (cons (fc-tx-lt (car p)) (car p)) (gethash (fc-address-key (cdr p)) by-account)))
+    (let ((dict (hashmap-cell
+                 (loop for key being the hash-keys of by-account using (hash-value txs)
+                       collect (cons key
+                                     (let ((tx-dict (hashmap-cell
+                                                     (loop for (lt . tx) in txs
+                                                           collect (cons lt (let ((tx tx)) (lambda (b) (store-ref (%fc-coins0 b) tx)))))
+                                                     64))
+                                           (key key))
+                                       (lambda (b)
+                                         (store-ref (%fc-inline-into (store-bits (store-uint (%fc-coins0 b) 5 4) key 256) tx-dict)
+                                                    update)))))
+                 256)))
+      (end-cell (%fc-coins0 (store-ref (store-bit (begin-cell) 1) dict))))))
+
+(defun %block-extra-cell (utime &optional custom account-blocks)
   (let* ((in (end-cell (store-builder (store-bit (begin-cell) 0) (cell->builder (end-cell (%store-cc (store-coins (begin-cell) 0) 0))))))
          (out (end-cell (%store-cc (store-bit (begin-cell) 0) 0)))
-         (acc (end-cell (%store-cc (store-bit (begin-cell) 0) 0)))
-         (seed (sha256 (uint->octets utime 4))))
-    (end-cell (store-uint (%store-hash (%store-hash (store-uint (store-ref (store-ref (store-ref (store-uint (begin-cell) #x4a33f6fd 32) in) out) acc)
-                                                                0 0)
-                                                    seed)
-                                       seed)
-                          0 1))))
+         (acc (or account-blocks (end-cell (%store-cc (store-bit (begin-cell) 0) 0))))
+         (seed (sha256 (uint->octets utime 4)))
+         (b (%store-hash (%store-hash (store-uint (store-ref (store-ref (store-ref (store-uint (begin-cell) #x4a33f6fd 32) in) out) acc)
+                                                  0 0)
+                                      seed)
+                         seed)))
+    (end-cell (if custom
+                  (store-ref (store-bit b 1) custom)
+                  (store-uint b 0 1)))))
 
-(defun build-block (&key info state-update utime)
+(defun build-block (&key info state-update utime mc-shard-entries account-blocks)
   (end-cell (store-ref (store-ref (store-ref (store-ref (store-int (store-uint (begin-cell) #x11ef55aa 32)
                                                                    +fake-global-id+ 32)
                                                         info)
                                              (%value-flow-cell))
                                   state-update)
-                       (%block-extra-cell utime))))
+                       (%block-extra-cell utime (and mc-shard-entries (%mc-block-extra-cell mc-shard-entries)) account-blocks))))
 
 (defun %file-hash (cell) (sha256 (boc-of cell)))
 
@@ -585,6 +643,7 @@ so pruning below it later (in a header proof) would change its hash; built this 
   (declare (ignore master-ref))
   (build-shard-state :workchain -1 :shard +mc-shard+ :seqno seqno :utime utime :lt lt
                      :accounts-root (%empty-accounts-cell) :total 0
+                     :libraries (with-fc-lock (fc) (copy-list (fakechain-libraries fc)))
                      :custom (build-mc-state-extra :shard-entries (list (cons 0 wc0-leaf))
                                                    :config-dict (fakechain-config fc)
                                                    :config-addr (fakechain-config-addr fc)
@@ -734,7 +793,8 @@ bounces, refunds and chained hops are just out-messages that re-enter the queue.
                                     :utime utime :start-lt start-lt :end-lt end-lt
                                     :prev-ref prev-sh-ref :master-ref prev-mc-ref))
          (sh-block (build-block :info sh-info :utime utime
-                                :state-update (make-state-update old-wc0 new-wc0)))
+                                :state-update (make-state-update old-wc0 new-wc0)
+                                :account-blocks (and processed (%account-blocks-cell processed))))
          (sh-root (node-hash sh-block))
          (sh-file (%file-hash sh-block))
          (leaf (%shard-leaf-for :seqno seqno :reg-mc seqno :start-lt start-lt :end-lt end-lt
@@ -744,7 +804,7 @@ bounces, refunds and chained hops are just out-messages that re-enter the queue.
          (mc-info (%block-info-cell :not-master nil :seqno seqno :workchain -1 :shard +mc-shard+
                                     :utime utime :start-lt start-lt :end-lt end-lt
                                     :prev-ref prev-mc-ref))
-         (mc-block (build-block :info mc-info :utime utime
+         (mc-block (build-block :info mc-info :utime utime :mc-shard-entries (list (cons 0 leaf))
                                 :state-update (make-state-update old-mc new-mc)))
          (mc-root (node-hash mc-block))
          (mc-file (%file-hash mc-block))
@@ -809,6 +869,26 @@ block's hash that shows only what a client needs to read the header."
       (dolist (n (append (collect-nodes info) (collect-nodes state-update)))
         (setf (gethash (node-hash n) visible) t))
       (prune-tree block (lambda (c) (gethash (node-hash c) visible))))))
+
+(defvar *fc-prune-dest-update* nil
+  "Test hook: true makes the destination proof of every link carry only the BlockInfo, its state_update a
+pruned branch -- what a real liteserver sends (check_block_header(vd_root, to) reads no state hash).")
+
+(defvar *fc-proof-head-lag* 0
+  "Test hook: getBlockProof without a target proves up to the head minus this many blocks, as an upstream
+whose shard client fell behind answers.")
+
+(defvar *fc-proof-target-lag* 0
+  "Test hook: getBlockProof with a target newer than the known block proves up to the target minus this many.")
+
+(defun fc-dest-proof-node (block)
+  (if *fc-prune-dest-update*
+      (destructuring-bind (info value-flow state-update extra) (coerce (cell-refs block) 'list)
+        (declare (ignore value-flow state-update extra))
+        (let ((visible (make-hash-table :test #'equalp)))
+          (dolist (n (collect-nodes info)) (setf (gethash (node-hash n) visible) t))
+          (prune-tree block (lambda (c) (gethash (node-hash c) visible)))))
+      (fc-header-proof-node block)))
 
 (defun dict-path-cells (root key key-bits)
   "The cells a lookup of KEY visits in the Hashmap(Aug) whose root edge cell is ROOT: an edge
@@ -905,7 +985,7 @@ getConfigAll serves: the client reads the config out of the proof)."
 (defun fc-forward-link (fc from-id blk)
   (tl-make "liteServer.blockLinkForward"
            :to-key-block nil :from from-id :to (fc-mc-id blk)
-           :dest-proof (fc-proof-boc (fc-header-proof-node (fc-block-mc-block blk)))
+           :dest-proof (fc-proof-boc (fc-dest-proof-node (fc-block-mc-block blk)))
            :config-proof (fc-proof-boc (fc-config-proof-node (fakechain-zero-state fc)))
            :signatures (tl-make "liteServer.signatureSet.ordinary"
                                 :validator-set-hash (fc-validator-set-hash) :catchain-seqno 0
@@ -927,14 +1007,44 @@ getConfigAll serves: the client reads the config out of the proof)."
                                                        :state-root-hash (node-hash (fc-block-mc-state h))
                                                        :init (fc-zero-state-id fc)))))
 
+(defun fc-zero-block-id (fc)
+  "The zero state as a masterchain blockIdExt (seqno 0, root hash = state hash)."
+  (tl-block-id-ext :seqno 0 :root-hash (fakechain-zero-root fc) :file-hash (fakechain-zero-file fc)))
+
+(defun fc-back-link (fc from-blk to-seqno)
+  "liteServer.blockLinkBack from masterchain block FROM-BLK to the older block TO-SEQNO (0 = the zero
+state), as construct_proof_link_back builds it: the header proof of the source, the source state's
+prev_blocks path to the destination, the destination's header proof (none for the zero state)."
+  (let ((to-blk (and (plusp to-seqno) (fc-find-block fc to-seqno))))
+    (tl-make "liteServer.blockLinkBack"
+             :to-key-block (zerop to-seqno)
+             :from (fc-mc-id from-blk)
+             :to (if to-blk (fc-mc-id to-blk) (fc-zero-block-id fc))
+             :dest-proof (if to-blk
+                             (fc-proof-boc (fc-dest-proof-node (fc-block-mc-block to-blk)))
+                             (make-array 0 :element-type '(unsigned-byte 8)))
+             :proof (fc-proof-boc (fc-header-proof-node (fc-block-mc-block from-blk)))
+             :state-proof (fc-proof-boc (fc-prev-blocks-proof-node (fc-block-mc-state from-blk) to-seqno)))))
+
 (defun fc-answer-block-proof (fc fn)
   (let* ((known (tl-get fn :known-block))
          (mode (tl-get fn :mode))
          (target-seqno (if (logbitp 0 mode)
-                           (tl-get (tl-get fn :target-block) :seqno)
-                           (fc-head-seqno fc)))
-         (blk (fc-find-block fc target-seqno)))
+                           (let ((tg (tl-get (tl-get fn :target-block) :seqno)))
+                             (if (and (plusp *fc-proof-target-lag*) (> tg (tl-get known :seqno)))
+                                 (max (1+ (tl-get known :seqno)) (- tg *fc-proof-target-lag*))
+                                 tg))
+                           (max 1 (- (fc-head-seqno fc) *fc-proof-head-lag*))))
+         (blk (fc-find-block fc target-seqno))
+         (known-blk (fc-find-block fc (tl-get known :seqno))))
     (cond
+      ((and (logbitp 0 mode) (= target-seqno 0) (null known-blk) (zerop (tl-get known :seqno)))
+       (tl-encode (tl-make "liteServer.partialBlockProof" :complete t :from known :to known :steps (vector))))
+      ((and (logbitp 0 mode) known-blk (< target-seqno (tl-get known :seqno)) (or blk (zerop target-seqno)))
+       ;; an OLDER target: one backward link straight to it
+       (tl-encode (tl-make "liteServer.partialBlockProof" :complete t :from known
+                                                         :to (if blk (fc-mc-id blk) (fc-zero-block-id fc))
+                                                         :steps (vector (fc-back-link fc known-blk target-seqno)))))
       ((null blk) (fc-error 651 "target block not found"))
       ((= (tl-get known :seqno) target-seqno)
        (tl-encode (tl-make "liteServer.partialBlockProof" :complete t :from known :to (fc-mc-id blk)
@@ -969,6 +1079,24 @@ getConfigAll serves: the client reads the config out of the proof)."
                   :proof (fc-proof-boc (fc-header-proof-node (fc-block-sh-block blk))
                                        (fc-state-proof-node (fc-block-sh-state blk) key (and sa t)))
                   :state (if acc (fc-cells-boc (list acc)) (fc-cells-boc '()))))))))
+
+(defun fc-answer-run-smc-method (fc fn)
+  "liteServer.runSmcMethod served by the emulator on the account's state at the asked block (result only: no proofs,
+as a real server answers mode 4)."
+  (let* ((id (tl-get fn :id))
+         (blk (or (fc-find-block fc (tl-get id :seqno)) (fc-head fc)))
+         (addr (tl-get fn :account)))
+    (let* ((sa (fc-account-from-blk blk addr))
+           (acc (and sa (fc-account-cell sa))))
+      (if (null acc)
+          (fc-error 609 "account state is not found")
+          (multiple-value-bind (items exit)
+              (run-account-get-method acc (tl-get fn :method-id) (parse-vm-stack (first (parse-boc (tl-get fn :params))))
+                                      :libraries (with-fc-lock (fc) (copy-list (fakechain-libraries fc))))
+            (tl-encode (tl-make "liteServer.runMethodResult"
+                                :mode (tl-get fn :mode) :id (fc-mc-id blk) :shardblk (fc-sh-id blk)
+                                :exit-code exit
+                                :result (fc-cells-boc (list (serialize-vm-stack items))))))))))
 
 (defun fc-tx-lt (tx)
   (cell-uint tx (+ 4 256) 64))
@@ -1022,11 +1150,13 @@ when more transactions remain than COUNT."
                 :id id :req-count count :incomplete incomplete
                 :ids (map 'vector
                           (lambda (e)
-                            (tl-make "liteServer.transactionId" :mode (logand mode 7)
+                            (tl-make "liteServer.transactionId" :mode (logand mode #xff)
                                      :account (uint->octets (first e) 32)
                                      :lt (second e) :hash (node-hash (third e))))
                           page)
-                :proof (make-array 0 :element-type '(unsigned-byte 8)))))))
+                :proof (if (logtest mode 32)
+                           (fc-proof-boc (fc-block-sh-block blk))
+                           (make-array 0 :element-type '(unsigned-byte 8))))))))
 
 (defun fc-answer-send-message (fc fn)
   (let* ((body (tl-get fn :body))
@@ -1041,19 +1171,238 @@ when more transactions remain than COUNT."
          (tl-encode (tl-make "liteServer.sendMsgStatus" :status 1))))))
 
 (defun fc-answer-config-all (fc fn)
-  (declare (ignore fn))
-  (let ((h (fc-head fc)))
+  ;; the configuration of the block asked for (a real liteserver answers for the id in the request)
+  (let ((h (or (let ((id (tl-get fn :id))) (and id (fc-find-block fc (tl-get id :seqno)))) (fc-head fc))))
     (tl-encode (tl-make "liteServer.configInfo" :mode 0 :id (fc-mc-id h)
                                                :state-proof (fc-proof-boc (fc-header-proof-node (fc-block-mc-block h)))
                                                :config-proof (fc-proof-boc (fc-config-proof-node (fc-block-mc-state h) :all))))))
 
+;;; getAllShardsInfo: a Merkle proof of the masterchain block that reveals the path to its McBlockExtra
+;;; (everything else pruned, as MerkleProofBuilder leaves it: the shard_hashes dictionary itself is only
+;;; wrapped, never walked, so its root stays a pruned branch; but unpacking McBlockExtra opens its
+;;; ^[ signatures, create and mint ] group, which therefore stays visible: real tonlib refuses a proof
+;;; that prunes it), and the ShardHashes dictionary in full.
+(defun fc-all-shards-proof-node (block)
+  (destructuring-bind (info value-flow update extra) (coerce (cell-refs block) 'list)
+    (let* ((extra-refs (coerce (cell-refs extra) 'list))
+           (custom (fourth extra-refs))
+           (custom-refs (coerce (cell-refs custom) 'list))
+           (custom2 (flet ((copy (cell refs)
+                             (let ((b (store-bits (begin-cell) (cell-bits cell) (cell-bit-length cell))))
+                               (dolist (r refs) (setf b (store-ref b r)))
+                               (end-cell b))))
+                      (copy custom (cons (make-pruned-branch (first custom-refs)) (rest custom-refs)))))
+           (extra2 (let ((b (store-bits (begin-cell) (cell-bits extra) (cell-bit-length extra))))
+                     (dolist (r (list (first extra-refs) (second extra-refs) (third extra-refs)))
+                       (setf b (store-ref b (make-pruned-branch r))))
+                     (end-cell (store-ref b custom2)))))
+      (let ((b (store-bits (begin-cell) (cell-bits block) (cell-bit-length block))))
+        (dolist (r (list info value-flow update)) (setf b (store-ref b (make-pruned-branch r))))
+        (end-cell (store-ref b extra2))))))
+
+(defun fc-answer-all-shards-info (fc fn)
+  (let* ((blk (fc-find-block fc (tl-get (tl-get fn :id) :seqno))))
+    (if (null blk)
+        (fc-error 651 "block not found")
+        (let* ((block (fc-block-mc-block blk))
+               (custom (fourth (coerce (cell-refs (fourth (coerce (cell-refs block) 'list))) 'list)))
+               (dict-root (first (coerce (cell-refs custom) 'list))))
+          (tl-encode (tl-make "liteServer.allShardsInfo" :id (fc-mc-id blk)
+                                                         :proof (fc-proof-boc (fc-all-shards-proof-node block))
+                                                         :data (boc-of (end-cell (store-ref (store-bit (begin-cell) 1) dict-root)))))))))
+
+(defun fc-answer-shard-info (fc fn)
+  "liteServer.getShardInfo over the fakechain's one shard (the whole of workchain 0, a single BinTree
+leaf): found for workchain 0 unless EXACT asks for a split shard, otherwise the cleared invalid id."
+  (let* ((blk (fc-find-block fc (tl-get (tl-get fn :id) :seqno))))
+    (if (null blk)
+        (fc-error 651 "block not found")
+        (let* ((state (fc-block-mc-state blk))
+               (refs (cell-refs (svref (cell-refs state) 3)))
+               (wc (tl-get fn :workchain))
+               (shard (ldb (byte 64 0) (tl-get fn :shard)))
+               (found (and (= wc 0) (plusp shard) (= 3 (length refs))
+                           (or (not (tl-get fn :exact)) (= shard (expt 2 63)))))
+               (leaf (and found (first-ref-cell (car (last (dict-path-cells (svref refs 0) 0 32)))))))
+          (tl-encode
+           (tl-make "liteServer.shardInfo" :id (fc-mc-id blk)
+                    :shardblk (if found (fc-sh-id blk) (tl-block-id-ext :workchain (- (expt 2 31)) :shard 0 :seqno 0))
+                    :shard-proof (fc-proof-boc (fc-header-proof-node (fc-block-mc-block blk))
+                                               (fc-mc-state-proof-node state 0))
+                    :shard-descr (if found (fc-cells-boc (list leaf)) (fc-cells-boc '()))))))))
+
+(defvar *fc-lookup-alt-seqno* nil
+  "Test hook: serve liteServer.lookupBlockWithProof for a workchain-0 block from THIS later masterchain
+block, as the node does when a block was included some blocks after it was made (a proof chain of
+several shard blocks).")
+
+(defun fc-mc-shards-link-proof-node (block)
+  "A masterchain BLOCK as a lookup proof link shows it: everything pruned but McBlockExtra with its
+whole ShardHashes (the lookup path of the shard)."
+  (destructuring-bind (info value-flow update extra) (coerce (cell-refs block) 'list)
+    (let ((b (store-bits (begin-cell) (cell-bits block) (cell-bit-length block)))
+          (eb (store-bits (begin-cell) (cell-bits extra) (cell-bit-length extra)))
+          (extra-refs (coerce (cell-refs extra) 'list)))
+      (dolist (r (list info value-flow update)) (setf b (store-ref b (make-pruned-branch r))))
+      (dolist (r (list (first extra-refs) (second extra-refs) (third extra-refs)))
+        (setf eb (store-ref eb (make-pruned-branch r))))
+      (end-cell (store-ref b (end-cell (store-ref eb (fourth extra-refs))))))))
+
+(defun fc-prev-blocks-proof-node (state seqno)
+  "The masterchain STATE as a liteserver reveals it to show that block SEQNO is one of its prev_blocks:
+the header fields, McStateExtra with its flags cell and the dictionary path of SEQNO."
+  (let* ((visible (make-hash-table :test #'equalp))
+         (custom (svref (cell-refs state) 3))
+         (refs (cell-refs custom))
+         (r1 (svref refs (1- (length refs)))))
+    (flet ((show (c) (setf (gethash (node-hash c) visible) t)))
+      (show (svref (cell-refs state) 2))
+      (show custom)
+      (show r1)
+      (when (plusp (length (cell-refs r1)))
+        (mapc #'show (dict-path-cells (first-ref-cell r1) seqno 32))))
+    (prune-tree state (lambda (c) (gethash (node-hash c) visible)))))
+
+(defun fc-lookup-pick (fc mode seqno lt utime)
+  (let ((blocks (coerce (fakechain-blocks fc) 'list)))
+    (case (logand mode 7)
+      (1 (find seqno blocks :key #'fc-block-seqno))
+      (2 (find-if (lambda (b) (>= (fc-block-end-lt b) lt)) blocks))
+      (4 (find-if (lambda (b) (>= (fc-block-utime b) utime)) blocks)))))
+
+(defun fc-answer-lookup-block (fc fn)
+  "liteServer.lookupBlockWithProof over the fakechain: workchain -1 or 0, the block found by seqno, lt or
+utime, with the proofs of a node (see liteserver.cpp perform_lookupBlockWithProof)."
+  (let* ((mode (tl-get fn :mode))
+         (id (tl-get fn :id))
+         (wc (tl-get id :workchain))
+         (lt (or (ignore-errors (tl-get fn :lt)) 0))
+         (utime (or (ignore-errors (tl-get fn :utime)) 0))
+         (blk (and (member wc '(0 -1)) (fc-lookup-pick fc mode (tl-get id :seqno) lt utime)))
+         (trusted (tl-get fn :mc-block-id))
+         (trusted-blk (fc-find-block fc (tl-get trusted :seqno))))
+    (cond ((not (member (logand mode 7) '(1 2 4))) (fc-error 500 "exactly one of mode.0, mode.1 and mode.2 bits must be set"))
+          ((or (null blk) (null trusted-blk)) (fc-error 651 "block not found"))
+          ((and (logtest mode 6) (< (fc-block-seqno blk) 2)) (fc-error 651 "block has no previous block"))
+          (t
+           (let* ((alt (if (= wc -1) blk (or (and *fc-lookup-alt-seqno* (fc-find-block fc *fc-lookup-alt-seqno*)) blk)))
+                  (links (when (= wc 0)
+                           (cons (cons (fc-sh-id alt)
+                                       (fc-proof-boc (fc-mc-shards-link-proof-node (fc-block-mc-block alt))))
+                                 (loop for j from (fc-block-seqno alt) above (fc-block-seqno blk)
+                                       collect (let ((cur (fc-find-block fc j)))
+                                                 (cons (fc-sh-id (fc-find-block fc (1- j)))
+                                                       (fc-proof-boc (fc-header-proof-node (fc-block-sh-block cur)))))))))
+                  (own (lambda (b) (if (= wc -1) (fc-block-mc-block b) (fc-block-sh-block b))))
+                  (empty (make-array 0 :element-type '(unsigned-byte 8)))
+                  (same (= (fc-block-seqno alt) (tl-get trusted :seqno))))
+             (tl-encode
+              (tl-make "liteServer.lookupBlockResult"
+                       :id (if (= wc -1) (fc-mc-id blk) (fc-sh-id blk))
+                       :mode mode
+                       :mc-block-id (fc-mc-id alt)
+                       :client-mc-state-proof (if same empty
+                                                  (fc-proof-boc (fc-header-proof-node (fc-block-mc-block trusted-blk))))
+                       :mc-block-proof (if same empty
+                                           (fc-proof-boc (fc-prev-blocks-proof-node (fc-block-mc-state trusted-blk)
+                                                                                    (fc-block-seqno alt))))
+                       :shard-links (coerce (mapcar (lambda (l) (tl-make "liteServer.shardBlockLink" :id (car l) :proof (cdr l)))
+                                                    links)
+                                            'vector)
+                       :header (fc-proof-boc (fc-header-proof-node (funcall own blk)))
+                       :prev-header (if (logtest mode 6)
+                                        (fc-proof-boc (fc-header-proof-node (funcall own (fc-find-block fc (1- (fc-block-seqno blk))))))
+                                        empty))))))))
+
+(defun fc-libraries-proof-node (state)
+  "The masterchain STATE as a liteserver reveals it to prove its public libraries: the header, the tail
+cell and the whole libraries dictionary (the library cells themselves are left to the answer)."
+  (let* ((visible (make-hash-table :test #'equalp))
+         (tail (svref (cell-refs state) 2))
+         (root (cl-ton::%state-libraries-root state)))
+    (flet ((show (c) (setf (gethash (node-hash c) visible) t)))
+      (show tail)
+      (when root (mapc #'show (collect-nodes root))))
+    (prune-tree state (lambda (c) (gethash (node-hash c) visible)))))
+
+(defun fc-answer-libraries-with-proof (fc fn)
+  "liteServer.getLibrariesWithProof as liteserver.cpp answers it: for the first 16 hashes (sorted, unique)
+the libraries the masterchain state of the block publishes."
+  (let* ((blk (fc-find-block fc (tl-get (tl-get fn :id) :seqno)))
+         (mode (tl-get fn :mode))
+         (asked (let ((l (coerce (tl-get fn :library-list) 'list)))
+                  (sort (remove-duplicates (subseq l 0 (min 16 (length l))) :test #'equalp)
+                        (lambda (a b) (< (octets->uint a) (octets->uint b)))))))
+    (if (null blk)
+        (fc-error 651 "block not found")
+        (let* ((state (fc-block-mc-state blk))
+               (root (cl-ton::%state-libraries-root state)))
+          (tl-encode
+           (tl-make "liteServer.libraryResultWithProof"
+                    :id (fc-mc-id blk) :mode mode
+                    :result (coerce
+                             (loop for h in asked
+                                   for value = (and root (cl-ton::dict-lookup root (octets->uint h) 256))
+                                   when value
+                                     collect (tl-make "liteServer.libraryEntry" :hash h
+                                                      :data (if (logtest mode 2)
+                                                                (make-array 0 :element-type '(unsigned-byte 8))
+                                                                (serialize-boc (aref (cell-refs (cl-ton::slice-cell value))
+                                                                                     (cl-ton::slice-ref-pos value))))))
+                             'vector)
+                    :state-proof (fc-proof-boc (fc-header-proof-node (fc-block-mc-block blk)))
+                    :data-proof (fc-proof-boc (fc-libraries-proof-node state))))))))
+
 (defun fc-answer-block-header (fc fn)
   (let* ((id (tl-get fn :id))
-         (blk (fc-find-block fc (tl-get id :seqno))))
+         (blk (fc-find-block fc (tl-get id :seqno)))
+         (shard (and blk (= (tl-get id :workchain) 0))))
     (if blk
-        (tl-encode (tl-make "liteServer.blockHeader" :id (fc-mc-id blk) :mode 0
-                                                     :header-proof (fc-proof-boc (fc-header-proof-node (fc-block-mc-block blk)))))
+        (tl-encode (tl-make "liteServer.blockHeader" :id (if shard (fc-sh-id blk) (fc-mc-id blk)) :mode 0
+                                                     :header-proof (fc-proof-boc (fc-header-proof-node
+                                                                                  (if shard (fc-block-sh-block blk) (fc-block-mc-block blk))))))
         (fc-error 651 "block not found"))))
+
+(defvar *fc-lookup-with-proof-p* t
+  "Test hook: NIL makes the fakechain answer liteServer.lookupBlockWithProof like the older mainnet
+liteservers do, with error -400 \"unknown request type\".")
+
+(defun fc-answer-lookup-block-plain (fc fn)
+  "liteServer.lookupBlock over the fakechain: the header of the block of workchain -1 or 0 found by seqno,
+lt or utime, with a header proof and nothing that ties it to a chain."
+  (let* ((mode (tl-get fn :mode))
+         (id (tl-get fn :id))
+         (wc (tl-get id :workchain))
+         (lt (or (ignore-errors (tl-get fn :lt)) 0))
+         (utime (or (ignore-errors (tl-get fn :utime)) 0))
+         (blk (and (member wc '(0 -1)) (member (logand mode 7) '(1 2 4))
+                   (fc-lookup-pick fc mode (tl-get id :seqno) lt utime))))
+    (cond ((not (member (logand mode 7) '(1 2 4))) (fc-error 500 "exactly one of mode.0, mode.1 and mode.2 bits must be set"))
+          ((null blk) (fc-error 651 "block not found"))
+          (t (tl-encode (tl-make "liteServer.blockHeader" :id (if (= wc -1) (fc-mc-id blk) (fc-sh-id blk)) :mode mode
+                                 :header-proof (fc-proof-boc (fc-header-proof-node
+                                                              (if (= wc -1) (fc-block-mc-block blk) (fc-block-sh-block blk))))))))))
+
+(defun fc-answer-shard-block-proof (fc fn)
+  "liteServer.getShardBlockProof over the fakechain as liteserver.cpp answers it: for a masterchain block no
+links; for a workchain-0 block the masterchain block that lists a shard block at or after it
+(*FC-LOOKUP-ALT-SEQNO* when set), the proof of its ShardHashes, and the proofs of each shard block down
+to the one asked for."
+  (let* ((id (tl-get fn :id))
+         (blk (fc-find-block fc (tl-get id :seqno))))
+    (cond ((null blk) (fc-error 651 "block not found"))
+          ((= (tl-get id :workchain) -1)
+           (tl-encode (tl-make "liteServer.shardBlockProof" :masterchain-id (fc-mc-id blk) :links (vector))))
+          (t (let* ((alt (or (and *fc-lookup-alt-seqno* (fc-find-block fc *fc-lookup-alt-seqno*)) blk))
+                    (links (cons (cons (fc-sh-id alt) (fc-proof-boc (fc-mc-shards-link-proof-node (fc-block-mc-block alt))))
+                                 (loop for j from (fc-block-seqno alt) above (fc-block-seqno blk)
+                                       collect (cons (fc-sh-id (fc-find-block fc (1- j)))
+                                                     (fc-proof-boc (fc-header-proof-node
+                                                                    (fc-block-sh-block (fc-find-block fc j)))))))))
+               (tl-encode (tl-make "liteServer.shardBlockProof" :masterchain-id (fc-mc-id alt)
+                                   :links (coerce (mapcar (lambda (l) (tl-make "liteServer.shardBlockLink" :id (car l) :proof (cdr l)))
+                                                          links)
+                                                  'vector))))))))
 
 (defun fc-wait-for-seqno (fc seqno timeout-ms)
   "Block until the head reaches SEQNO; NIL on timeout."
@@ -1099,12 +1448,20 @@ when more transactions remain than COUNT."
                    (tl-encode (tl-make "liteServer.version" :mode 0 :version #x101 :capabilities 7 :now (fc-now fc))))
                   ((tl-is fn "liteServer.getBlockProof") (fc-answer-block-proof fc fn))
                   ((tl-is fn "liteServer.getAccountState") (fc-answer-account-state fc fn))
+                  ((tl-is fn "liteServer.runSmcMethod") (fc-answer-run-smc-method fc fn))
                   ((tl-is fn "liteServer.getTransactions") (fc-answer-transactions fc fn))
                   ((tl-is fn "liteServer.listBlockTransactions") (fc-answer-list-block-transactions fc fn))
                   ((tl-is fn "liteServer.sendMessage") (fc-answer-send-message fc fn))
                   ((tl-is fn "liteServer.getConfigAll") (fc-answer-config-all fc fn))
                   ((tl-is fn "liteServer.getLibraries") (fc-answer-get-libraries fc fn))
+                  ((tl-is fn "liteServer.getLibrariesWithProof") (fc-answer-libraries-with-proof fc fn))
                   ((tl-is fn "liteServer.getBlockHeader") (fc-answer-block-header fc fn))
+                  ((tl-is fn "liteServer.getAllShardsInfo") (fc-answer-all-shards-info fc fn))
+                  ((tl-is fn "liteServer.getShardInfo") (fc-answer-shard-info fc fn))
+                  ((tl-is fn "liteServer.lookupBlockWithProof")
+                   (if *fc-lookup-with-proof-p* (fc-answer-lookup-block fc fn) (fc-error -400 "unknown request type")))
+                  ((tl-is fn "liteServer.lookupBlock") (fc-answer-lookup-block-plain fc fn))
+                  ((tl-is fn "liteServer.getShardBlockProof") (fc-answer-shard-block-proof fc fn))
                   (t (fc-error 651 (format nil "fakechain: ~A not supported" (tl-obj-name fn))))))))))))
 
 ;;; --- lifecycle ---------------------------------------------------------------------

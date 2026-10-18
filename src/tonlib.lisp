@@ -66,6 +66,7 @@
   (timeout 30.0d0 :type double-float))
 
 (defun tonlib-alive-p (tl)
+  (when (lite-client-p tl) (return-from tonlib-alive-p (adnl-ext-client-alive-p (lite-client-adnl tl))))
   (and (not (tonlib-closing-p tl))
        (not (cffi:null-pointer-p (tonlib-handle tl)))))
 
@@ -300,6 +301,7 @@ progress, and gives up only after MAX-STALLED attempts in a row added none, afte
 seconds, or on an error that retrying cannot help.  ON-ATTEMPT is called after each failed
 attempt with (attempt-number error steps-gained progress-now).  Without PROGRESS it is simply
 ATTEMPTS tries, as before."
+  (when (lite-client-p tl) (return-from tonlib-sync (tl-get (lite-sync tl) :seqno)))
   (if (null progress)
       (retrying (lambda ()
                   (json-get (tonlib-call tl (list :|@type| "sync") :timeout timeout) "seqno"))
@@ -324,6 +326,7 @@ ATTEMPTS tries, as before."
                        (sleep *tonlib-sync-retry-delay*))))))))
 
 (defun close-tonlib (tl)  
+  (when (lite-client-p tl) (return-from close-tonlib (close-lite-client tl)))
   (when (tonlib-alive-p tl)  
     (setf (tonlib-closing-p tl) t)  
     (fail-tonlib-waiters tl "tonlib client closed")  
@@ -415,18 +418,20 @@ times in total, then re-signal the last error.  Definitive failures
 (defun account-address-json (addr)
   (list :|@type| "accountAddress" :|account_address| (address->string addr)))
 
-(defun tonlib-masterchain-block (tl &key (timeout (tonlib-timeout tl)))
+(defun tonlib-masterchain-block (tl &key (timeout (and (not (lite-client-p tl)) (tonlib-timeout tl))))
   "Return the internal.blockIdExt for the last known masterchain block."
+  (when (lite-client-p tl) (return-from tonlib-masterchain-block (lite-backend-masterchain-block tl)))
   (json-get (tonlib-call tl (list :|@type| "blocks.getMasterchainInfo")
                              :timeout timeout)
             "last"))
 
-(defun tonlib-masterchain-info (tl &key (timeout (tonlib-timeout tl)))
+(defun tonlib-masterchain-info (tl &key (timeout (and (not (lite-client-p tl)) (tonlib-timeout tl))))
   "Returns the masterchain seqno of the last known block."
   (json-get (tonlib-masterchain-block tl :timeout timeout) "seqno"))
 
-(defun tonlib-shards (tl block &key (timeout (tonlib-timeout tl)))
+(defun tonlib-shards (tl block &key (timeout (and (not (lite-client-p tl)) (tonlib-timeout tl))))
   "blocks.getShards for a masterchain internal.blockIdExt."
+  (when (lite-client-p tl) (return-from tonlib-shards (lite-backend-shards tl block)))
   (json-get (retrying
              (lambda ()
                (tonlib-call tl (list :|@type| "blocks.getShards"
@@ -462,9 +467,10 @@ times in total, then re-signal the last error.  Definitive failures
         finally (return transactions)))
 
 (defun tonlib-block-transactions (tl block &key (count 40)
-                                             (timeout (tonlib-timeout tl)))
+                                             (timeout (and (not (lite-client-p tl)) (tonlib-timeout tl))))
   "Return up to COUNT short transaction ids from a shard block.
 COUNT may be NIL to follow pagination until the block is complete."
+  (when (lite-client-p tl) (return-from tonlib-block-transactions (lite-backend-block-transactions tl block :count count)))
   (collect-block-transactions
    (lambda (request)
      (retrying (lambda () (tonlib-call tl request :timeout timeout))))
@@ -482,6 +488,7 @@ COUNT may be NIL to follow pagination until the block is complete."
 
 (defun tonlib-account-state (tl addr)
   "raw.getAccountState -> ACCOUNT-STATE (balance, code, data, last tx)."
+  (when (lite-client-p tl) (return-from tonlib-account-state (lite-backend-account-state tl addr)))
   (let* ((r (retrying (lambda ()
                         (tonlib-call tl (list :|@type| "raw.getAccountState"
                                               :|account_address| (account-address-json addr))))))
@@ -508,6 +515,7 @@ sync point.  NIL means read the client's current head (unpinned).")
 (defun tonlib-run-get-method (tl addr method &optional stack)  
   "smc.load + smc.runGetMethod + smc.forget.  Returns (values ITEMS EXIT-CODE).  
 When *GET-METHOD-BLOCK* is set, smc.load is pinned to that block via withBlock."  
+  (when (lite-client-p tl) (return-from tonlib-run-get-method (lite-backend-run-get-method tl addr method stack)))
   (retrying  
    (lambda ()  
      (let* ((load-req (list :|@type| "smc.load"  
@@ -526,6 +534,7 @@ When *GET-METHOD-BLOCK* is set, smc.load is pinned to that block via withBlock."
               (values (mapcar #'json->stack-item (json-get r "stack"))  
                       (json-get r "exit_code")))  
          (ignore-errors (tonlib-call tl (list :|@type| "smc.forget" :|id| id))))))))
+(pushnew '*get-method-block* *pmap-conveyed*)
 
 ;; (defun tonlib-run-get-method (tl addr method &optional stack)
 ;;   "smc.load + smc.runGetMethod + smc.forget.  Returns (values ITEMS EXIT-CODE)."
@@ -603,18 +612,21 @@ fetched once through smc.getLibraries and cached."
 
 (defun tonlib-send-message (tl message-cell)
   "raw.sendMessageReturnHash; returns the message hash as base64."
+  (when (lite-client-p tl) (return-from tonlib-send-message (lite-backend-send-message tl message-cell)))
   (json-get (tonlib-call tl (list :|@type| "raw.sendMessageReturnHash"
                                   :|body| (cell->base64 message-cell)))
             "hash"))
 
 (defun tonlib-config-cell (tl)
   "Full config dictionary cell (getConfigAll), as required by the emulator."
+  (when (lite-client-p tl) (return-from tonlib-config-cell (lite-backend-config-cell tl)))
   (base64->cell (json-get (retrying (lambda ()
                                       (tonlib-call tl (list :|@type| "getConfigAll" :|mode| 0))))
                           "config" "bytes")))
 
 (defun tonlib-shard-account-cell (tl addr)
   "ShardAccount cell for ADDR (getShardAccountCell), the emulator's account input."
+  (when (lite-client-p tl) (return-from tonlib-shard-account-cell (lite-backend-shard-account-cell tl addr)))
   (base64->cell (json-get (retrying (lambda ()
                                       (tonlib-call tl (list :|@type| "getShardAccountCell"
                                                             :|account_address| (account-address-json addr)))))
@@ -622,6 +634,7 @@ fetched once through smc.getLibraries and cached."
 
 (defun tonlib-libraries (tl hashes)
   "smc.getLibraries -> alist of (hash-hex . cell) for the given 32-byte hashes."
+  (when (lite-client-p tl) (return-from tonlib-libraries (lite-backend-libraries tl hashes)))
   (let ((r (retrying (lambda ()
                        (tonlib-call tl (list :|@type| "smc.getLibraries"
                                              :|library_list| (mapcar #'base64-encode hashes)))))))
@@ -633,6 +646,7 @@ fetched once through smc.getLibraries and cached."
 (defun tonlib-transactions (tl addr &key (from-lt nil) (from-hash nil))
   "raw.getTransactions from the given tx id (defaults to the latest).
 Returns the raw list of raw.transaction hash tables."
+  (when (lite-client-p tl) (return-from tonlib-transactions (lite-backend-transactions tl addr :from-lt from-lt :from-hash from-hash)))
   (let* ((st (if (and from-lt from-hash)
                  nil
                  (tonlib-account-state tl addr)))

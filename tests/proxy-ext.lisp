@@ -446,8 +446,25 @@ where CALLS-CELL is a cons whose car counts the non-poll queries received."
                                                                                       :known-block (cl-ton::tl-block-id-ext))))
               (not (cl-ton:proxy-history-query-p
                     (cl-ton::proxy-query-info (cl-ton::tl-make "liteServer.getMasterchainInfo"))))))
+  (check "library queries are history queries too: an upstream that cannot build a library proof does not end the query"
+         (and (cl-ton:proxy-history-query-p
+               (cl-ton::proxy-query-info (cl-ton::tl-make "liteServer.getLibrariesWithProof" :id (cl-ton::tl-block-id-ext) :mode 1
+                                                                                         :library-list (vector))))
+              (cl-ton:proxy-history-query-p
+               (cl-ton::proxy-query-info (cl-ton::tl-make "liteServer.getLibraries" :library-list (vector))))))
   (check "error texts are grouped: runs of 3+ digits collapse"
          (string= "block (-1,#) not in db 12" (cl-ton::%collapse-digits "block (-1,96883115) not in db 12")))
+           (check "proxy-notready-answer-p: a getTransactions error of a server whose lt index lags is 'not ready'"
+                  (cl-ton::proxy-notready-answer-p
+                   (cl-ton::tl-encode (cl-ton::tl-make "liteServer.error" :code -400
+                                                       :message "cannot compute block with specified transaction: cannot find block (-1,3333333333333333) lt=110244655000002: ltdb: block not found (last known masterchain block: 99298644)"))))
+           (check "...as is a getBlockProof refusal of a server behind the block the client already proved"
+                  (cl-ton::proxy-notready-answer-p
+                   (cl-ton::tl-encode (cl-ton::tl-make "liteServer.error" :code -400
+                                                       :message "client knows block (-1,8000000000000000,99682333):94049368:51E73EFC newer than the reference masterchain block (-1,8000000000000000,99682267):668E23B1:05525EFC"))))
+           (check "...and another -400 is still an answer"
+                  (not (cl-ton::proxy-notready-answer-p
+                        (cl-ton::tl-encode (cl-ton::tl-make "liteServer.error" :code -400 :message "cannot parse request")))))
   (let ((table (cl-ton:proxy-method-table
                 (list (list :outcomes '(("a" :ok nil 5) ("a" :timeout nil 2) ("b" :ok nil 1)))
                       (list :outcomes '(("a" :ok nil 1) ("b" :error "x" 3)))))))
@@ -999,3 +1016,206 @@ TOTAL seconds in all, the slowest MAX, and OK / FAILED upstream attempts."
     (check "unknown query: decoded to (constructor . octets)" (and (consp fn) (= #xD97693BD (car fn))))
     (check "unknown query: named unknown-<constructor id> in the statistics"
            (string= "unknown-D97693BD" (cl-ton::qinfo-name (cl-ton::proxy-query-info fn))))))
+
+;;; --- upstream speed scores that survive a restart ---------------------------------------------------
+
+(defun %scores-proxy (dir &rest upstreams)
+  "A LISP-PROXY over DIR with UPSTREAMS, (name slowness) lists -- no network, no clients."
+  (let ((p (cl-ton::%make-lisp-proxy :db dir)))
+    (setf (cl-ton::lisp-proxy-upstreams p)
+          (mapcar (lambda (u) (cl-ton::make-proxy-upstream :name (first u) :slowness (second u))) upstreams))
+    p))
+
+(defun %write-scores (dir text)
+  (with-open-file (o (cl-ton:proxy-scores-file dir) :direction :output :if-exists :supersede)
+    (write-string text o)))
+
+(defun test-proxy-scores ()
+  (format t "proxy: upstream speed scores kept across restarts~%")
+  (let* ((dir (%tmpdir "scores"))
+         (p (%scores-proxy dir '("1.1.1.1:1" 0.5) '("2.2.2.2:2" 3.0) '("3.3.3.3:3" nil))))
+    (setf (gethash "liteServer.getMasterchainInfo" (cl-ton::lisp-proxy-method-latency p)) (cons 50 0.4))
+    (check "nothing learned, nothing written"
+           (and (null (cl-ton:proxy-save-scores (%scores-proxy (%tmpdir "scores-empty") '("9.9.9.9:9" nil))))
+                (not (probe-file (cl-ton:proxy-scores-file (%tmpdir "scores-empty"))))))
+    (check "scores are saved" (and (cl-ton:proxy-save-scores p) (probe-file (cl-ton:proxy-scores-file dir))))
+    (multiple-value-bind (ups methods) (cl-ton::%proxy-read-scores dir)
+      (check "read back, pulled half-way toward typical: 0.5 -> 0.75, 3.0 -> 2.0; the unknown one is absent"
+             (and (< (abs (- 0.75 (gethash "1.1.1.1:1" ups))) 0.01) (< (abs (- 2.0 (gethash "2.2.2.2:2" ups))) 0.01)
+                  (null (gethash "3.3.3.3:3" ups))))
+      (check "the method's usual time is kept, its sample count capped so it is re-learned quickly"
+             (let ((m (gethash "liteServer.getMasterchainInfo" methods)))
+               (and m (= 10 (car m)) (< (abs (- 0.4 (cdr m))) 0.01)))))
+    ;; applied to a new proxy; a live measurement is never overwritten
+    (let ((q (%scores-proxy (%tmpdir "scores-b") '("1.1.1.1:1" nil) '("2.2.2.2:2" 1.5))))
+      (multiple-value-bind (ups methods) (cl-ton::%proxy-read-scores dir)
+        (cl-ton::%proxy-apply-scores q ups methods))
+      (check "applied: a fresh upstream gets its saved slowness, one already measured keeps its own"
+             (and (< (abs (- 0.75 (cl-ton::proxy-upstream-slowness (first (cl-ton::lisp-proxy-upstreams q))))) 0.01)
+                  (= 1.5 (cl-ton::proxy-upstream-slowness (second (cl-ton::lisp-proxy-upstreams q))))))
+      (check "...and the method's usual time is known from the start (hedging needs it)"
+             (gethash "liteServer.getMasterchainInfo" (cl-ton::lisp-proxy-method-latency q))))
+    ;; ordering of the first sessions
+    (let* ((entries (list '("9.9.9.9" 9 nil nil) '("1.1.1.1" 1 nil nil) '("2.2.2.2" 2 nil nil) '("4.4.4.4" 4 nil nil)))
+           (scores (make-hash-table :test 'equal)))
+      (setf (gethash "1.1.1.1:1" scores) 0.5 (gethash "2.2.2.2:2" scores) 3.0)
+      (let ((ranked (mapcar #'first (cl-ton::%proxy-rank-entries entries scores))))
+        (check "ranking: the known-fast first, the known-slow last, unknown servers in between in their order"
+               (equal ranked '("1.1.1.1" "9.9.9.9" "4.4.4.4" "2.2.2.2"))))
+      (check "ranking without scores keeps the (random) order as it is"
+             (equal entries (cl-ton::%proxy-rank-entries entries nil))))
+    ;; hostile or stale files are ignored, never an error
+    (flet ((ignored (what text)
+             (%write-scores dir text)
+             (check (format nil "a scores file is ignored: ~A" what)
+                    (multiple-value-bind (ups methods) (cl-ton::%proxy-read-scores dir)
+                      (and (or (null ups) (zerop (hash-table-count ups))) (or (null methods) (zerop (hash-table-count methods))))))))
+      (ignored "empty" "")
+      (ignored "not JSON" "this is not json {{{")
+      (ignored "JSON of another shape" "[1,2,3]")
+      (ignored "another version" (format nil "{\"version\":2,\"saved\":~D,\"upstreams\":[{\"name\":\"1.1.1.1:1\",\"slowness\":0.5}],\"methods\":[]}" (get-universal-time)))
+      (ignored "8 days old" (format nil "{\"version\":1,\"saved\":~D,\"upstreams\":[{\"name\":\"1.1.1.1:1\",\"slowness\":0.5}],\"methods\":[]}" (- (get-universal-time) (* 8 86400))))
+      (ignored "dated in the far future" (format nil "{\"version\":1,\"saved\":~D,\"upstreams\":[{\"name\":\"1.1.1.1:1\",\"slowness\":0.5}],\"methods\":[]}" (+ (get-universal-time) (* 30 86400))))
+      (ignored "a saved time that is no number" "{\"version\":1,\"saved\":\"yesterday\",\"upstreams\":[],\"methods\":[]}")
+      (ignored "over the size cap" (format nil "{\"version\":1,\"saved\":~D,\"upstreams\":[],\"methods\":[],\"pad\":\"~A\"}" (get-universal-time) (make-string 70000 :initial-element #\x))))
+    (%write-scores dir (format nil "{\"version\":1,\"saved\":~D,\"upstreams\":[{\"name\":\"a.b:1\",\"slowness\":99999},{\"name\":\"bad name!\",\"slowness\":1.0},{\"name\":\"c.d:2\",\"slowness\":\"fast\"},{\"name\":\"e.f:3\",\"slowness\":-5},7,{\"name\":5,\"slowness\":1}],\"methods\":[{\"name\":\"m1\",\"n\":-3,\"usual\":1.0},{\"name\":\"m2\",\"n\":4,\"usual\":1e99},{\"name\":\"m3\",\"n\":2,\"usual\":0.0000001}]}" (get-universal-time)))
+    (multiple-value-bind (ups methods) (cl-ton::%proxy-read-scores dir)
+      (check "a valid file with bad entries: out-of-range numbers are clamped, malformed entries skipped"
+             (and (< (abs (- 2.5 (gethash "a.b:1" ups))) 0.01)       ; 4.0 clamped, then halved toward 1
+                  (null (gethash "bad name!" ups)) (null (gethash "c.d:2" ups))
+                  (< (abs (- 0.625 (gethash "e.f:3" ups))) 0.01)    ; -5 clamped to 0.25
+                  (= 2 (hash-table-count ups))
+                  (null (gethash "m1" methods))
+                  (= 30.0 (cdr (gethash "m2" methods)))
+                  (< (cdr (gethash "m3" methods)) 0.0011))))
+    ;; the live proxy saves, and its file feeds the next one
+    (let ((dir2 (%tmpdir "scores-live")))
+      (let ((q (%scores-proxy dir2 '("5.5.5.5:5" 1.2))))
+        (cl-ton:proxy-save-scores q))
+      (check "a proxy's scores are written into its own db directory"
+             (probe-file (cl-ton:proxy-scores-file dir2))))))
+
+;;; --- refreshing the liteserver list ------------------------------------------------------------------
+
+(defun %ls-json (entries)
+  "Global-config text with ENTRIES, a list of (ip port key-octets-or-string)."
+  (format nil "{\"@type\":\"config.global\",\"dht\":{},\"liteservers\":[~{~A~^,~}],\"validator\":{\"init_block\":{\"seqno\":1}}}"
+          (mapcar (lambda (e)
+                    (format nil "{\"ip\":~A,\"port\":~A,\"id\":{\"@type\":\"pub.ed25519\",\"key\":~S}}"
+                            (first e) (second e)
+                            (let ((k (third e))) (if (stringp k) k (cl-ton::base64-encode k)))))
+                  entries)))
+
+(defun %ip (a b c d) (+ (ash a 24) (ash b 16) (ash c 8) d))
+
+(defun test-proxy-refresh ()
+  (format t "proxy: refreshing the liteserver list~%")
+  (let ((key (make-array 32 :element-type '(unsigned-byte 8) :initial-element 7)))
+    ;; the URL
+    (check "official names resolve, an https URL is accepted"
+           (and (equal "https://ton.org/global-config.json" (cl-ton::%refresh-url-resolve "mainnet"))
+                (cl-ton::%refresh-url-resolve "TESTNET")
+                (equal "https://example.org/a.json" (cl-ton::%refresh-url-resolve "https://example.org/a.json"))))
+    (macrolet ((refuses (what url) `(check ,what (%signals cl-ton:ton-error (cl-ton::%refresh-url-resolve ,url)))))
+      (refuses "plain http is refused" "http://example.org/a.json")
+      (refuses "file: is refused" "file:///etc/passwd")
+      (refuses "a URL with a space is refused" "https://example.org/a b")
+      (refuses "a URL with a control character is refused" (format nil "https://example.org/a~Cb" #\Newline))
+      (refuses "a non-ASCII URL is refused" (format nil "https://example.org/~C" (code-char 233)))
+      (refuses "a URL that is only the scheme is refused" "https://")
+      (refuses "an enormous URL is refused" (concatenate 'string "https://example.org/" (make-string 3000 :initial-element #\a))))
+    ;; addresses
+    (check "private, loopback, link-local, shared, multicast and zero addresses are no liteserver addresses; public ones are"
+           (and (every #'cl-ton::%public-ipv4-p '("8.8.4.4" "51.195.189.59" "135.181.177.59" "172.15.0.1" "172.32.0.1" "100.63.0.1" "100.128.0.1"))
+                (notany #'cl-ton::%public-ipv4-p '("10.1.2.3" "127.0.0.1" "169.254.1.1" "172.16.0.1" "172.31.255.1" "192.168.0.9"
+                                                   "100.64.0.1" "100.127.0.1" "224.0.0.1" "255.255.255.255" "0.1.2.3"
+                                                   "1.2.3" "1.2.3.4.5" "a.b.c.d" "256.1.1.1"))))
+    ;; parsing
+    (let ((entries (cl-ton::%refresh-parse-liteservers
+                    (%ls-json (list (list (%ip 8 8 4 4) 4701 key)
+                                    (list (- (%ip 185 86 79 9) (expt 2 32)) 19434 key)  ; signed, as global configs write addresses above 127.x
+                                    (list (%ip 10 0 0 5) 4701 key)
+                                    (list (%ip 8 8 8 8) 0 key)
+                                    (list (%ip 8 8 8 8) 70000 key)
+                                    (list (%ip 9 9 9 9) 4701 (subseq key 0 31))
+                                    (list (%ip 9 9 9 9) 4701 "!!not base64!!")
+                                    (list "\"x\"" 4701 key)
+                                    (list (%ip 1 1 1 1) 4701 key))))))
+      (check "valid entries are taken (signed ip too), bad addresses, ports, keys are skipped one by one"
+             (and (= 3 (length entries))
+                  (equal (mapcar #'first entries) '("8.8.4.4" "185.86.79.9" "1.1.1.1"))
+                  (equal (mapcar #'second entries) '(4701 19434 4701)))))
+    (check "text that is no config gives nothing, never an error"
+           (and (null (cl-ton::%refresh-parse-liteservers "")) (null (cl-ton::%refresh-parse-liteservers "<html>"))
+                (null (cl-ton::%refresh-parse-liteservers "[1,2]")) (null (cl-ton::%refresh-parse-liteservers "{\"liteservers\":5}"))
+                (null (cl-ton::%refresh-parse-liteservers "{\"liteservers\":[1,\"a\",null,{}]}"))))
+    (check "no more than 512 entries of a download are even looked at"
+           (= 512 (length (cl-ton::%refresh-parse-liteservers
+                           (%ls-json (loop for i below 700 collect (list (%ip 20 (floor i 250) (mod i 250) 1) 4701 key)))))))
+    ;; merging into a proxy
+    (let* ((dir (%tmpdir "refresh"))
+           (p (%scores-proxy dir '("8.8.4.4:4701" nil))))
+      (unwind-protect
+           (progn
+             (setf (cl-ton::lisp-proxy-log-fn p) nil)
+             (let ((entries (cl-ton::%refresh-parse-liteservers
+                             (%ls-json (list (list (%ip 8 8 4 4) 4701 key) (list (%ip 5 5 5 5) 4701 key) (list (%ip 6 6 6 6) 4702 key))))))
+               (check "merging adds only the servers the proxy does not have, as standbys with a poller each"
+                      (and (= 2 (cl-ton:proxy-merge-liteservers p entries))
+                           (= 3 (length (cl-ton::lisp-proxy-upstreams p)))
+                           (every (lambda (u) (not (cl-ton::proxy-upstream-started-p u))) (rest (cl-ton::lisp-proxy-upstreams p)))
+                           (= 2 (length (cl-ton::lisp-proxy-pollers p)))))
+               (check "merging the same list again adds nothing"
+                      (and (zerop (cl-ton:proxy-merge-liteservers p entries)) (= 3 (length (cl-ton::lisp-proxy-upstreams p)))))
+               (let ((many (cl-ton::%refresh-parse-liteservers
+                            (%ls-json (loop for i below 200 collect (list (%ip 30 (floor i 250) (mod i 250) 1) 4701 key))))))
+                 (check "one refresh adds at most 64 servers"
+                        (= 64 (cl-ton:proxy-merge-liteservers p many))))
+               (check "the proxy never holds more than 256 upstreams"
+                      (let ((more (cl-ton::%refresh-parse-liteservers
+                                   (%ls-json (loop for i below 200 collect (list (%ip 40 (floor i 250) (mod i 250) 1) 4701 key))))))
+                        (cl-ton:proxy-merge-liteservers p more)
+                        (cl-ton:proxy-merge-liteservers p (cl-ton::%refresh-parse-liteservers
+                                                           (%ls-json (loop for i below 200 collect (list (%ip 41 (floor i 250) (mod i 250) 1) 4701 key)))))
+                        (cl-ton:proxy-merge-liteservers p (cl-ton::%refresh-parse-liteservers
+                                                           (%ls-json (loop for i below 200 collect (list (%ip 42 (floor i 250) (mod i 250) 1) 4701 key)))))
+                        (<= (length (cl-ton::lisp-proxy-upstreams p)) 256)))))
+        (setf (cl-ton::lisp-proxy-stop-p p) t)
+        (dolist (th (cl-ton::lisp-proxy-pollers p)) (sb-thread:join-thread th :default nil :timeout 6))
+        (dolist (u (cl-ton::lisp-proxy-upstreams p))
+          (when (cl-ton::proxy-upstream-client u) (cl-ton::close-adnl-ext-client (cl-ton::proxy-upstream-client u))))))
+    ;; the whole refresh, with a fake download
+    (let* ((dir (%tmpdir "refresh2")) (p (%scores-proxy dir '("8.8.4.4:4701" nil))))
+      (setf (cl-ton::lisp-proxy-refresh-url p) "https://example.org/g.json")
+      (unwind-protect
+           (flet ((refresh (fetch) (cl-ton:proxy-refresh-liteservers p :fetch fetch)))
+             (check "a download is parsed and its new servers added; the status says so"
+                    (and (eql 1 (refresh (lambda (url) (declare (ignore url)) (%ls-json (list (list (%ip 8 8 4 4) 4701 key) (list (%ip 5 5 5 5) 4701 key))))))
+                         (search "1 new" (cl-ton::lisp-proxy-refresh-status p))
+                         (= 1 (cl-ton::lisp-proxy-refresh-added p))))
+             (let ((before (length (cl-ton::lisp-proxy-upstreams p))))
+               (check "a failed download, garbage and a fetch that signals an error all change nothing and signal nothing"
+                      (and (null (refresh (lambda (url) (declare (ignore url)) nil)))
+                           (search "failed" (cl-ton::lisp-proxy-refresh-status p))
+                           (null (refresh (lambda (url) (declare (ignore url)) "this is not json")))
+                           (search "no usable" (cl-ton::lisp-proxy-refresh-status p))
+                           (null (refresh (lambda (url) (declare (ignore url)) (error "boom"))))
+                           (= before (length (cl-ton::lisp-proxy-upstreams p))))))
+             (check "the download is asked for at the refresh URL"
+                    (let ((asked nil))
+                      (refresh (lambda (url) (setf asked url) nil))
+                      (equal asked "https://example.org/g.json"))))
+        (setf (cl-ton::lisp-proxy-stop-p p) t)
+        (dolist (th (cl-ton::lisp-proxy-pollers p)) (sb-thread:join-thread th :default nil :timeout 6))
+        (dolist (u (cl-ton::lisp-proxy-upstreams p))
+          (when (cl-ton::proxy-upstream-client u) (cl-ton::close-adnl-ext-client (cl-ton::proxy-upstream-client u))))))
+    ;; the real curl: nothing listens on loopback port 9; nothing is fetched, nothing leaks
+    (check "curl against a closed port fails quietly, within its time limit"
+           (let ((t0 (get-internal-real-time)))
+             (and (null (cl-ton::%curl-fetch "https://127.0.0.1:9/g.json" :timeout 4))
+                  (< (/ (- (get-internal-real-time) t0) internal-time-units-per-second) 8))))
+    (check "a URL that looks like a curl option is a URL, not an option (no file is written)"
+           (let ((path "/tmp/cl-ton-curl-injection-test"))
+             (when (probe-file path) (delete-file path))
+             (null (cl-ton::%curl-fetch (format nil "-o~A" path) :timeout 3))
+             (not (probe-file path))))))

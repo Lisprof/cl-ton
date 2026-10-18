@@ -31,7 +31,19 @@
    :node :node-p :node-hash :node-hash-hex :node-depth :node-level :node-equal
    :node-level-mask :node-hashes :node-depths :node-hash-at :node-depth-at
    :cell-special-type :pruned-branch-p :make-pruned-branch
-   :merkle-proof-root :verify-merkle-proof :verify-merkle-update
+   :merkle-proof-root :verify-merkle-proof :verify-merkle-update :merkle-update-hashes
+   ;; proof-verify.lisp
+   :proof-error :dict-lookup :parse-block-info :verify-block-proof :parse-shard-state-header
+   :find-shard-description :verify-account-state :verify-transaction-list :parse-transaction-header
+   :parse-account :run-account-get-method :open-lite-client :close-lite-client :lite-call :lite-sync :lite-account-state :lite-transactions :lite-run-get-method :lite-server-get-method :lite-send-message :lite-shards :lite-shard-info :lite-libraries :lite-lookup-block :lite-prove-block :diagnose-lite :*signature-set-counts* :lite-error :lite-error-code :lite-client-trusted
+   :verify-all-shards-info :list-shard-descriptions :verify-libraries-with-proof :verify-shard-info :lookup-shard-leaf :verify-lookup-block :verify-shard-block-proof :verify-lookup-header :verify-lookup-prev-header :parse-block-links :verify-libraries :check-send-message-status :external-message-hash :verify-block-header :verify-block-data :verify-block-transactions :find-block-transaction :dict-lookup-in-slice
+   ;; sync.lisp
+   :validator-set :validator-set-p :validator-set-since :validator-set-until :validator-set-main
+   :validator-set-total-weight :validator-set-members :parse-validator-set :validator-set-active-p
+   :check-block-signatures :plan-block-signatures :check-signature-entries :check-signature-jobs :ed25519-prepare :ed25519-batch-verify :ed25519-first-invalid :ironclad-assembly-status :ironclad-assembly-line :*lite-proof-hook* :save-link-vector :load-link-vector :parallel-map :worker-count :*worker-count* :ed25519-key-point :masterchain-config-root :key-block-config-root :config-param :validator-sets-at :validator-sets-at-root :key-block-validator-sets
+   :verify-forward-link :signature-message :verify-back-link :verify-partial-block-proof :proof-single-links :parse-catchain-config :verify-config-info
+   :compute-validator-set-hash :shuffle-masterchain-validators :masterchain-validator-set-hash
+   :check-validator-set-binding :*verify-validator-set-hash* :prng-next-ulong :make-validator-prng
    :cell :cell-p :make-cell
    :cell-bits :cell-bit-length :cell-refs :cell-exotic-p
    :cell-bit :cell-uint :cell-bit-vector :cell-data-octets
@@ -50,7 +62,7 @@
    :tl-write-bytes :tl-write-string :tl-write-vector
    :make-tl-reader :tl-reader-remaining :tl-reader-eof-p :tl-take :tl-read-uint
    :tl-read-int32 :tl-read-int64 :tl-read-int256 :tl-read-bytes :tl-read-string :tl-read-vector
-   ;; tl.lisp: the typed tonlib API (cl-ton/tl/tonlib_api.tl)
+   ;; tl.lisp: the typed tonlib API (cl-ton/tests/tl/tonlib_api.tl)
    :tlapi-make :tlapi-validate :tlapi-get :tlapi-is :tlapi-obj :tlapi-obj-p :tlapi-obj-name
    :tlapi-function-p :tlapi-constructor-names :tlapi->plist :json->tlapi
    ;; adnl-crypto.lisp
@@ -104,7 +116,8 @@
    :read-proxy-liteserver-identity :proxy-liteserver-entry :proxy-liteserver-config
    :proxy-liteserver-global-config-path :ipv4-string->ip-int
    ;; proxy diagnostics (where does the native proxy stop?)
-   :proxy-diagnostics :proxy-diagnostics-report :proxy-verdict :proxy-wait-ready :start-proxy-watch
+   :proxy-refresh-liteservers :proxy-merge-liteservers :*proxy-refresh-url* :*proxy-fetch-function* :*proxy-official-config-urls*
+   :proxy-save-scores :proxy-scores-file :proxy-diagnostics :proxy-diagnostics-report :proxy-verdict :proxy-wait-ready :start-proxy-watch
    :diagnose-proxy :adnl-ext-client-status :adnl-failure-hint
    :adnl-ext-server-connection-stats :proxy-method-table :proxy-history-query-p :*proxy-max-attempts* :*proxy-hedge-delay* :*proxy-hedge-min* :*proxy-hedge-max*
    :*proxy-failure-penalty-max* :proxy-hedge-delay :*proxy-max-active-upstreams*

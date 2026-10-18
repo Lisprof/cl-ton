@@ -114,7 +114,7 @@ libemulator.  Returns (values ITEMS EXIT-CODE GAS-USED MISSING-LIBRARY-HEX)."
                  (%tvm-set-c7 em (address->string (or address (make-address)))
                               unixtime balance rand-seed (cffi:null-pointer))))
            (let* ((raw (take-c-string
-                        (%tvm-run-get-method em (method-id method)
+                        (%tvm-run-get-method em (if (integerp method) method (method-id method))
                                              (cell->base64 (serialize-vm-stack stack)))))
                   (r (json-decode raw)))
              (unless (json-get r "success")
@@ -126,6 +126,28 @@ libemulator.  Returns (values ITEMS EXIT-CODE GAS-USED MISSING-LIBRARY-HEX)."
                        (let ((g (json-get r "gas_used"))) (if (stringp g) (parse-integer g) g))
                        (and missing (stringp missing) missing)))))
       (%tvm-destroy em))))
+
+(defun run-account-get-method (account-cell method stack &key config libraries unixtime gas-limit)
+  "Run getter METHOD with STACK (deepest first) on the code and data of ACCOUNT-CELL, an Account cell
+(the verified one VERIFY-ACCOUNT-STATE returns): the address and balance of c7 come from the account
+too, and its own libraries join LIBRARIES (an alist of (hash-hex . cell), which win).  The values of
+RUN-GET-METHOD-LOCAL.  An account that is not active has nothing to run."
+  (let ((account (parse-account account-cell)))
+    (unless (and (eq (getf account :status) :active) (getf account :code) (getf account :data))
+      (error 'emulator-error :format-control "cannot run ~A on ~A: the account is ~(~A~)~:[~; without code or data~]"
+                             :format-arguments (list method
+                                                     (let ((a (getf account :address))) (if a (address->string a) "?"))
+                                                     (getf account :status) (eq (getf account :status) :active))))
+    (let ((own (and (getf account :library-root)
+                    (mapcar (lambda (entry)
+                              (cons (octets->hex (uint->octets (car entry) 32)) (cdr entry)))
+                            (dict-entries (getf account :library-root) 256
+                                          (lambda (s) (load-ref (skip-bits s 1))))))))
+      (apply #'run-get-method-local (getf account :code) (getf account :data) method stack
+             :address (getf account :address) :balance (getf account :balance)
+             :libraries (append libraries (remove-if (lambda (e) (assoc (car e) libraries :test #'string-equal)) own))
+             (append (and config (list :config config)) (and unixtime (list :unixtime unixtime))
+                     (and gas-limit (list :gas-limit gas-limit)))))))
 
 (defstruct (emulation-result (:copier nil))
   (success-p nil :read-only t)

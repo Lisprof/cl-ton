@@ -114,13 +114,31 @@
 
 (defun uint->octets (value nbytes)
   "Big-endian encoding of the non-negative integer VALUE in NBYTES bytes."
-  (make-array nbytes :element-type '(unsigned-byte 8)
-                     :initial-contents (loop for k from (1- nbytes) downto 0
-                                             collect (ldb (byte 8 (* 8 k)) value))))
+  (let ((out (make-array nbytes :element-type '(unsigned-byte 8))))
+    (loop for i from 0 below nbytes
+          do (setf (aref out i) (ldb (byte 8 (* 8 (- nbytes 1 i))) value)))
+    out))
 
 (defun octets->uint (octets &key (start 0) (end (length octets)))
-  (reduce (lambda (acc b) (logior (ash acc 8) b)) octets
-          :start start :end end :initial-value 0))
+  "The big-endian unsigned integer of OCTETS[START, END).  Whole 64-bit words are gathered without
+boxing, so a 32-octet hash costs one or two bignums instead of one per octet."
+  (if (typep octets '(simple-array (unsigned-byte 8) (*)))
+      (let ((acc 0) (i start))
+        (declare (type unsigned-byte acc) (type fixnum i start end)
+                 (type (simple-array (unsigned-byte 8) (*)) octets))
+        (loop while (<= (+ i 8) end)
+              do (let ((w 0))
+                   (declare (type (unsigned-byte 64) w))
+                   (dotimes (k 8)
+                     (setf w (logior (ldb (byte 64 0) (ash w 8)) (aref octets (+ i k)))))
+                   (setf acc (logior (ash acc 64) w)))
+                 (incf i 8))
+        (loop while (< i end)
+              do (setf acc (logior (ash acc 8) (aref octets i)))
+                 (incf i))
+        acc)
+      (reduce (lambda (acc b) (logior (ash acc 8) b)) octets
+              :start start :end end :initial-value 0)))
 
 (defun bytes-needed (n)
   "Smallest number of bytes (at least 1) whose big-endian encoding holds N."
@@ -169,6 +187,12 @@ least this many cells; smaller ones are not worth the thread start-up.")
         (loop for tail on list by (lambda (l) (nthcdr size l))
               collect (loop for x in tail repeat size collect x)))))
 
+(defvar *pmap-conveyed* '()
+  "Special variables whose CURRENT values PMAP hands to its worker threads.  A new SBCL thread sees the global value of
+a special, not the binding of the thread that made it, so a dynamically bound setting (the block the getters are pinned
+to, the trial's getter log) would silently not apply inside a worker without this.  Files that define such a variable
+PUSHNEW it here.")
+
 (defun pmap (function list &key (threads *worker-count*))
   "MAPCAR FUNCTION over LIST using up to THREADS SB-THREAD threads; the
 result has the same order as LIST.  FUNCTION must be thread-safe, which is
@@ -180,14 +204,17 @@ have finished."
         (mapcar function list)
         #-sb-thread (mapcar function list)
         #+sb-thread
-        (let ((workers
-                (mapcar (lambda (chunk)
-                          (sb-thread:make-thread
-                           (lambda ()
-                             (handler-case (cons :ok (mapcar function chunk))
-                               (error (e) (cons :error e))))
-                           :name "ton-boc pmap worker"))
-                        (split-list list parts))))
+        (let* ((vars (remove-if-not #'boundp *pmap-conveyed*))
+               (vals (mapcar #'symbol-value vars))
+               (workers
+                 (mapcar (lambda (chunk)
+                           (sb-thread:make-thread
+                            (lambda ()
+                              (progv vars vals
+                                (handler-case (cons :ok (mapcar function chunk))
+                                  (error (e) (cons :error e)))))
+                            :name "ton-boc pmap worker"))
+                         (split-list list parts))))
           ;; Join EVERY worker before signalling anything: re-signalling the first error
           ;; straight away lets the caller unwind (and tear down whatever the other workers
           ;; are still using -- e.g. close a tonlib client mid-request) under their feet.
@@ -441,6 +468,13 @@ the tree's, pruned branches seen at level 0 as the subtrees they stand for."
       (boc-error "Merkle proof is of ~A, expected ~A"
                  (octets->hex (node-hash-at root 0)) (octets->hex (%hash-arg expected-hash))))
     root))
+
+(defun merkle-update-hashes (update)
+  "(VALUES OLD-HASH NEW-HASH) a Merkle update cell states (checked against its subtrees at construction)."
+  (unless (and (cell-p update) (= 4 (cell-special-type update)))
+    (boc-error "Not a Merkle update: ~S" update))
+  (values (%field-octets (cell-bits update) (cell-bit-length update) 8 32)
+          (%field-octets (cell-bits update) (cell-bit-length update) 264 32)))
 
 (defun verify-merkle-update (update expected-old-hash)
   "(VALUES NEW-HASH OLD-TREE NEW-TREE) of a Merkle update cell, provided it transforms the state

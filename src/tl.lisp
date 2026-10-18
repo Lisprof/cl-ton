@@ -58,7 +58,13 @@
 (defun tl-put-int64 (out v) (tl-put-uint-le out v 8))
 
 (defun tl-put-raw (out octets)
-  (loop for b across octets do (tl-put-u8 out b)))
+  "Append OCTETS to the adjustable vector OUT with one growth and one copy."
+  (let* ((n (length octets)) (old (fill-pointer out)) (new (+ old n)))
+    (when (> new (array-dimension out 0))
+      (setf out (adjust-array out (max new (* 2 (array-dimension out 0))))))
+    (setf (fill-pointer out) new)
+    (replace out octets :start1 old)
+    out))
 
 (defun tl-put-int256 (out octets)
   (unless (= (length octets) 32)
@@ -452,7 +458,7 @@ a known constructor are an error; an unknown constructor decodes to
 
 ;;; --- the schema: lite_api.tl and ton_api.tl --------------------------------------
 ;;;
-;;; The constructors are the vendored files' (cl-ton/tl/), read when this file is compiled, so
+;;; The constructors are the vendored files' (cl-ton/tests/tl/), read when this file is compiled, so
 ;;; the codec cannot disagree with them: names, field layouts, explicit `#id`s and CRC32 ids all
 ;;; come from the schema the TON nodes are built from.  Updating the schema means replacing
 ;;; the files and running the cl-ton test system, which checks the ids against the ones
@@ -470,7 +476,7 @@ being compiled), read now, at compile time, when the compiled file loads."
                                      collect text)))
        (tl-register declaration))))
 
-(define-tl-schema "../tl/ton_api.tl" "../tl/lite_api.tl")
+(define-tl-schema "../tests/tl/ton_api.tl" "../tests/tl/lite_api.tl")
 
 ;;; --- small conveniences used by the proxy / fakechain ----------------------
 
@@ -485,7 +491,7 @@ being compiled), read now, at compile time, when the compiled file loads."
 
 ;;; --- tonlib_api.tl: the typed tonlib API ------------------------------------
 ;;;
-;;; tonlib's API objects (cl-ton/tl/tonlib_api.tl) are not wire formats on this path: tonlib
+;;; tonlib's API objects (cl-ton/tests/tl/tonlib_api.tl) are not wire formats on this path: tonlib
 ;;; hands them around in memory and tonlibjson shows them as JSON.  So this section does not
 ;;; encode them to octets; it gives them a SCHEMA (read from the vendored file when this file
 ;;; is compiled, so the .tl text is not needed at run time), validated typed objects
@@ -576,7 +582,7 @@ time, and install its declarations when the compiled file loads."
   (let ((path (merge-pathnames relative-path (or *compile-file-truename* *load-truename*))))
     `(tlapi-install ',(tlapi-read-declarations path))))
 
-(define-tlapi-schema "../tl/tonlib_api.tl")
+(define-tlapi-schema "../tests/tl/tonlib_api.tl")
 
 (defun tlapi-find (name)
   (or (gethash name *tlapi-cons*) (ton-error "unknown tonlib API constructor ~A" name)))

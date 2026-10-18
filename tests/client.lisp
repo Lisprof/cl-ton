@@ -943,12 +943,24 @@ Skipped when TON_FIFT_BINARY isn't set."
     (test-tl-adnl-ext)   ; Phase A/B unit tests (tests/tl-adnl-ext.lisp)
     (test-tlapi)         ; typed tonlib API (tests/tlapi.lisp)
     (test-cells)         ; cell levels / pruned branches / Merkle proofs (tests/cells.lisp)
+    (test-verify)        ; lite proof verification (tests/verify.lisp)
+    (test-sync)          ; key-block sync (tests/sync.lisp)
+    (test-pmap-conveys)
+    (test-lite-client)   ; the verifying liteserver client over ADNL-ext (tests/lite.lisp)
+    (test-lite-state-file)   ; its persisted trust state
+    (test-lite-commit-key)   ; key blocks kept round by round
+    (test-lite-resilience)   ; reconnects, waiting for a block, a state file in use
+    (test-lite-backend-parity) ; the lite client as a drop-in for tonlib
+    (test-lite-backend-parity-2) ; ... shards, block transactions, raw transactions
+    (test-diagnose-lite)     ; the real-network diagnostic, against the fakechain
     (test-proxy-ext)     ; Phase C/D: client + native proxy vs Lisp upstream (tests/proxy-ext.lisp)
     (test-patient-sync)      ; sync keeps going while verified steps arrive
     (test-keystores)         ; private, per-client keystore directories
     (test-network-summary)   ; fast / ok / slow / unknown
     (test-unknown-query-naming)
     (test-proxy-hedging)     ; hedge, adaptive delay, penalties, speed preference, standby
+    (test-proxy-scores)      ; upstream speed scores kept across restarts
+    (test-proxy-refresh)     ; refreshing the liteserver list
     (test-proxy-connection-stats) ; inbound connection lifecycle + answer times
     (test-proxy-retry)       ; retry on another upstream: stall / drop / pruned / single
     (test-proxy-diagnostics) ; where the native proxy stops: stage, hint, verdict, watch

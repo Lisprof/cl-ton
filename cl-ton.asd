@@ -34,13 +34,18 @@
      (:file "types")  
      (:file "vm-stack")  
      (:file "tonlib")  
-     (:file "emulator")  
+     (:file "emulator")
+     (:file "ed25519-batch") ; many Ed25519 signatures at once, pure, on ironclad's curve operations
+     (:file "proof-verify") ; checking a liteserver answer against a trusted block hash
+     (:file "sync")         ; trusted block -> newer block: validator signatures over block links  
      (:file "jetton")  
      (:file "wallet")  
      (:file "adnl-ext")            ; Phase B: X25519 glue, AES-CTR framing, init packet
      (:file "adnl-ext-client")     ; Phase C: outbound upstream client (reconnect loop, query table)
      (:file "adnl-ext-server")     ; Phase D: inbound listener/handshake, shared with fakechain
      (:file "proxy-liteserver")    ; uses CONFIG-WITH-LITESERVERS/JSON-GET from tonlib
+     (:file "lite-client")         ; verifying liteserver client: sync, account state, transactions, getters
+     (:file "lite-backend")        ; the lite client as a drop-in for the tonlib client (R2b)
      (:file "dex")  
      (:file "indexer")     ; before chain: chain-close calls stop-flow-scanner  
      (:file "chain"))))  
@@ -63,7 +68,10 @@
 			     (:file "proxy-ext")
 			     (:file "scenarios")
 			     (:file "tlapi")
-			     (:file "cells"))))   ; cell levels, pruned branches, Merkle proofs   ; the typed tonlib API: schema, validation, JSON bridge, A/B vs tonlibjson
+			     (:file "cells")
+			     (:file "verify")
+			     (:file "sync")
+			     (:file "lite"))))   ; validator sets, signatures, block links   ; the lite proof verifier   ; cell levels, pruned branches, Merkle proofs   ; the typed tonlib API: schema, validation, JSON bridge, A/B vs tonlibjson
 
   :perform (test-op (o c)  
              (uiop:symbol-call :cl-ton/test :run-tests)))  

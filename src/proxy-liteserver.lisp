@@ -89,7 +89,13 @@ liteServer.error instead of leaving the client hanging.")
   (method-latency (make-hash-table :test 'equal)) ; METHOD -> (n . ewma-seconds) of answered attempts
   (served (make-hash-table :test 'equal)) ; METHOD -> (n total-seconds max-seconds slow) as tonlib saw it
                                          ; (retries included); SLOW counts answers later than 8 s
-  (stats (make-hash-table :test #'equal)))
+  (stats (make-hash-table :test #'equal))
+  (refresh-url nil)                     ; NIL (off) or the https URL of a global config whose liteservers are added
+  (refresh-interval 86400)              ; seconds between refreshes
+  (refresh-at 0)                        ; universal time the last refresh was started
+  (refresh-running nil)                 ; a refresh thread is working
+  (refresh-added 0)                     ; upstreams added by refreshes so far
+  (refresh-status nil))                 ; text of the last refresh outcome
 
 (defstruct (proxy-upstream (:copier nil))
   name client
@@ -742,7 +748,15 @@ function-octets): an optional waitMasterchainSeqno prefix and the rest."
          (or (eql (tl-get obj :code) 651)
              (let ((msg (tl-get obj :message)))
                (and (stringp msg)
-                    (or (search "not in db" msg) (search "out of sync" msg))))))))
+                    (or (search "not in db" msg) (search "out of sync" msg)
+                        ;; getTransactions of a server whose lt index lags: "cannot compute block with specified
+                        ;; transaction: cannot find block (...) lt=...: ltdb: block not found (last known
+                        ;; masterchain block: N)" -- code -400, but the same "not there yet" as above
+                        (search "ltdb: block not found" msg)
+                        ;; getBlockProof from a server that is BEHIND the block the client already proved: "client knows
+                        ;; block (-1,..,N):.. newer than the reference masterchain block (-1,..,M):.." -- code -400,
+                        ;; but a stale upstream, not a bad request: another one is ahead
+                        (and (search "client knows block" msg) (search "newer than the reference" msg)))))))))
 
 (defparameter *proxy-max-attempts* 4
   "At most this many upstreams are tried for one query before the last answer is passed on.")
@@ -764,12 +778,14 @@ clears it.")
 (defparameter *proxy-failure-penalty-max* 120)
 
 (defparameter *proxy-history-queries*
-  '("getBlockProof" "getBlock" "getBlockHeader" "lookupBlock" "getState" "getShardBlockProof"
+  '("getBlockProof" "getBlock" "getBlockHeader" "lookupBlock" "lookupBlockWithProof" "getState" "getShardBlockProof"
     "getAllShardsInfo" "getShardInfo" "getConfigAll" "getConfigParams" "listBlockTransactions"
-    "listBlockTransactionsExt")
+    "listBlockTransactionsExt" "getLibrariesWithProof" "getLibraries")
   "Read-only queries about a block or its history.  A liteserver that has pruned, or never had,
 the block answers with an ERROR for them while another may hold it, so an error answer is retried
-on a different upstream (a block proof chain from the init block is hundreds of these in a row,
+on a different upstream (the library queries are here because the servers differ in what they can build:
+one real upstream answers getLibrariesWithProof with -400 \"cannot create library proof: failed to load ref for
+dict\", another with \"unknown request type\", while a C++ node answers it) (a block proof chain from the init block is hundreds of these in a row,
 and tonlib restarts the whole synchronisation when one fails).  Account queries are not listed:
 their errors (and exit codes) are answers about the account, the same on every server.")
 
@@ -1076,13 +1092,282 @@ good upstreams are enough, and a standby is opened the moment an active one fail
         (start-adnl-ext-client (proxy-upstream-client up))
         (incf started)))))
 
+
+;;; --- upstream speed scores that survive a restart (R1c-2) -------------------------------------
+;;;
+;;; Which public liteservers are near and fast is learned from answers; a restart used to forget it
+;;; and open eight random sessions again.  The proxy keeps per upstream its SLOWNESS (answer time
+;;; relative to the method's usual time) and per method the USUAL answer time in
+;;; <db>/upstream-scores.json: no secrets, only numbers.  The file is read defensively (size cap,
+;;; strict types, ranges clamped, a stale or malformed file ignored, never an error), its numbers are
+;;; pulled half-way back toward "typical" (what was fast a day ago may not be now), and it only
+;;; ORDERS the first sessions: the server's answers are verified exactly as before.
+
+(defparameter *proxy-scores-max-age* (* 7 24 3600)
+  "Seconds after which a saved scores file is ignored.")
+(defparameter *proxy-scores-save-interval* 60
+  "Seconds between saves of the scores while the proxy runs (it also saves when closed).")
+
+(defun proxy-scores-file (db)
+  (merge-pathnames "upstream-scores.json" (uiop:ensure-directory-pathname db)))
+
+(defun %scores-name-ok-p (name)
+  (and (stringp name) (< 0 (length name) 101)
+       (every (lambda (c) (or (alphanumericp c) (find c ".:-_[]"))) name)))
+
+(defun %scores-real (x lo hi)
+  "X clamped to [LO, HI] when it is a finite real, else NIL."
+  (and (realp x) (not (and (floatp x) (or (/= x x) (> (abs x) 1d300))))
+       (max lo (min hi x))))
+
+(defun %proxy-scores-text (proxy)
+  "The JSON text of PROXY's learned scores, or NIL when nothing was learned yet."
+  (let ((ups (sb-thread:with-mutex ((lisp-proxy-lock proxy))
+               (loop for up in (lisp-proxy-upstreams proxy)
+                     when (and (proxy-upstream-slowness up) (%scores-name-ok-p (proxy-upstream-name up)))
+                       collect (cons (proxy-upstream-name up) (proxy-upstream-slowness up)))))
+        (methods (sb-thread:with-mutex ((lisp-proxy-lock proxy))
+                   (loop for name being the hash-keys of (lisp-proxy-method-latency proxy) using (hash-value cell)
+                         when (and (%scores-name-ok-p name) (plusp (car cell)))
+                           collect (list name (car cell) (cdr cell))))))
+    (when (or ups methods)
+      (with-output-to-string (o)
+        (format o "{\"version\":1,\"saved\":~D,\"upstreams\":[" (get-universal-time))
+        (loop for (name . slow) in ups for first = t then nil
+              do (format o "~:[,~;~]{\"name\":\"~A\",\"slowness\":~,4F}" first name (float slow 1d0)))
+        (format o "],\"methods\":[")
+        (loop for (name n usual) in methods for first = t then nil
+              do (format o "~:[,~;~]{\"name\":\"~A\",\"n\":~D,\"usual\":~,5F}" first name n (float usual 1d0)))
+        (format o "]}")))))
+
+(defun proxy-save-scores (proxy)
+  "Write PROXY's learned speed scores to its db (atomically); NIL when there is nothing to write or the
+write failed -- a failure is logged, never signalled."
+  (handler-case
+      (let ((text (%proxy-scores-text proxy)))
+        (when text
+          (let* ((path (namestring (proxy-scores-file (lisp-proxy-db proxy))))
+                 (tmp (format nil "~A.~D.tmp" path (sb-posix:getpid))))
+            (ensure-directories-exist path)
+            (with-open-file (o tmp :direction :output :if-exists :supersede :external-format :utf-8)
+              (write-string text o))
+            (sb-posix:rename tmp path)
+            t)))
+    (error (e)
+      (when (lisp-proxy-log-fn proxy)
+        (ignore-errors (funcall (lisp-proxy-log-fn proxy) "scores: not saved: ~A" e)))
+      nil)))
+
+(defun %proxy-read-scores (db)
+  "(VALUES UPSTREAMS METHODS) read from DB's scores file: UPSTREAMS maps an upstream name to its decayed
+slowness, METHODS a method name to (N . USUAL-SECONDS).  Both NIL when there is no usable file."
+  (handler-case
+      (let* ((path (proxy-scores-file db))
+             (size (and (probe-file path) (with-open-file (i path :element-type '(unsigned-byte 8)) (file-length i)))))
+        (when (and size (< 0 size 65537))
+          (let* ((doc (json-decode (uiop:read-file-string path)))
+                 (saved (and (hash-table-p doc) (json-get doc "saved")))
+                 (now (get-universal-time))
+                 (ups (make-hash-table :test 'equal)) (methods (make-hash-table :test 'equal)))
+            (when (and (hash-table-p doc) (eql (json-get doc "version") 1) (integerp saved)
+                       (<= (- now *proxy-scores-max-age*) saved (+ now 86400)))
+              (dolist (e (let ((l (json-get doc "upstreams"))) (and (listp l) (subseq l 0 (min 64 (length l))))))
+                (when (hash-table-p e)
+                  (let ((name (json-get e "name")) (slow (%scores-real (json-get e "slowness") 0.25 4.0)))
+                    (when (and (%scores-name-ok-p name) slow)
+                      (setf (gethash name ups) (+ 1.0 (* 0.5 (- (float slow 1.0) 1.0))))))))
+              (dolist (e (let ((l (json-get doc "methods"))) (and (listp l) (subseq l 0 (min 64 (length l))))))
+                (when (hash-table-p e)
+                  (let ((name (json-get e "name")) (n (json-get e "n")) (usual (%scores-real (json-get e "usual") 0.001 30)))
+                    (when (and (%scores-name-ok-p name) (integerp n) (plusp n) usual)
+                      (setf (gethash name methods) (cons (min 10 n) (float usual 1.0)))))))
+              (values ups methods)))))
+    (error () nil)))
+
+(defun %proxy-rank-entries (entries upstream-scores)
+  "ENTRIES, (host port public slices) lists in their random order, with the upstreams UPSTREAM-SCORES
+(name -> slowness) knows to be fast first, unknown ones counting as typical (1.0) and keeping their
+random order among themselves (a stable sort), so some exploration of new servers always remains."
+  (if (or (null upstream-scores) (zerop (hash-table-count upstream-scores)))
+      entries
+      (stable-sort (copy-list entries) #'<
+                   :key (lambda (e) (or (gethash (format nil "~A:~D" (first e) (second e)) upstream-scores) 1.0)))))
+
+(defun %proxy-apply-scores (proxy upstream-scores method-scores)
+  (sb-thread:with-mutex ((lisp-proxy-lock proxy))
+    (dolist (up (lisp-proxy-upstreams proxy))
+      (let ((slow (and upstream-scores (gethash (proxy-upstream-name up) upstream-scores))))
+        (when (and slow (null (proxy-upstream-slowness up)))
+          (setf (proxy-upstream-slowness up) slow))))
+    (when method-scores
+      (maphash (lambda (name cell)
+                 (unless (gethash name (lisp-proxy-method-latency proxy))
+                   (setf (gethash name (lisp-proxy-method-latency proxy)) (cons (car cell) (cdr cell)))))
+               method-scores))))
+
+;;; --- refreshing the liteserver list (R1c-1) -------------------------------------------------------
+;;;
+;;; The public liteservers change; the global config the proxy started with ages.  When a refresh URL
+;;; is set (OPEN-NATIVE-PROXY :refresh-url, *PROXY-REFRESH-URL*, or the environment variable
+;;; TON_TRADER_PROXY_REFRESH_URL: an https URL, or "mainnet" / "testnet" for the official files),
+;;; a background thread downloads that global config now and then and ADDS its liteservers (as
+;;; standbys, never removing one) to the upstream set.  Only (ip, port, public key, slices) are taken:
+;;; init_block, the validator set and every other trust anchor are never read from the download --
+;;; and nothing it says is trusted anyway: every answer of every upstream is verified against the
+;;; anchors the client already has.  The download is done by the system's CURL, run WITHOUT a shell
+;;; (arguments, not a command line), https only (redirects too), with a time and a size limit; a
+;;; failed, oversized or malformed download changes nothing.
+
+(defparameter *proxy-refresh-url* nil "An https URL, \"mainnet\", \"testnet\", or NIL (read the environment).")
+(defparameter *proxy-refresh-interval* 86400 "Seconds between refreshes of the liteserver list.")
+(defparameter *proxy-official-config-urls*
+  '(("mainnet" . "https://ton.org/global-config.json")
+    ("testnet" . "https://ton.org/testnet-global.config.json"))
+  "The official global configs (to confirm against the TON documentation before relying on them).")
+(defparameter *proxy-refresh-max-bytes* 1048576 "Largest download accepted.")
+(defparameter *proxy-refresh-max-upstreams* 256 "Most upstreams the proxy will hold in total.")
+(defparameter *proxy-refresh-max-new* 64 "Most upstreams one refresh may add.")
+(defvar *proxy-fetch-function* nil
+  "NIL, or a function of (url) returning the body as a string: replaces curl (tests).")
+
+(defun %refresh-url-resolve (spec)
+  "SPEC (a URL, \"mainnet\", \"testnet\", NIL or \"\") as an https URL, or NIL; a bad URL is an error."
+  (let ((spec (or spec *proxy-refresh-url* (uiop:getenv "TON_TRADER_PROXY_REFRESH_URL"))))
+    (cond ((or (null spec) (zerop (length spec))) nil)
+          ((cdr (assoc spec *proxy-official-config-urls* :test #'string-equal)))
+          ((and (< 8 (length spec) 2049) (string= "https://" spec :end2 8)
+                (every (lambda (c) (and (graphic-char-p c) (char/= c #\Space) (< (char-code c) 127))) spec))
+           spec)
+          (t (ton-error "the liteserver refresh URL must be https://... (or mainnet / testnet)")))))
+
+(defun %curl-fetch (url &key (max-bytes *proxy-refresh-max-bytes*) (timeout 20))
+  "The body at the https URL, as a string, by running curl without a shell; NIL on any failure or when it
+is larger than MAX-BYTES (the transfer is stopped)."
+  (handler-case
+      (let* ((process (sb-ext:run-program
+                       "curl" (list "--silent" "--show-error" "--fail" "--location"
+                                    "--proto" "=https" "--proto-redir" "=https" "--max-redirs" "3"
+                                    "--max-time" (princ-to-string timeout)
+                                    "--max-filesize" (princ-to-string max-bytes)
+                                    "--" url)
+                       :search t :wait nil :input nil :output :stream :error nil :external-format :latin-1))
+             (out (sb-ext:process-output process))
+             (buffer (make-array 4096 :element-type 'character))
+             (text (make-string-output-stream))
+             (total 0))
+        (unwind-protect
+             (loop for n = (read-sequence buffer out)
+                   while (plusp n)
+                   do (incf total n)
+                      (when (> total max-bytes) (return-from %curl-fetch nil))
+                      (write-string buffer text :end n))
+          (when (sb-ext:process-alive-p process) (ignore-errors (sb-ext:process-kill process 15)))
+          (sb-ext:process-wait process)
+          (ignore-errors (sb-ext:process-close process)))
+        (and (zerop (sb-ext:process-exit-code process)) (get-output-stream-string text)))
+    (error () nil)))
+
+(defun %public-ipv4-p (host)
+  "HOST, a dotted quad string, is an address a public liteserver could have: not loopback, private,
+link-local, shared, multicast or reserved."
+  (let ((parts (ignore-errors (mapcar #'parse-integer (uiop:split-string host :separator ".")))))
+    (and (= 4 (length parts)) (every (lambda (x) (<= 0 x 255)) parts)
+         (destructuring-bind (a b c d) parts
+           (declare (ignore c d))
+           (not (or (= a 0) (= a 10) (= a 127) (>= a 224)
+                    (and (= a 100) (<= 64 b 127)) (and (= a 169) (= b 254))
+                    (and (= a 172) (<= 16 b 31)) (and (= a 192) (= b 168))))))))
+
+(defun %refresh-parse-liteservers (text)
+  "The valid liteserver entries (host port public slices) of the global config TEXT: each checked on its
+own (an address in range and public, a port 1-65535, a 32-octet Ed25519 key); bad entries are skipped,
+a text that is no config gives NIL."
+  (handler-case
+      (let* ((doc (json-decode text))
+             (entries (and (hash-table-p doc)
+                           (let ((a (json-get doc "liteservers")) (b (json-get doc "liteservers_v2")))
+                             (append (and (listp a) a) (and (listp b) b)))))
+             (out '()))
+        (dolist (e (subseq entries 0 (min 512 (length entries))))
+          (handler-case
+              (let* ((ip (json-get e "ip")) (port (json-get e "port"))
+                     (key (let ((id (json-get e "id"))) (and (hash-table-p id) (json-get id "key")))))
+                (when (and (integerp ip) (<= (- (expt 2 31)) ip (1- (expt 2 32))) (integerp port) (<= 1 port 65535)
+                           (stringp key) (< (length key) 100))
+                  (let* ((u (ldb (byte 32 0) ip))
+                         (host (format nil "~D.~D.~D.~D" (ldb (byte 8 24) u) (ldb (byte 8 16) u)
+                                       (ldb (byte 8 8) u) (ldb (byte 8 0) u)))
+                         (pub (base64-decode key)))
+                    (when (and (= 32 (length pub)) (%public-ipv4-p host))
+                      (push (list host port pub (parse-liteserver-slices e)) out)))))
+            (error () nil)))
+        (nreverse out))
+    (error () nil)))
+
+(defun proxy-merge-liteservers (proxy entries)
+  "Add the upstreams ENTRIES, (host port public slices) lists, that PROXY does not have yet, as standbys
+(not yet connected), with a freshness poller each.  At most *PROXY-REFRESH-MAX-NEW* per call and
+*PROXY-REFRESH-MAX-UPSTREAMS* in all.  Returns how many were added."
+  (let ((added '()))
+    (sb-thread:with-mutex ((lisp-proxy-lock proxy))
+      (dolist (e entries)
+        (destructuring-bind (h p pub slices) e
+          (let ((name (format nil "~A:~D" h p)))
+            (when (and (< (length added) *proxy-refresh-max-new*)
+                       (< (length (lisp-proxy-upstreams proxy)) *proxy-refresh-max-upstreams*)
+                       (not (find name (lisp-proxy-upstreams proxy) :key #'proxy-upstream-name :test #'string=)))
+              (let ((up (make-proxy-upstream :name name :slices slices :host h :port p :public pub :started-p nil
+                                             :client (open-adnl-ext-client h p pub :log (lisp-proxy-log-fn proxy) :start nil))))
+                (setf (lisp-proxy-upstreams proxy) (append (lisp-proxy-upstreams proxy) (list up)))
+                (push up added)))))))
+    (dolist (up (reverse added))
+      (push (start-proxy-poller proxy up) (lisp-proxy-pollers proxy)))
+    (length added)))
+
+(defun proxy-refresh-liteservers (proxy &key url (fetch (or *proxy-fetch-function* #'%curl-fetch)))
+  "Download the global config at URL (default: the proxy's refresh URL) and add its new liteservers;
+returns the number added, or NIL when nothing could be done.  Never signals; records the outcome."
+  (handler-case
+      (let* ((url (or url (lisp-proxy-refresh-url proxy)))
+             (text (and url (funcall fetch url))))
+        (cond ((null url) (setf (lisp-proxy-refresh-status proxy) "no refresh URL") nil)
+              ((null text) (setf (lisp-proxy-refresh-status proxy) "download failed") nil)
+              (t (let ((entries (%refresh-parse-liteservers text)))
+                   (if (null entries)
+                       (progn (setf (lisp-proxy-refresh-status proxy) "no usable liteservers in the download") nil)
+                       (let ((n (proxy-merge-liteservers proxy entries)))
+                         (incf (lisp-proxy-refresh-added proxy) n)
+                         (setf (lisp-proxy-refresh-status proxy)
+                               (format nil "~D usable, ~D new" (length entries) n))
+                         n))))))
+    (error (e)
+      (setf (lisp-proxy-refresh-status proxy) (format nil "refresh failed: ~A" e))
+      nil)))
+
+(defun %proxy-maybe-refresh (proxy)
+  "Called by the supervisor: start a refresh thread when one is due."
+  (when (and (lisp-proxy-refresh-url proxy) (not (lisp-proxy-refresh-running proxy))
+             (>= (- (get-universal-time) (lisp-proxy-refresh-at proxy)) (lisp-proxy-refresh-interval proxy)))
+    (setf (lisp-proxy-refresh-running proxy) t
+          (lisp-proxy-refresh-at proxy) (get-universal-time))
+    (sb-thread:make-thread
+     (lambda ()
+       (unwind-protect (proxy-refresh-liteservers proxy)
+         (setf (lisp-proxy-refresh-running proxy) nil)))
+     :name "proxy-refresh")))
+
 (defun proxy-supervise (proxy)
   "Keep (LISP-PROXY-MAX-ACTIVE PROXY) sessions alive or being opened: whenever fewer are, start a
 standby (one per second, so a burst of failures does not open everything at once)."
   (sb-thread:make-thread
    (lambda ()
-     (loop until (lisp-proxy-stop-p proxy)
-           do (let ((live (count-if (lambda (up) (and (proxy-upstream-started-p up)
+     (loop with last-save = (get-universal-time)
+           until (lisp-proxy-stop-p proxy)
+           do (%proxy-maybe-refresh proxy)
+              (when (>= (- (get-universal-time) last-save) *proxy-scores-save-interval*)
+                (setf last-save (get-universal-time))
+                (proxy-save-scores proxy))
+              (let ((live (count-if (lambda (up) (and (proxy-upstream-started-p up)
                                                       (or (adnl-ext-client-alive-p (proxy-upstream-client up))
                                                           (%upstream-trying-p up))))
                                     (lisp-proxy-upstreams proxy))))
@@ -1092,8 +1377,11 @@ standby (one per second, so a burst of failures does not open everything at once
    :name "proxy supervisor"))
 
 (defun open-native-proxy (&key global-config db (port 0) (host "127.0.0.1") (query-timeout *proxy-query-timeout*)
-                            log (max-active *proxy-max-active-upstreams*))
-  "Start the native proxy; returns a LISP-PROXY.  LOG, a function of (control &rest args),
+                            log (max-active *proxy-max-active-upstreams*)
+                            refresh-url (refresh-interval *proxy-refresh-interval*))
+  "Start the native proxy; returns a LISP-PROXY.  With REFRESH-URL (or *PROXY-REFRESH-URL*, or the
+environment variable TON_TRADER_PROXY_REFRESH_URL) the liteserver list is refreshed from that global
+config now and then, see PROXY-REFRESH-LITESERVERS.  LOG, a function of (control &rest args),
 receives one line per upstream event (connecting, handshake ack, first answer, each failure
 with its stage and a hint); see PROXY-DIAGNOSTICS for the same information on demand.  MAX-ACTIVE
 upstream sessions are opened at once (in random order, so load spreads over the public servers);
@@ -1101,7 +1389,7 @@ the others stand by and are opened when an active one fails (see PROXY-SUPERVISE
   (let* ((db (uiop:ensure-directory-pathname db))
          (config-file (merge-pathnames "config.json" db))
          (existing (probe-file config-file))
-         keypair listen-port)
+         keypair listen-port saved-upstreams saved-methods)
     (ensure-directories-exist db)
     (if existing
         (let ((parsed (json-decode (uiop:read-file-string config-file))))
@@ -1110,15 +1398,19 @@ the others stand by and are opened when an active one fails (see PROXY-SUPERVISE
         (setf keypair (adnl-generate-keypair) listen-port port))
     (let* ((proxy (%make-lisp-proxy :keypair keypair :db db :query-timeout query-timeout :log-fn log))
            (entries (%global-config-liteservers (json-decode (read-global-config global-config)))))
-      (setf (lisp-proxy-max-active proxy) (max 1 max-active))
+      (setf (lisp-proxy-max-active proxy) (max 1 max-active)
+            (lisp-proxy-refresh-url proxy) (%refresh-url-resolve refresh-url)
+            (lisp-proxy-refresh-interval proxy) (max 300 refresh-interval))
+      (multiple-value-setq (saved-upstreams saved-methods) (%proxy-read-scores db))
       (setf (lisp-proxy-upstreams proxy)
-            (loop for (h p pub slices) in (%shuffle entries)
+            (loop for (h p pub slices) in (%proxy-rank-entries (%shuffle entries) saved-upstreams)
                   for i from 0
                   for active = (< i (lisp-proxy-max-active proxy))
                   collect (make-proxy-upstream
                            :name (format nil "~A:~D" h p) :slices slices
                            :host h :port p :public pub :started-p active
                            :client (open-adnl-ext-client h p pub :log log :start active))))
+      (%proxy-apply-scores proxy saved-upstreams saved-methods)
       (handler-case
           (setf (lisp-proxy-server proxy)
                 (start-adnl-ext-server :keypair keypair :host host :port listen-port
@@ -1143,6 +1435,7 @@ the others stand by and are opened when an active one fails (see PROXY-SUPERVISE
 (defun close-native-proxy (proxy)
   (when proxy
     (setf (lisp-proxy-stop-p proxy) t)
+    (proxy-save-scores proxy)
     (dolist (th (cons (lisp-proxy-supervisor proxy) (lisp-proxy-pollers proxy)))
       (when th (sb-thread:join-thread th :default nil :timeout 6)))
     (stop-adnl-ext-server (lisp-proxy-server proxy))

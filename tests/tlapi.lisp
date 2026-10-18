@@ -1,4 +1,4 @@
-;;;; tlapi.lisp -- tests for the typed tonlib API (tl.lisp, schema cl-ton/tl/tonlib_api.tl).
+;;;; tlapi.lisp -- tests for the typed tonlib API (tl.lisp, schema cl-ton/tests/tl/tonlib_api.tl).
 ;;;;
 ;;;; Four layers: the schema (counted independently of the parser), typed objects and their
 ;;;; validation (including every way to get one wrong), the JSON bridge (exactly the requests
@@ -14,7 +14,7 @@ points it at the copy beside the binary), else in the checkout via ASDF."
   (let ((dir (sb-posix:getenv "CL_TON_TL_DIR")))
     (if (and dir (plusp (length dir)))
         (merge-pathnames name (uiop:ensure-directory-pathname dir))
-        (asdf:system-relative-pathname :cl-ton (format nil "tl/~A" name)))))
+        (asdf:system-relative-pathname :cl-ton (format nil "tests/tl/~A" name)))))
 
 (defun %raw-declarations (name)
   "Alist (constructor-name . normalized declaration text) of the vendored file NAME, by a
