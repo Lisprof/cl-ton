@@ -462,6 +462,13 @@ where CALLS-CELL is a cons whose car counts the non-poll queries received."
                   (cl-ton::proxy-notready-answer-p
                    (cl-ton::tl-encode (cl-ton::tl-make "liteServer.error" :code -400
                                                        :message "client knows block (-1,8000000000000000,99682333):94049368:51E73EFC newer than the reference masterchain block (-1,8000000000000000,99682267):668E23B1:05525EFC"))))
+           (check "...and so is one whose reference masterchain block is far behind the target"
+                  (cl-ton::proxy-notready-answer-p
+                   (cl-ton::tl-encode (cl-ton::tl-make "liteServer.error" :code -400
+                                                       :message "cannot build block proof: target block wc=-1 shard=8000000000000000 seqno=99879134 is newer than reference masterchain block wc=-1 shard=8000000000000000 seqno=86733676"))))
+           (check "...and so is a code 500 \"failed to resolve block\" (a server that lacks the block)"
+                  (cl-ton::proxy-notready-answer-p
+                   (cl-ton::tl-encode (cl-ton::tl-make "liteServer.error" :code 500 :message "failed to resolve block"))))
            (check "...and another -400 is still an answer"
                   (not (cl-ton::proxy-notready-answer-p
                         (cl-ton::tl-encode (cl-ton::tl-make "liteServer.error" :code -400 :message "cannot parse request")))))

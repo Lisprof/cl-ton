@@ -11,6 +11,8 @@ automated trading system.
 The only shared library needs is ~libemulator~. The JSON tonlib
 (~tonlibjson~) is kept as a *test oracle*, see [[*The JSON tonlib oracle (tests only)][below]].
 
+*Warning* This project is under active development; please refer to the [[./src/package.lisp][~package.lisp~]] file to examine the interface.
+
 * Layout
 
 #+begin_example
@@ -195,8 +197,8 @@ the application (see the top-level README).
 
 * Contact Us
 
-[[https://lists.sr.ht/~lisprof/cl-ton-devel][cl-ton-devel]] mailing list.
-[[https://t.me/lispDevs][Meta Programmers]] Telegram channel.
+- *[[https://lists.sr.ht/~lisprof/cl-ton-devel][cl-ton-devel]]* mailing list.
+- *[[https://t.me/lispDevs][Meta Programmers]]* Telegram channel.
 
 * License
 

@@ -737,7 +737,13 @@ function-octets): an optional waitMasterchainSeqno prefix and the rest."
                         ;; getBlockProof from a server that is BEHIND the block the client already proved: "client knows
                         ;; block (-1,..,N):.. newer than the reference masterchain block (-1,..,M):.." -- code -400,
                         ;; but a stale upstream, not a bad request: another one is ahead
-                        (and (search "client knows block" msg) (search "newer than the reference" msg)))))))))
+                        (and (search "client knows block" msg) (search "newer than the reference" msg))
+                        ;; the same from the other side: "cannot build block proof: target block ... is newer than
+                        ;; reference masterchain block (-1,..,N)" -- a server whose state is behind (a real one answered
+                        ;; with a reference block 13 million blocks old)
+                        (and (search "cannot build block proof" msg) (search "newer than reference masterchain block" msg))
+                        ;; code 500 "failed to resolve block": a server that does not have the block (yet, or any more)
+                        (search "failed to resolve block" msg))))))))
 
 (defparameter *proxy-max-attempts* 4
   "At most this many upstreams are tried for one query before the last answer is passed on.")

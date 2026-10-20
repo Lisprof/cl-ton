@@ -224,7 +224,9 @@
       (%lite-put-octets path (cl-ton::%lite-state-octets anchor anchor shash))
       (check "...but not with a state hash attached" (null (cl-ton::%lite-load-state path anchor))))
     (%lite-put-octets path (cl-ton::%lite-state-octets anchor key nil))
-    (check "a later key block without its state hash is refused" (null (cl-ton::%lite-load-state path anchor)))
+    (check "a later key block without a state hash loads as it is (real links carry none): the next start resumes there"
+           (multiple-value-bind (k h) (cl-ton::%lite-load-state path anchor)
+             (and k (null h) (eql (cl-ton::tl-get k :seqno) (cl-ton::tl-get key :seqno)))))
     (let ((other-wc (cl-ton::tl-block-id-ext :workchain 0 :seqno 900)))
       (%lite-put-octets path (cl-ton::%lite-state-octets anchor other-wc shash))
       (check "a key block of another chain (workchain 0) is refused" (null (cl-ton::%lite-load-state path anchor))))))

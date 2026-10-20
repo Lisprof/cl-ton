@@ -1,7 +1,8 @@
 lib/*linux-x86_64.so
-.tonlib/*
+.tonlib/
 tests/*linux-x86_64
 tests/lib/*
-README.org
+tests/tl/*
+tests/fixtures/*
 *.fasl
 *~

@@ -54,7 +54,10 @@ the liteserver reports by more than that: some upstreams answer getBlockProof wi
 ;;; file can move the starting point of the next run, exactly as with tonlib's keystore, so the file
 ;;; is private (mode 600, in a directory created 700) and is READ BACK ONLY if it is ours, not
 ;;; writable by others, intact (SHA-256), written for the SAME anchor and a key block that is not
-;;; older than it.  Anything else is ignored and the client starts from the anchor.  The anchor
+;;; older than it.  Anything else is ignored and the client starts from the anchor.  (A key block that
+;;; came over real links has no state hash -- the links' state updates are pruned -- and is stored and
+;;; restored as it is; a stored hash is restored with it.  A file that never resumed on the real network
+;;; made every start walk the whole key-block chain again, minutes.)  The anchor
 ;;; itself is never taken from the file.
 
 (defparameter +lite-state-magic+ (map '(simple-array (unsigned-byte 8) (*)) #'char-code "CLTONLS1"))
@@ -102,7 +105,10 @@ the liteserver reports by more than that: some upstreams answer getBlockProof wi
                              (>= (tl-get key :seqno) (tl-get anchor :seqno)))
                   (return-from %lite-load-state nil))
                 (let ((flag (aref rest 0)))
-                  (cond ((and (= flag 0) (= (length rest) 1) (%lite-same-block-p key anchor))
+                  (cond ;; no state hash: the anchor itself, OR a later key block of a real chain, whose links
+                        ;; carry no state update (it is pruned from them), so the live client holds NIL there too;
+                        ;; loading it restores exactly the state the client had when it saved the file
+                        ((and (= flag 0) (= (length rest) 1))
                          (values key nil))
                         ((and (= flag 1) (= (length rest) 33) (> (tl-get key :seqno) (tl-get anchor :seqno)))
                          (values key (subseq rest 1)))
@@ -361,7 +367,7 @@ on.  Signals LITE-ERROR (a pruned state: 602, an unknown request: -400) or when 
                                             :method-id (if (integerp method) method (method-id method))
                                             :params (serialize-boc (list (serialize-vm-stack stack)) :has-crc32c nil)))))
     (unless (tl-is answer "liteServer.runMethodResult")
-      (ton-error "runSmcMethod: unexpected answer ~A" (and (tl-obj-p answer) (tl-name answer))))
+      (ton-error "runSmcMethod: unexpected answer ~A" (and (tl-obj-p answer) (tl-obj-name answer))))
     (let ((result (tl-get answer :result)))
       (values (and result (plusp (length result)) (parse-vm-stack (first (parse-boc result))))
               (tl-get answer :exit-code)))))

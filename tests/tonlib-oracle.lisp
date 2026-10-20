@@ -311,33 +311,6 @@ ATTEMPTS tries, as before."
 (defun account-address-json (addr)
   (list :|@type| "accountAddress" :|account_address| (address->string addr)))
 
-(defun collect-block-transactions (requester block count)
-  (loop with after = nil
-        with left = count
-        with transactions = nil
-        while (or (null left) (plusp left))
-        for page-size = (if left (min left 256) 256)
-        for request = (append
-                       (list :|@type| "blocks.getTransactions"
-                             :|id| block
-                             :|mode| (if after 135 7)
-                             :|count| page-size)
-                       (when after (list :|after| after)))
-        for response = (funcall requester request)
-        for page = (json-get response "transactions")
-        do (setf transactions (nconc transactions (copy-list page)))
-           (when left (decf left (length page)))
-           (unless (and (json-get response "incomplete")
-                        page
-                        (or (null left) (plusp left)))
-             (return transactions))
-           (let ((last (car (last page))))
-             (setf after
-                   (list :|@type| "blocks.accountTransactionId"
-                         :|account| (json-get last "account")
-                         :|lt| (json-get last "lt"))))
-        finally (return transactions)))
-
 ;;; --- the entry points the lean code reaches through *TONLIB-ORACLE* ---------------------------------------------------
 
 (defun close-tonlib-ffi (tl)
