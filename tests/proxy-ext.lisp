@@ -469,6 +469,9 @@ where CALLS-CELL is a cons whose car counts the non-poll queries received."
            (check "...and so is a code 500 \"failed to resolve block\" (a server that lacks the block)"
                   (cl-ton::proxy-notready-answer-p
                    (cl-ton::tl-encode (cl-ton::tl-make "liteServer.error" :code 500 :message "failed to resolve block"))))
+           (check "...and so is a code 411 \"too future block\" (a server that is behind the block the client pinned)"
+                  (cl-ton::proxy-notready-answer-p
+                   (cl-ton::tl-encode (cl-ton::tl-make "liteServer.error" :code 411 :message "too future block"))))
            (check "...and another -400 is still an answer"
                   (not (cl-ton::proxy-notready-answer-p
                         (cl-ton::tl-encode (cl-ton::tl-make "liteServer.error" :code -400 :message "cannot parse request")))))

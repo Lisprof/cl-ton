@@ -282,7 +282,7 @@ are unordered); lists of non-plists compare element by element."
 
 (defun %typed-call (tl obj)
   "Send the typed request OBJ to the real tonlib and decode its answer into a typed object."
-  (cl-ton:json->tlapi (cl-ton::tonlib-call tl (cl-ton:tlapi->plist obj))))
+  (cl-ton:json->tlapi (cl-ton::tonlib-call tl obj)))
 
 (defun test-tlapi-vs-tonlib ()
   (format t "tonlib API: typed requests against the real tonlibjson.so (fakechain)~%")

@@ -94,7 +94,7 @@
                       (check "a getter pinned to the block before reads THAT block: seqno 3, not 4"
                              (equal '(3) (cl-ton:lite-run-get-method client addr "seqno" '() :block pinned)))
                       (check "...and so does the backend's getter when *get-method-block* is bound (the observe mode's snapshot)"
-                             (let ((cl-ton::*get-method-block* (cl-ton::lite-block-id->json pinned)))
+                             (let ((cl-ton::*get-method-block* (cl-ton::lite-block-id->tlapi pinned)))
                                (equal '(3) (cl-ton::lite-backend-run-get-method client addr "seqno" '()))))
                       (check "the configuration of a pinned block is fetched once and kept"
                              (eq (cl-ton::lite-backend-config-cell client pinned) (cl-ton::lite-backend-config-cell client pinned)))
@@ -355,10 +355,10 @@
                       (check "masterchain info and block id: the same seqno and hashes"
                              (let ((tb (cl-ton:tonlib-masterchain-block tl)) (lb (cl-ton:tonlib-masterchain-block lc)))
                                (and (= (cl-ton:tonlib-masterchain-info tl) (cl-ton:tonlib-masterchain-info lc))
-                                    (equal (cl-ton::json-get tb "root_hash") (cl-ton::json-get lb "root_hash"))
-                                    (equal (cl-ton::json-get tb "file_hash") (cl-ton::json-get lb "file_hash"))
-                                    (equal (cl-ton::json-get tb "shard") (cl-ton::json-get lb "shard"))
-                                    (equal (cl-ton::json-get tb "workchain") (cl-ton::json-get lb "workchain")))))
+                                    (equalp (cl-ton:block-id-root-hash tb) (cl-ton:block-id-root-hash lb))
+                                    (equalp (cl-ton:block-id-file-hash tb) (cl-ton:block-id-file-hash lb))
+                                    (eql (cl-ton:block-id-shard tb) (cl-ton:block-id-shard lb))
+                                    (eql (cl-ton:block-id-workchain tb) (cl-ton:block-id-workchain lb)))))
                       (dolist (a (list addr absent))
                         (let ((ts (cl-ton:tonlib-account-state tl a)) (ls (cl-ton:tonlib-account-state lc a)))
                           (check (format nil "account state of ~A: balance, code, data, last tx, status are the same"
@@ -385,12 +385,12 @@
                       (check "a getter run gives the same stack and exit code (the wallet's seqno)"
                              (multiple-value-bind (ti te) (cl-ton:tonlib-run-get-method tl addr "seqno" nil)
                                (multiple-value-bind (li le) (cl-ton:tonlib-run-get-method lc addr "seqno" nil)
-                                 (and (eql te le) (equalp (mapcar #'cl-ton::stack-item->json ti)
-                                                          (mapcar #'cl-ton::stack-item->json li))))))
+                                 (and (eql te le) (equalp (mapcar #'cl-ton:stack-item-key ti)
+                                                          (mapcar #'cl-ton:stack-item-key li))))))
                       (check "the local getter (emulator on fetched code) works on a lite client too"
                              (let ((g (cl-ton:make-local-getter lc (cl-ton:tonlib-config-cell lc))))
-                               (equalp (mapcar #'cl-ton::stack-item->json (funcall g addr "seqno" nil))
-                                       (mapcar #'cl-ton::stack-item->json (nth-value 0 (cl-ton:tonlib-run-get-method tl addr "seqno" nil))))))
+                               (equalp (mapcar #'cl-ton:stack-item-key (funcall g addr "seqno" nil))
+                                       (mapcar #'cl-ton:stack-item-key (nth-value 0 (cl-ton:tonlib-run-get-method tl addr "seqno" nil))))))
                       (check "the hash tonlib returns for a sent message is the one the lite client computes"
                              (let* ((msg (%transfer w 0 (fake-address #x66) (cl-ton::nano 1/10)))
                                     (boc (cl-ton::serialize-boc msg))
@@ -419,15 +419,12 @@
                          (if (stringp b) (subseq b 0 (min 60 (length b))) b))))))
 
 (defun %tx-normalize (tx)
-  "A copy of the raw.transaction TX whose \"data\" (a BoC) is replaced by the hash of its cell: two BoC byte
+  "A copy of the typed raw.transaction TX whose DATA (a BoC) is replaced by the hash of its cell: two BoC byte
 layouts of one cell are the same data."
-  (let ((h (make-hash-table :test 'equal)))
-    (maphash (lambda (k v) (setf (gethash k h)
-                                 (if (and (equal k "data") (stringp v))
-                                     (cl-ton::cell-hash-hex (cl-ton::base64->cell v))
-                                     v)))
-             tx)
-    h))
+  (let ((fields (copy-list (cl-ton::tlapi-obj-fields tx))))
+    (setf (getf fields :data)
+          (cl-ton::cell-hash (first (cl-ton::parse-boc (cl-ton:raw-tx-data tx)))))
+    (cl-ton::%make-tlapi-obj (cl-ton::tlapi-obj-name tx) fields)))
 
 (defun test-lite-backend-parity-2 ()
   (format t "lite backend: shards, block transactions and raw transactions against real tonlib~%")
@@ -449,17 +446,23 @@ layouts of one cell are the same data."
                     (let* ((head-json (cl-ton:tonlib-masterchain-block tl))
                            (t-shards (cl-ton:tonlib-shards tl head-json))
                            (l-shards (cl-ton:tonlib-shards lc head-json)))
-                      (check "the shards of the head are the same JSON documents"
-                             (null (%json-diff t-shards l-shards))))
+                      (check "the shards of the head are the same typed block ids"
+                             (and (plusp (length t-shards))
+                                  (equalp (mapcar #'cl-ton::tlapi-obj-fields t-shards)
+                                          (mapcar #'cl-ton::tlapi-obj-fields l-shards)))))
                     (let ((all-same t) (seen 0) (shown nil))
                       (loop for seqno from 1 to (cl-ton::fc-head-seqno fc)
-                            do (let* ((mc (cl-ton::lite-block-id->json (cl-ton::fc-mc-id (cl-ton::fc-find-block fc seqno)))))
+                            do (let* ((mc (cl-ton::lite-block-id->tlapi (cl-ton::fc-mc-id (cl-ton::fc-find-block fc seqno)))))
                                  (dolist (sh (cl-ton:tonlib-shards tl mc))
                                    (let ((tt (cl-ton:tonlib-block-transactions tl sh :count nil))
                                          (lt (cl-ton:tonlib-block-transactions lc sh :count nil)))
                                      (incf seen (length tt))
-                                     (let ((d (%json-diff tt lt)))
-                                       (when d (setf all-same nil) (unless shown (setf shown d))))))))
+                                     (unless (and (= (length tt) (length lt))
+                                                  (equalp (mapcar #'cl-ton::tlapi-obj-fields tt)
+                                                          (mapcar #'cl-ton::tlapi-obj-fields lt)))
+                                       (setf all-same nil)
+                                       (unless shown
+                                         (setf shown (list (format nil "tonlib ~D ids, lite ~D ids" (length tt) (length lt))))))))))
                       (when shown (format t "    first differences: ~{~A~^; ~}~%" (subseq shown 0 (min 5 (length shown)))))
                       (check (format nil "the short transaction ids of every block are the same (~D transactions seen)" seen)
                              (and all-same (plusp seen))))
@@ -469,18 +472,18 @@ layouts of one cell are the same data."
                              (<= (length a) 1)))
                     (let* ((tt (mapcar #'%tx-normalize (cl-ton:tonlib-transactions tl addr)))
                            (lt (mapcar #'%tx-normalize (cl-ton:tonlib-transactions lc addr))))
-                      (let ((d (%json-diff tt lt)))
-                        (when d (format t "    differences: ~{~A~^~%                 ~}~%" (subseq d 0 (min 12 (length d)))))
-                        (check (format nil "the wallet's raw transactions are the same documents (~D of them)" (length tt))
-                               (and (null d) (plusp (length tt))))))
+                      (let ((same (and (= (length tt) (length lt)) (every #'%tlapi-equal tt lt))))
+                        (unless same
+                          (format t "    tonlib ~D transactions, lite ~D~%" (length tt) (length lt)))
+                        (check (format nil "the wallet's raw transactions are the same objects (~D of them)" (length tt))
+                               (and same (plusp (length tt))))))
                     (check "...also when asked from an older transaction id"
                            (let* ((tt (cl-ton:tonlib-transactions tl addr)) (second-tx (second tt)))
                              (and second-tx
-                                  (let* ((id (cl-ton::json-get second-tx "transaction_id"))
-                                         (from-lt (parse-integer (cl-ton::json-get id "lt"))) (from-hash (cl-ton::json-get id "hash"))
+                                  (let* ((from-lt (cl-ton:raw-tx-lt second-tx)) (from-hash (cl-ton:raw-tx-hash second-tx))
                                          (a (mapcar #'%tx-normalize (cl-ton:tonlib-transactions tl addr :from-lt from-lt :from-hash from-hash)))
                                          (b (mapcar #'%tx-normalize (cl-ton:tonlib-transactions lc addr :from-lt from-lt :from-hash from-hash))))
-                                    (null (%json-diff a b)))))))
+                                    (and (= (length a) (length b)) (every #'%tlapi-equal a b)))))))
                (cl-ton:close-lite-client lc))))))))
 
 (defun test-diagnose-lite ()

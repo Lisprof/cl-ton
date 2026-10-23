@@ -12,21 +12,18 @@
 
 (defun %zero-hash-base64 () (base64-encode (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)))
 
-(defun lite-block-id->json (id)
-  "A blockIdExt tl-obj as the JSON-shaped hash table tonlib returns (ton.blockIdExt)."
-  (let ((h (make-hash-table :test 'equal)))
-    (setf (gethash "@type" h) "ton.blockIdExt"
-          (gethash "workchain" h) (tl-get id :workchain)
-          (gethash "shard" h) (format nil "~D" (let ((s (ldb (byte 64 0) (tl-get id :shard))))
-                                                  (if (>= s (expt 2 63)) (- s (expt 2 64)) s)))
-          (gethash "seqno" h) (tl-get id :seqno)
-          (gethash "root_hash" h) (base64-encode (tl-get id :root-hash))
-          (gethash "file_hash" h) (base64-encode (tl-get id :file-hash)))
-    h))
+(defun lite-block-id->tlapi (id)
+  "A blockIdExt tl-obj (the lite API's, SHARD any 64-bit pattern) as the typed ton.blockIdExt of the tonlib API."
+  (make-block-id :workchain (tl-get id :workchain)
+                 :shard (let ((s (ldb (byte 64 0) (tl-get id :shard))))
+                          (if (>= s (expt 2 63)) (- s (expt 2 64)) s))
+                 :seqno (tl-get id :seqno)
+                 :root-hash (coerce (tl-get id :root-hash) 'tl-octets)
+                 :file-hash (coerce (tl-get id :file-hash) 'tl-octets)))
 
 (defun lite-backend-masterchain-block (lc)
   "The newest PROVED masterchain block, as TONLIB-MASTERCHAIN-BLOCK returns it."
-  (lite-block-id->json (lite-sync lc)))
+  (lite-block-id->tlapi (lite-sync lc)))
 
 (defun lite-backend-masterchain-info (lc)
   (tl-get (lite-sync lc) :seqno))
@@ -107,7 +104,7 @@ account state with the proved configuration, and the public libraries the contra
 (STON.fi's pool code is one: a library cell) fetched and proved.  Like tonlib's, it honours *GET-METHOD-BLOCK*:
 when that is bound (the observe mode pins every pool read to one block) the state and the configuration are
 those of that masterchain block, proved to be of the trusted chain, not of whatever the newest head is by then."
-  (let* ((block (and *get-method-block* (json->lite-block-id *get-method-block*)))
+  (let* ((block (and *get-method-block* (tlapi->lite-block-id *get-method-block*)))
          (state (lite-account-state lc addr :block block))
          (account (and (getf state :exists) (parse-account (getf state :account-cell))))
          (hashes (and account (collect-library-hashes (getf account :code) (getf account :data)))))
@@ -121,29 +118,21 @@ those of that masterchain block, proved to be of the trusted chain, not of whate
 
 ;;; --- raw.transaction documents, shards and block transactions ------------------------------------
 ;;;
-;;; The scanner and the transaction tracker read tonlib's JSON documents.  These build the same
-;;; documents from PROVED cells.  raw.message's msg_data is always msg.dataRaw here (tonlib may
+;;; The scanner and the transaction tracker read tonlib's typed raw.transaction objects.  These build the same
+;;; objects from PROVED cells.  raw.message's msg_data is always msg.dataRaw here (tonlib may
 ;;; present a text comment as msg.dataText), and a StateInit written inline in a message is not
 ;;; extracted into init_state (it is "" then).
 
-(defun %json-table (&rest plist)
-  (let ((h (make-hash-table :test 'equal)))
-    (loop for (k v) on plist by #'cddr do (setf (gethash k h) v))
-    h))
-
-(defun json->lite-block-id (json)
-  "The ton.blockIdExt JSON-shaped hash table JSON as a blockIdExt tl-obj."
-  (let ((shard (json-get json "shard")))
-    (tl-block-id-ext :workchain (json-get json "workchain")
-                     :shard (if (stringp shard) (parse-integer shard) shard)
-                     :seqno (json-get json "seqno")
-                     :root-hash (base64-decode (json-get json "root_hash"))
-                     :file-hash (base64-decode (json-get json "file_hash")))))
+(defun tlapi->lite-block-id (id)
+  "The typed ton.blockIdExt ID as a blockIdExt tl-obj."
+  (unless (tlapi-is id "ton.blockIdExt") (ton-error "not a typed ton.blockIdExt: ~S" id))
+  (tl-block-id-ext :workchain (block-id-workchain id) :shard (block-id-shard id) :seqno (block-id-seqno id)
+                   :root-hash (block-id-root-hash id) :file-hash (block-id-file-hash id)))
 
 (defun %friendly (addr) (if addr (address->string addr) ""))
 
-(defun %message-json (msg)
-  "A Message cell as tonlib's raw.message."
+(defun %message-raw (msg)
+  "A Message cell as the typed raw.message of the tonlib API."
   (let* ((s (cell-slice msg))
          (internal (zerop (load-uint s 1)))
          (src nil) (dest nil) (value 0) (ihr 0) (fwd 0) (created 0))
@@ -174,19 +163,16 @@ those of that masterchain block, proved to be of the trusted chain, not of whate
                       (setf created (load-uint s 64) s (skip-bits s 96)))))))))
     ;; init and body, from the position after the header: re-derive it by parsing again
     (multiple-value-bind (init-cell body) (%message-init-and-body msg)
-      (%json-table "@type" "raw.message"
-                   "hash" (base64-encode (node-hash-at msg 0))
-                   "source" (%json-table "@type" "accountAddress" "account_address" (%friendly src))
-                   "destination" (%json-table "@type" "accountAddress" "account_address" (%friendly dest))
-                   "value" (format nil "~D" value)
-                   "extra_currencies" nil
-                   "fwd_fee" (format nil "~D" fwd)
-                   "ihr_fee" (format nil "~D" ihr)
-                   "created_lt" (format nil "~D" created)
-                   "body_hash" (base64-encode (node-hash-at body 0))
-                   "msg_data" (%json-table "@type" "msg.dataRaw"
-                                           "body" (cell->base64 body)
-                                           "init_state" (if init-cell (cell->base64 init-cell) ""))))))
+      (make-raw-message :hash (node-hash-at msg 0)
+                        :source (%friendly src)
+                        :destination (%friendly dest)
+                        :value value
+                        :fwd-fee fwd
+                        :ihr-fee ihr
+                        :created-lt created
+                        :body-hash (node-hash-at body 0)
+                        :body (serialize-boc body)
+                        :init-state (and init-cell (serialize-boc init-cell))))))
 
 (defun %message-init-and-body (msg)
   "(VALUES INIT-CELL-OR-NIL BODY-CELL) of a Message cell."
@@ -224,8 +210,8 @@ those of that masterchain block, proved to be of the trusted chain, not of whate
             (multiple-value-bind (in-ref s) (load-bit s)
               (values init (if in-ref (values (load-ref s)) (cell-from-slice-rest s))))))))))
 
-(defun %transaction-json (addr cell)
-  "A Transaction CELL (already proved) as tonlib's raw.transaction.  As in tonlib, \"fee\" is the
+(defun %transaction-raw (addr cell)
+  "A Transaction CELL (already proved) as the typed raw.transaction of the tonlib API.  As in tonlib, \"fee\" is the
 transaction's total fees plus the forwarding and IHR fees of its outgoing messages, \"other_fee\" that
 minus the storage fee.  \"data\" is the transaction cell as a BoC (tonlib's byte layout of the BoC may differ)."
   (let* ((s (cell-slice cell)))
@@ -253,47 +239,44 @@ minus the storage fee.  \"data\" is the transaction cell as a BoC (tonlib's byte
                                                   (multiple-value-bind (has x) (load-bit x)
                                                     (if has (load-coins x) 0)))
                                                 0))))
-                            (let* ((out-json (mapcar #'%message-json out-cells))
-                                   (fees (+ fees (loop for m in out-json
-                                                       sum (+ (parse-integer (json-get m "fwd_fee"))
-                                                              (parse-integer (json-get m "ihr_fee")))))))
-                            (%json-table "@type" "raw.transaction"
-                                         "address" (%json-table "@type" "accountAddress" "account_address" (%friendly addr))
-                                         "utime" now
-                                         "data" (cell->base64 cell)
-                                         "transaction_id" (%json-table "@type" "internal.transactionId"
-                                                                       "lt" (format nil "~D" lt)
-                                                                       "hash" (base64-encode (node-hash-at cell 0)))
-                                         "fee" (format nil "~D" fees)
-                                         "storage_fee" (format nil "~D" storage)
-                                         "other_fee" (format nil "~D" (- fees storage))
-                                         "in_msg" (if in-cell (%message-json in-cell) (make-hash-table :test 'equal))
-                                         "out_msgs" out-json))))))))))))))))
+                            (let* ((out-msgs (mapcar #'%message-raw out-cells))
+                                   (fees (+ fees (loop for m in out-msgs
+                                                       sum (+ (raw-msg-fwd-fee m) (raw-msg-ihr-fee m))))))
+                              (make-raw-transaction :address (%friendly addr)
+                                                    :utime now
+                                                    :data (serialize-boc cell)
+                                                    :lt lt
+                                                    :hash (node-hash-at cell 0)
+                                                    :fee fees
+                                                    :storage-fee storage
+                                                    :other-fee (- fees storage)
+                                                    :in-msg (and in-cell (%message-raw in-cell))
+                                                    :out-msgs out-msgs))))))))))))))))
 
 (defun lite-backend-transactions (lc addr &key from-lt from-hash)
-  "As TONLIB-TRANSACTIONS: raw.transaction documents newest first, from the given transaction id
+  "As TONLIB-TRANSACTIONS: typed raw.transaction objects newest first, from the given transaction id
 (default: the account's latest), each proved by the hash chain from the account's proved state."
   (let ((count 16))
     (if (and from-lt from-hash)
         (let* ((trusted (lite-sync lc))
                (result (verify-transaction-list
                         (lite-call lc (tl-make "liteServer.getTransactions" :count count :account (%lite-account-id addr)
-                                                                            :lt from-lt :hash (base64-decode from-hash)))
-                        addr from-lt (base64-decode from-hash) :count count)))
+                                                                            :lt from-lt :hash from-hash))
+                        addr from-lt from-hash :count count)))
           (declare (ignore trusted))
-          (mapcar (lambda (tx) (%transaction-json addr (getf tx :cell))) (getf result :transactions)))
+          (mapcar (lambda (tx) (%transaction-raw addr (getf tx :cell))) (getf result :transactions)))
         (let ((r (lite-transactions lc addr :count count)))
-          (mapcar (lambda (tx) (%transaction-json addr (getf tx :cell))) (getf r :transactions))))))
+          (mapcar (lambda (tx) (%transaction-raw addr (getf tx :cell))) (getf r :transactions))))))
 
 (defun lite-backend-shards (lc block &key timeout)
-  "As TONLIB-SHARDS: the workchain shard blocks (ton.blockIdExt JSON) the masterchain block BLOCK names.
+  "As TONLIB-SHARDS: the workchain shard blocks (typed ton.blockIdExt) the masterchain block BLOCK names.
 BLOCK is the newest proved head, or an older masterchain block, which is first proved from it."
   (declare (ignore timeout))
-  (let* ((id (json->lite-block-id block))
+  (let* ((id (tlapi->lite-block-id block))
          (head (lite-sync lc)))
     (unless (%same-block-id-p id head) (lite-prove-block lc id))
     (let ((answer (lite-call lc (tl-make "liteServer.getAllShardsInfo" :id id))))
-      (mapcar (lambda (s) (lite-block-id->json
+      (mapcar (lambda (s) (lite-block-id->tlapi
                            (tl-block-id-ext :workchain (getf s :workchain) :shard (getf s :shard) :seqno (getf s :seqno)
                                             :root-hash (getf s :root-hash) :file-hash (getf s :file-hash))))
               (getf (verify-all-shards-info answer id) :shards)))))
@@ -319,31 +302,27 @@ the head's shard blocks, or (proved by a block lookup) any other."
                    (tl-get id :seqno) (tl-get id :workchain)))))
 
 (defun lite-backend-block-transactions (lc block &key (count 40) timeout)
-  "As TONLIB-BLOCK-TRANSACTIONS: up to COUNT short transaction ids (blocks.shortTxId JSON) of a block, NIL COUNT
+  "As TONLIB-BLOCK-TRANSACTIONS: up to COUNT short transaction ids (typed blocks.shortTxId) of a block, NIL COUNT
 following the pagination to the end.  Each is proved to be in the block."
   (declare (ignore timeout))
-  (let ((id (json->lite-block-id block)))
+  (let ((id (tlapi->lite-block-id block)))
     (%lite-trust-block lc id)
     (collect-block-transactions
-     (lambda (request)
-       (let* ((mode (getf request :|mode|))
-              (after (getf request :|after|))
-              (req (apply #'tl-make "liteServer.listBlockTransactions"
-                          :id id :mode (logior mode 32) :count (getf request :|count|)
+     (lambda (block-ignored mode count after)
+       (declare (ignore block-ignored))
+       (let* ((req (apply #'tl-make "liteServer.listBlockTransactions"
+                          :id id :mode (logior mode 32) :count count
                           (and after (list :after (tl-make "liteServer.transactionId3"
-                                                           :account (base64-decode (getf after :|account|))
-                                                           :lt (let ((l (getf after :|lt|))) (if (stringp l) (parse-integer l) l)))))))
-              (result (verify-block-transactions (lite-call lc req) id :count (getf request :|count|))))
-         (%json-table "@type" "blocks.transactions"
-                      "incomplete" (getf result :incomplete)
-                      "transactions"
-                      (mapcar (lambda (tx)
-                                (%json-table "@type" "blocks.shortTxId"
-                                             "mode" mode
-                                             "account" (base64-encode (getf tx :account))
-                                             "lt" (format nil "~D" (getf tx :lt))
-                                             "hash" (base64-encode (getf tx :hash))))
-                              (getf result :transactions)))))
+                                                           :account (short-tx-account after)
+                                                           :lt (short-tx-lt after))))))
+              (result (verify-block-transactions (lite-call lc req) id :count count)))
+         (values (mapcar (lambda (tx)
+                           (tlapi-make "blocks.shortTxId" :mode mode
+                                                          :account (coerce (getf tx :account) 'tl-octets)
+                                                          :lt (getf tx :lt)
+                                                          :hash (coerce (getf tx :hash) 'tl-octets)))
+                         (getf result :transactions))
+                 (getf result :incomplete))))
      id count)))
 
 ;;; --- opening a lite client from a global config ------------------------------------------------------

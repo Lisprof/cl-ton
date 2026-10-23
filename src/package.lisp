@@ -18,7 +18,9 @@
   
 (defpackage :cl-ton
   (:nicknames :ton-client)
-  (:use :cl)  
+  (:use :cl)
+  ;; the few jonathan functions the application uses, all of them in json.lisp
+  (:import-from :jonathan :parse :to-json :*false-value* :*null-value*)
   (:export
    ;; tonlib.lisp: resolve-time getter retry
    :call-with-getter-retry :definitive-getter-failure-p :*getter-retry-attempts* :*getter-retry-delay*
@@ -97,7 +99,11 @@
    :serialize-vm-stack :parse-vm-stack  
    ;; tonlib  
    :tonlib :tonlib-oracle :tonlib-json-op :*tonlib-oracle* :open-tonlib :close-tonlib :with-tonlib :tonlib-call :ensure-keystore
-   :tonlib-masterchain-info :tonlib-masterchain-block :tonlib-shards  
+   :tonlib-masterchain-info :tonlib-masterchain-block :tonlib-shards
+   :transient-error-p :stack-item-key :make-raw-message :make-raw-transaction :raw-tx-utime :raw-tx-data :raw-tx-lt :raw-tx-hash :raw-tx-fee :raw-tx-storage-fee
+   :raw-tx-other-fee :raw-tx-in-msg :raw-tx-out-msgs :raw-msg-hash :raw-msg-body-hash :raw-msg-source :raw-msg-destination
+   :raw-msg-value :raw-msg-fwd-fee :raw-msg-ihr-fee :raw-msg-created-lt :raw-msg-body :raw-msg-init-state
+   :make-short-tx-id :short-tx-account :short-tx-lt :short-tx-hash :make-block-id :block-id-workchain :block-id-shard :block-id-seqno :block-id-root-hash :block-id-file-hash  
    :tonlib-block-transactions :tonlib-sync :tonlib-account-state :account-state  
    :account-state-balance :account-state-code :account-state-data  
    :account-state-last-lt :account-state-last-hash :account-state-status  

@@ -227,10 +227,9 @@ emulator computed."
                   (%until
                    (lambda ()
                      (let* ((blk (cl-ton::fc-head fc))
-                            (id (list :|@type| "ton.blockIdExt" :|workchain| 0
-                                      :|shard| (- (expt 2 63)) :|seqno| (cl-ton::fc-block-seqno blk)
-                                      :|root_hash| (cl-ton::base64-encode (cl-ton::fc-block-sh-root blk))
-                                      :|file_hash| (cl-ton::base64-encode (cl-ton::fc-block-sh-file blk)))))
+                            (id (cl-ton:make-block-id :workchain 0 :shard (- (expt 2 63)) :seqno (cl-ton::fc-block-seqno blk)
+                                                :root-hash (cl-ton::fc-block-sh-root blk)
+                                                :file-hash (cl-ton::fc-block-sh-file blk))))
                        (some (lambda (x) (declare (ignore x)) t)
                              (handler-case (cl-ton::tonlib-block-transactions tl id)
                                (error () nil)))))

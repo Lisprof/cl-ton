@@ -23,8 +23,6 @@
 
 (in-package :cl-ton)
 
-(defun json-decode (string) (jonathan:parse string :as :hash-table))
-
 (defun config-with-liteservers (config servers)
   (let ((out (make-hash-table :test #'equal)))
     (maphash (lambda (k v) (setf (gethash k out) v)) config)
@@ -122,33 +120,37 @@ times in total, then re-signal the last error.  Definitive failures
 
 ;;; --- typed wrappers ---------------------------------------------------
 
-;; The paging of blocks.getTransactions-shaped answers: REQUESTER takes one request (a plist) and returns one page
-;; (a JSON document with "transactions" and "incomplete"); used by the lite backend and by the test-only JSON tonlib.
+;; The short transaction ids of a block are typed blocks.shortTxId objects: MODE (the flags bits 0,1,2 say which of
+;; ACCOUNT / LT / HASH are present; the pager asks for all three), ACCOUNT and HASH octet vectors, LT an integer.
+(defun make-short-tx-id (&key account lt hash)
+  "A typed blocks.shortTxId with all three of ACCOUNT (32 octets), LT and HASH (32 octets) present."
+  (tlapi-make "blocks.shortTxId" :mode 7 :account account :lt lt :hash hash))
+
+(defun short-tx-account (tx) (tlapi-get tx :account))
+(defun short-tx-lt (tx) (tlapi-get tx :lt))
+(defun short-tx-hash (tx) (tlapi-get tx :hash))
+
+;; The paging of blocks.getTransactions-shaped answers: REQUESTER takes (BLOCK MODE COUNT AFTER), AFTER being NIL or a typed
+;; blocks.accountTransactionId, and returns one page as (VALUES the typed blocks.shortTxId list, INCOMPLETE-P).  Used by the
+;; lite backend and by the test-only JSON tonlib.
 (defun collect-block-transactions (requester block count)
   (loop with after = nil
         with left = count
         with transactions = nil
         while (or (null left) (plusp left))
         for page-size = (if left (min left 256) 256)
-        for request = (append
-                       (list :|@type| "blocks.getTransactions"
-                             :|id| block
-                             :|mode| (if after 135 7)
-                             :|count| page-size)
-                       (when after (list :|after| after)))
-        for response = (funcall requester request)
-        for page = (json-get response "transactions")
+        for (page incomplete) = (multiple-value-list
+                                 (funcall requester block (if after 135 7) page-size after))
         do (setf transactions (nconc transactions (copy-list page)))
            (when left (decf left (length page)))
-           (unless (and (json-get response "incomplete")
+           (unless (and incomplete
                         page
                         (or (null left) (plusp left)))
              (return transactions))
            (let ((last (car (last page))))
-             (setf after
-                   (list :|@type| "blocks.accountTransactionId"
-                         :|account| (json-get last "account")
-                         :|lt| (json-get last "lt"))))
+             (setf after (tlapi-make "blocks.accountTransactionId"
+                                     :account (short-tx-account last)
+                                     :lt (short-tx-lt last))))
         finally (return transactions)))
 
 ;;; --- the JSON tonlib oracle seam ---------------------------------------------------------------------------
@@ -180,24 +182,36 @@ in tests/tonlib-oracle.lisp; without them this default signals the error above."
 proved head.  NIL means read the client's current head (unpinned).  Conveyed to PMAP workers.")
 (pushnew '*get-method-block* *pmap-conveyed*)
 
+(defun make-block-id (&key workchain shard seqno root-hash file-hash)
+  "A typed ton.blockIdExt (the TL object of the tonlib API): WORKCHAIN int32, SHARD the SIGNED int64 of TL,
+SEQNO int32, ROOT-HASH and FILE-HASH octet vectors."
+  (tlapi-make "ton.blockIdExt" :workchain workchain :shard shard :seqno seqno
+                               :root-hash root-hash :file-hash file-hash))
+
+(defun block-id-workchain (id) (tlapi-get id :workchain))
+(defun block-id-shard (id) (tlapi-get id :shard))
+(defun block-id-seqno (id) (tlapi-get id :seqno))
+(defun block-id-root-hash (id) (tlapi-get id :root-hash))
+(defun block-id-file-hash (id) (tlapi-get id :file-hash))
+
 (defun tonlib-masterchain-block (tl &key timeout)
-  "Return the internal.blockIdExt for the last known masterchain block."
+  "Return the typed ton.blockIdExt of the last known masterchain block."
   (if (lite-client-p tl)
       (lite-backend-masterchain-block tl)
       (tonlib-json-op tl :masterchain-block :timeout timeout)))
 
 (defun tonlib-masterchain-info (tl &key timeout)
   "Returns the masterchain seqno of the last known block."
-  (json-get (tonlib-masterchain-block tl :timeout timeout) "seqno"))
+  (block-id-seqno (tonlib-masterchain-block tl :timeout timeout)))
 
 (defun tonlib-shards (tl block &key timeout)
-  "The shard block ids of a masterchain internal.blockIdExt."
+  "The typed shard block ids (ton.blockIdExt) of a masterchain block id."
   (if (lite-client-p tl)
       (lite-backend-shards tl block)
       (tonlib-json-op tl :shards :block block :timeout timeout)))
 
 (defun tonlib-block-transactions (tl block &key (count 40) timeout)
-  "Return up to COUNT short transaction ids from a shard block.
+  "Return up to COUNT short transaction ids (typed blocks.shortTxId) from a shard block.
 COUNT may be NIL to follow pagination until the block is complete."
   (if (lite-client-p tl)
       (lite-backend-block-transactions tl block :count count)
@@ -309,20 +323,78 @@ fetched once through smc.getLibraries and cached."
       (tonlib-json-op tl :libraries :hashes hashes)))
 
 (defun tonlib-transactions (tl addr &key (from-lt nil) (from-hash nil))
-  "The account's transactions from the given tx id (defaults to the latest): the raw list of raw.transaction hash
-tables."
+  "The account's transactions from the given tx id (defaults to the latest): the typed raw.transaction objects, newest
+first.  FROM-LT is an integer and FROM-HASH the 32 octets of the transaction id."
   (if (lite-client-p tl)
       (lite-backend-transactions tl addr :from-lt from-lt :from-hash from-hash)
       (tonlib-json-op tl :transactions :addr addr :from-lt from-lt :from-hash from-hash)))
 
-;;; --- reading raw.transaction documents -------------------------------------
+;;; --- reading raw.transaction objects ---------------------------------------
 ;;;
-;;; TONLIB-TRANSACTIONS returns Jonathan hash tables shaped like tonlib's
-;;; raw.transaction: utime, transaction_id {lt hash}, in_msg (raw.message:
-;;; source destination value hash body_hash ...), out_msgs [raw.message].
+;;; TONLIB-TRANSACTIONS returns typed raw.transaction objects of the tonlib API: UTIME, DATA (the transaction cell as a
+;;; BoC), TRANSACTION-ID {LT HASH}, the three fees (int64), IN-MSG and OUT-MSGS (typed raw.message: HASH, SOURCE and
+;;; DESTINATION as accountAddress, VALUE, FWD-FEE, IHR-FEE, CREATED-LT, BODY-HASH, MSG-DATA).  A transaction without an
+;;; inbound message carries an empty raw.message (empty hashes, empty addresses), as tonlib's does.
+
+(defun %empty-octets () (make-array 0 :element-type '(unsigned-byte 8)))
+
+(defun %clamp-int64 (n)
+  "N as an int64 (tonlib's field type): a 120-bit coins value of a hostile message must not break the reader."
+  (max (- (expt 2 63)) (min (1- (expt 2 63)) n)))
+
+(defun make-raw-message (&key hash (source "") (destination "") (value 0) (fwd-fee 0) (ihr-fee 0) (created-lt 0)
+                           body-hash body init-state)
+  "A typed raw.message with a msg.dataRaw body; omitted octet fields are empty, omitted numbers 0, addresses \"\"."
+  (flet ((octets (x) (coerce (or x (%empty-octets)) 'tl-octets)))
+    (tlapi-make "raw.message"
+                :hash (octets hash)
+                :source (tlapi-make "accountAddress" :account-address source)
+                :destination (tlapi-make "accountAddress" :account-address destination)
+                :value (%clamp-int64 value)
+                :extra-currencies '()
+                :fwd-fee (%clamp-int64 fwd-fee)
+                :ihr-fee (%clamp-int64 ihr-fee)
+                :created-lt (%clamp-int64 created-lt)
+                :body-hash (octets body-hash)
+                :msg-data (tlapi-make "msg.dataRaw" :body (octets body) :init-state (octets init-state)))))
+
+(defun make-raw-transaction (&key (address "") (utime 0) data (lt 0) hash (fee 0) (storage-fee 0) (other-fee 0)
+                               in-msg out-msgs)
+  "A typed raw.transaction; IN-MSG defaults to the empty raw.message, OUT-MSGS to none."
+  (flet ((octets (x) (coerce (or x (%empty-octets)) 'tl-octets)))
+    (tlapi-make "raw.transaction"
+                :address (tlapi-make "accountAddress" :account-address address)
+                :utime utime
+                :data (octets data)
+                :transaction-id (tlapi-make "internal.transactionId" :lt (%clamp-int64 lt) :hash (octets hash))
+                :fee (%clamp-int64 fee)
+                :storage-fee (%clamp-int64 storage-fee)
+                :other-fee (%clamp-int64 other-fee)
+                :in-msg (or in-msg (make-raw-message))
+                :out-msgs out-msgs)))
+
+(defun raw-tx-utime (tx) (tlapi-get tx :utime))
+(defun raw-tx-data (tx) (tlapi-get tx :data))
+(defun raw-tx-lt (tx) (tlapi-get (tlapi-get tx :transaction-id) :lt))
+(defun raw-tx-hash (tx) (tlapi-get (tlapi-get tx :transaction-id) :hash))
+(defun raw-tx-fee (tx) (tlapi-get tx :fee))
+(defun raw-tx-storage-fee (tx) (tlapi-get tx :storage-fee))
+(defun raw-tx-other-fee (tx) (tlapi-get tx :other-fee))
+(defun raw-tx-in-msg (tx) (tlapi-get tx :in-msg))
+(defun raw-tx-out-msgs (tx) (tlapi-get tx :out-msgs))
+(defun raw-msg-hash (msg) (tlapi-get msg :hash))
+(defun raw-msg-body-hash (msg) (tlapi-get msg :body-hash))
+(defun raw-msg-source (msg) (tlapi-get (tlapi-get msg :source) :account-address))
+(defun raw-msg-destination (msg) (tlapi-get (tlapi-get msg :destination) :account-address))
+(defun raw-msg-value (msg) (tlapi-get msg :value))
+(defun raw-msg-fwd-fee (msg) (tlapi-get msg :fwd-fee))
+(defun raw-msg-ihr-fee (msg) (tlapi-get msg :ihr-fee))
+(defun raw-msg-created-lt (msg) (tlapi-get msg :created-lt))
+(defun raw-msg-body (msg) (tlapi-get (tlapi-get msg :msg-data) :body))
+(defun raw-msg-init-state (msg) (tlapi-get (tlapi-get msg :msg-data) :init-state))
 
 (defun transaction-out-count (tx)
-  (length (json-get tx "out_msgs")))
+  (length (raw-tx-out-msgs tx)))
 
 (defun transaction-matches-broadcast-p (tx &key message-hash normalized-hash body-hash)
   "True when TX (a raw.transaction) is the one that consumed a broadcast
@@ -333,18 +405,16 @@ HASH / the signed body cell's own hash).  BODY-HASH is compared against
 the consumed message's body_hash, which cannot be perturbed by how the
 message envelope was serialised; it is unique because the body carries the
 wallet's seqno and signature."
-  (let ((in-hash (json-get tx "in_msg" "hash"))
-        (in-body-hash (json-get tx "in_msg" "body_hash")))
+  (let* ((in-msg (raw-tx-in-msg tx))
+         (in-hash (and in-msg (raw-msg-hash in-msg)))
+         (in-body-hash (and in-msg (raw-msg-body-hash in-msg))))
     (flet ((same-b64 (candidate actual)
-             (and candidate (stringp actual)
-                  (or (string= candidate actual)
-                      (let ((a (ignore-errors (base64-decode actual)))
-                            (c (ignore-errors (base64-decode candidate))))
-                        (and a c (equalp a c))))))
+             (and candidate (plusp (length actual))
+                  (let ((c (ignore-errors (base64-decode candidate))))
+                    (and c (equalp c (as-octets actual))))))
            (same-octets (octets actual)
-             (and octets (stringp actual)
-                  (let ((a (ignore-errors (base64-decode actual))))
-                    (and a (equalp a (as-octets octets)))))))
+             (and octets (plusp (length actual))
+                  (equalp (as-octets octets) (as-octets actual)))))
       (or (same-b64 message-hash in-hash)
           (same-octets normalized-hash in-hash)
           (same-octets body-hash in-body-hash)))))

@@ -566,39 +566,34 @@ against the real binary)."
 
 (defun test-block-transaction-pagination ()
   (format t "block transaction pagination~%")
-  (let ((responses
-          (list
-           (jonathan:parse
-            "{\"incomplete\":true,\"transactions\":[{\"account\":\"A\",\"lt\":\"1\"}]}"
-            :as :hash-table)
-           (jonathan:parse
-            "{\"incomplete\":false,\"transactions\":[{\"account\":\"B\",\"lt\":\"2\"}]}"
-            :as :hash-table)))
-        (requests nil))
-    (let ((transactions
-            (cl-ton::collect-block-transactions
-             (lambda (request)
-               (push request requests)
-               (pop responses))
-             :block nil)))
-      (setf requests (nreverse requests))
-      (check "incomplete block transaction pages are joined"
-             (equal (mapcar (lambda (tx) (cl-ton::json-get tx "account"))
-                            transactions)
-                    '("A" "B")))
-      (check "transaction pages use the tonlib method name"
-             (every (lambda (request)
-                      (string= (getf request :|@type|)
-                               "blocks.getTransactions"))
-                    requests))
-      (check "first transaction page has no cursor"
-             (= 7 (getf (first requests) :|mode|)))
-      (check "next transaction page uses after mode"
-             (= 135 (getf (second requests) :|mode|)))
-      (check "next transaction page starts after the final prior id"
-             (let ((after (getf (second requests) :|after|)))
-               (and (equal "A" (getf after :|account|))
-                    (equal "1" (getf after :|lt|))))))))
+  (flet ((tx (byte lt)
+           (make-short-tx-id :account (make-array 32 :element-type '(unsigned-byte 8) :initial-element byte)
+                             :lt lt
+                             :hash (make-array 32 :element-type '(unsigned-byte 8) :initial-element (+ byte 1)))))
+    (let ((pages (list (list (list (tx 10 1)) t)
+                       (list (list (tx 20 2)) nil)))
+          (requests nil))
+      (let ((transactions
+              (cl-ton::collect-block-transactions
+               (lambda (block mode count after)
+                 (declare (ignore block))
+                 (push (list mode count after) requests)
+                 (values-list (pop pages)))
+               :block nil)))
+        (setf requests (nreverse requests))
+        (check "incomplete block transaction pages are joined"
+               (equal (mapcar #'short-tx-lt transactions) '(1 2)))
+        (check "the joined ids are typed blocks.shortTxId objects"
+               (every (lambda (x) (cl-ton:tlapi-is x "blocks.shortTxId")) transactions))
+        (check "first transaction page has no cursor"
+               (and (= 7 (first (first requests))) (null (third (first requests)))))
+        (check "next transaction page uses after mode"
+               (= 135 (first (second requests))))
+        (check "next transaction page starts after the final prior id"
+               (let ((after (third (second requests))))
+                 (and (cl-ton:tlapi-is after "blocks.accountTransactionId")
+                      (equalp (short-tx-account (first transactions)) (cl-ton:tlapi-get after :account))
+                      (eql 1 (cl-ton:tlapi-get after :lt)))))))))
 
 (defun test-base64 ()
   (format t "base64~%")
@@ -658,9 +653,9 @@ against the real binary)."
 (defun test-shard-prefix ()
   (format t "shard prefix matching~%")
   (flet ((shard (wc s)
-           (let ((h (make-hash-table :test #'equal)))
-             (setf (gethash "workchain" h) wc (gethash "shard" h) s)
-             h)))
+           (let ((zero (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)))
+             (make-block-id :workchain wc :seqno 1 :root-hash zero :file-hash zero
+                            :shard (if (>= s (expt 2 63)) (- s (expt 2 64)) s)))))
     (let ((addr (fake-address #x11)))    ; top bit of hash byte #x11 (00010001) is 0
       (check "root shard (mask 0) matches everything"
              (cl-ton::shard-includes-address-p (shard 0 #x8000000000000000) addr))
@@ -670,17 +665,20 @@ against the real binary)."
              (not (cl-ton::shard-includes-address-p (shard 0 #xC000000000000000) addr)))
       (check "wrong workchain never matches"
              (not (cl-ton::shard-includes-address-p (shard 1 #x8000000000000000) addr)))
-      (check "decimal-string shard id is accepted"
-             (cl-ton::shard-includes-address-p (shard 0 "9223372036854775808") addr)))))
+      (check "the signed int64 of the typed block id is read as its unsigned bit pattern"
+             (and (cl-ton::shard-includes-address-p (shard 0 #x8000000000000000) addr)
+                  (eql (cl-ton:block-id-shard (shard 0 #x8000000000000000)) (- (expt 2 63))))))))
 
 (defun test-flow-event-plumbing ()
   (format t "flow event plumbing~%")
-  (flet ((tx-with (account)
-           (let ((h (make-hash-table :test #'equal))) (setf (gethash "account" h) account) h)))
+  (flet ((tx-with (addr)
+           (make-short-tx-id :account (address-hash addr) :lt 5
+                             :hash (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0))))
     (let ((p1 (fake-address #x51)) (p2 (fake-address #x52)))
-      (check "tx-account-hash: address object" (equalp (address-hash p1) (cl-ton::tx-account-hash (tx-with p1))))
-      (check "tx-account-hash: friendly-string address"
-             (equalp (address-hash p1) (cl-ton::tx-account-hash (tx-with (address->string p1)))))
+      (check "tx-account-hash: the account octets of a typed short transaction id"
+             (equalp (address-hash p1) (cl-ton::tx-account-hash (tx-with p1))))
+      (check "tx-account-hash: an id without an account has no hash"
+             (null (cl-ton::tx-account-hash (cl-ton:tlapi-make "blocks.shortTxId" :mode 0))))
       (check "watched-pool-for-transaction finds by hash"
              (eq p2 (cl-ton::watched-pool-for-transaction (list p1 p2) (tx-with p2))))
       (check "watched-pool-for-transaction: no match"
@@ -897,20 +895,18 @@ Skipped when TON_FIFT_BINARY isn't set."
                   (not (equalp norm (external-message-normalized-hash
                                      dest (end-cell (store-uint (begin-cell) 1 8)))))))
       (flet ((tx (&key hash body-hash)
-               (let ((h (make-hash-table :test 'equal)) (m (make-hash-table :test 'equal)))
-                 (setf (gethash "hash" m) hash (gethash "body_hash" m) body-hash (gethash "in_msg" h) m)
-                 h)))
+               (make-raw-transaction :in-msg (make-raw-message :hash hash :body-hash body-hash))))
         (check "match by the hash chain-send returned"
-               (transaction-matches-broadcast-p (tx :hash "abc=") :message-hash "abc="))
+               (transaction-matches-broadcast-p (tx :hash (base64-decode "abc=")) :message-hash "abc="))
         (check "match by normalized hash"
-               (transaction-matches-broadcast-p (tx :hash (base64-encode norm)) :normalized-hash norm))
+               (transaction-matches-broadcast-p (tx :hash norm) :normalized-hash norm))
         (check "match by body hash when the envelope hash differs"
-               (transaction-matches-broadcast-p (tx :hash "other" :body-hash (base64-encode (cell-hash body)))
+               (transaction-matches-broadcast-p (tx :hash (cell-hash (funcall leaf 7)) :body-hash (cell-hash body))
                                                 :message-hash "abc=" :body-hash (cell-hash body)))
         (check "a different message does not match"
                (not (transaction-matches-broadcast-p
-                     (tx :hash (base64-encode (cell-hash (funcall leaf 9)))
-                         :body-hash (base64-encode (cell-hash (funcall leaf 8))))
+                     (tx :hash (cell-hash (funcall leaf 9))
+                         :body-hash (cell-hash (funcall leaf 8)))
                      :message-hash "abc=" :normalized-hash norm :body-hash (cell-hash body))))
         (check "a transaction with no in_msg identity never matches"
                (not (transaction-matches-broadcast-p (tx) :message-hash "abc=" :body-hash (cell-hash body))))))))
@@ -945,7 +941,9 @@ Skipped when TON_FIFT_BINARY isn't set."
     (test-cells)         ; cell levels / pruned branches / Merkle proofs (tests/cells.lisp)
     (test-verify)        ; lite proof verification (tests/verify.lisp)
     (test-sync)          ; key-block sync (tests/sync.lisp)
+    (test-coverage-stage3) ; proxy routing, tuples, head wait, flow scan (tests/coverage.lisp)
     (test-pmap-conveys)
+    (cl-ton::test-tl-schema-generated (lambda (name ok) (check name ok)))
     (test-lite-client)   ; the verifying liteserver client over ADNL-ext (tests/lite.lisp)
     (test-lite-state-file)   ; its persisted trust state
     (test-lite-commit-key)   ; key blocks kept round by round

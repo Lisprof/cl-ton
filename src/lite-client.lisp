@@ -233,6 +233,15 @@ the anchor.  Never moves backwards."
 (define-condition lite-stale-head (ton-error) ()
   (:documentation "The proved head is older than the freshness asked for."))
 
+(defun transient-error-p (e)
+  "True when the condition E is a transport or liteserver hiccup that a later try can overcome (no answer, a lost or
+refused session, a head that is not fresh yet, a liteserver that is busy or not synced: codes 411 \"too future block\", 500, 651, -400), false for
+everything that is a verdict (a proof that does not verify, a malformed answer, a bug)."
+  (or (typep e 'adnl-timeout)
+      (typep e 'adnl-closed)
+      (typep e 'lite-stale-head)
+      (and (typep e 'lite-error) (member (lite-error-code e) '(411 500 651 -400)) t)))
+
 (defvar *lite-proof-hook* nil
   "NIL, or a function called with every block proof the sync fetched and verified (the diagnose uses it to
 capture real links as test vectors).  Its errors are ignored.")

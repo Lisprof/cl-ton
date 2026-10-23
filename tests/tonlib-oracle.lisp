@@ -172,8 +172,12 @@ client path that calls %TL-RECEIVE."
             (return-from wait nil)))))))
 
 (defun tonlib-call (tl request &key (timeout (tonlib-timeout tl)))
-  "Send REQUEST and return its @extra-correlated Jonathan hash table.
+  "Send REQUEST, a TYPED tonlib_api function object (TLAPI-MAKE), and return its @extra-correlated Jonathan
+hash table.  Every request that reaches tonlibjson goes through here, so every one is validated against the
+schema before it is sent (tonlib's JSON layer would otherwise silently ignore a misspelt field).
 The old one-second receive timeout was polling cadence, not a latency floor."
+  (unless (tlapi-obj-p request)
+    (ton-error "tonlib-call takes a typed tonlib_api object (TLAPI-MAKE), not ~S" request))
   (unless (tonlib-alive-p tl) (ton-error "tonlib client is closed"))
   (let* ((id (sb-thread:with-mutex ((tonlib-lock tl))
                (format nil "req-~D" (incf (tonlib-counter tl)))))
@@ -192,7 +196,7 @@ The old one-second receive timeout was polling cadence, not a latency floor."
           (unless (and (tonlib-alive-p tl) (not (tonlib-closing-p tl)))
             (ton-error "tonlib client is closed"))
           (%tl-send (tonlib-handle tl)
-                    (json-encode (append request (list :|@extra| id)))))
+                    (json-encode (append (tlapi->plist request) (list :|@extra| id)))))
       (error (e)
         (sb-thread:with-mutex ((tonlib-waiters-lock tl))
           (remhash id (tonlib-waiters tl)))
@@ -227,17 +231,15 @@ The old one-second receive timeout was polling cadence, not a latency floor."
         (progn
           (tonlib-call
            tl
-           (list :|@type| "init"
-                 :|options| (list :|@type| "options"
-                                  :|config| (list :|@type| "config"
-                                                  :|config| config
-                                                  :|use_callbacks_for_network| :false
-                                                  :|blockchain_name| ""
-                                                  :|ignore_cache| :false)
-                                  :|keystore_type| (if (eq keystore :in-memory)
-                                                       (list :|@type| "keyStoreTypeInMemory")
-                                                       (list :|@type| "keyStoreTypeDirectory"
-                                                             :|directory| keystore)))))
+           (tlapi-make "init"
+                       :options (tlapi-make "options"
+                                            :config (tlapi-make "config" :config config
+                                                                         :use-callbacks-for-network nil
+                                                                         :blockchain-name "" :ignore-cache nil)
+                                            :keystore-type (if (eq keystore :in-memory)
+                                                               (tlapi-make "keyStoreTypeInMemory")
+                                                               (tlapi-make "keyStoreTypeDirectory"
+                                                                           :directory keystore)))))
           (when sync
             (tonlib-sync tl :attempts sync-attempts :timeout sync-timeout :progress sync-progress))
           tl)
@@ -282,14 +284,14 @@ ATTEMPTS tries, as before."
   (when (lite-client-p tl) (return-from tonlib-sync (tl-get (lite-sync tl) :seqno)))
   (if (null progress)
       (retrying (lambda ()
-                  (json-get (tonlib-call tl (list :|@type| "sync") :timeout timeout) "seqno"))
+                  (json-get (tonlib-call tl (tlapi-make "sync") :timeout timeout) "seqno"))
                 :attempts attempts :delay 2.0)
       (let ((deadline (+ (get-universal-time) total-timeout))
             (last (funcall progress))
             (stalled 0))
         (loop for attempt from 1
               do (handler-case
-                     (return (json-get (tonlib-call tl (list :|@type| "sync") :timeout timeout) "seqno"))
+                     (return (json-get (tonlib-call tl (tlapi-make "sync") :timeout timeout) "seqno"))
                    ((or tonlib-error ton-error) (e)
                      (let* ((now (funcall progress)) (gained (- now last)))
                        (setf last now)
@@ -308,8 +310,43 @@ ATTEMPTS tries, as before."
      (unwind-protect (progn ,@body)
        (close-tonlib ,var))))
 
-(defun account-address-json (addr)
-  (list :|@type| "accountAddress" :|account_address| (address->string addr)))
+(defun %account-address-obj (addr)
+  (tlapi-make "accountAddress" :account-address (address->string addr)))
+
+(defun %block-obj (block)
+  "A masterchain/shard block id as a typed ton.blockIdExt (BLOCK is one already, or a decoded JSON document)."
+  (cond ((tlapi-obj-p block) block)
+        ((hash-table-p block) (json->tlapi block))
+        (t (ton-error "not a block id: ~S" block))))
+
+(defun %cell-octets (cell) (coerce (base64-decode (cell->base64 cell)) 'tl-octets))
+
+(defun %stack-entry (item)
+  "A TVM stack value as a typed tvm.StackEntry (what STACK-ITEM->JSON builds as a plist)."
+  (cond ((eq item :null) (ton-error "tonlib cannot pass null stack entries"))
+        ((integerp item)
+         (tlapi-make "tvm.stackEntryNumber"
+                     :number (tlapi-make "tvm.numberDecimal" :number (format nil "~D" item))))
+        ((cell-p item)
+         (tlapi-make "tvm.stackEntryCell" :cell (tlapi-make "tvm.cell" :bytes (%cell-octets item))))
+        ((slice-p item)
+         (unless (and (zerop (slice-bit-pos item)) (zerop (slice-ref-pos item)))
+           (ton-error "tonlib slices must start at the cell beginning"))
+         (tlapi-make "tvm.stackEntrySlice" :slice (tlapi-make "tvm.slice" :bytes (%cell-octets (slice-cell item)))))
+        (t (ton-error "Cannot encode stack item ~S for tonlib" item))))
+
+(defun %typed-get-transactions (block mode count after)
+  "The typed blocks.getTransactions for the arguments COLLECT-BLOCK-TRANSACTIONS (the lean pager shared with the lite
+backend) passes its requester."
+  (tlapi-make "blocks.getTransactions"
+              :id (%block-obj block)
+              :mode mode
+              :count count
+              :after (or after
+                         ;; the first page: the zero account id, lt 0
+                         (tlapi-make "blocks.accountTransactionId"
+                                     :account (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)
+                                     :lt 0))))
 
 ;;; --- the entry points the lean code reaches through *TONLIB-ORACLE* ---------------------------------------------------
 
@@ -356,27 +393,31 @@ that must touch no real network)."
 
 
 (defmethod tonlib-json-op ((tl tonlib) (op (eql :masterchain-block)) &key timeout)
-  (json-get (tonlib-call tl (list :|@type| "blocks.getMasterchainInfo")
-                         :timeout (or timeout (tonlib-timeout tl)))
-            "last"))
+  (json->tlapi (json-get (tonlib-call tl (tlapi-make "blocks.getMasterchainInfo")
+                                      :timeout (or timeout (tonlib-timeout tl)))
+                         "last")))
 
 (defmethod tonlib-json-op ((tl tonlib) (op (eql :shards)) &key block timeout)
-  (json-get (retrying
-             (lambda ()
-               (tonlib-call tl (list :|@type| "blocks.getShards" :|id| block)
-                            :timeout (or timeout (tonlib-timeout tl)))))
-            "shards"))
+  (mapcar #'json->tlapi
+          (json-get (retrying
+                     (lambda ()
+                       (tonlib-call tl (tlapi-make "blocks.getShards" :id (%block-obj block))
+                                    :timeout (or timeout (tonlib-timeout tl)))))
+                    "shards")))
 
 (defmethod tonlib-json-op ((tl tonlib) (op (eql :block-transactions)) &key block count timeout)
   (collect-block-transactions
-   (lambda (request)
-     (retrying (lambda () (tonlib-call tl request :timeout (or timeout (tonlib-timeout tl))))))
+   (lambda (block mode count after)
+     (let ((response (retrying (lambda ()
+                                 (tonlib-call tl (%typed-get-transactions block mode count after)
+                                              :timeout (or timeout (tonlib-timeout tl)))))))
+       (values (mapcar #'json->tlapi (json-get response "transactions"))
+               (json-get response "incomplete"))))
    block count))
 
 (defmethod tonlib-json-op ((tl tonlib) (op (eql :account-state)) &key addr)
   (let* ((r (retrying (lambda ()
-                        (tonlib-call tl (list :|@type| "raw.getAccountState"
-                                              :|account_address| (account-address-json addr))))))
+                        (tonlib-call tl (tlapi-make "raw.getAccountState" :account-address (%account-address-obj addr))))))
          (code (json-get r "code"))
          (data (json-get r "data"))
          (frozen (json-get r "frozen_hash")))
@@ -396,40 +437,39 @@ that must touch no real network)."
   "smc.load + smc.runGetMethod + smc.forget; smc.load is pinned to *GET-METHOD-BLOCK* via withBlock when it is set."
   (retrying
    (lambda ()
-     (let* ((load-req (list :|@type| "smc.load" :|account_address| (account-address-json addr)))
+     (let* ((load-req (tlapi-make "smc.load" :account-address (%account-address-obj addr)))
             (loaded (tonlib-call tl (if *get-method-block*
-                                        (list :|@type| "withBlock" :|id| *get-method-block* :|function| load-req)
+                                        (tlapi-make "withBlock" :id (%block-obj *get-method-block*) :function load-req)
                                         load-req)))
             (id (json-get loaded "id")))
        (unwind-protect
-            (let ((r (tonlib-call tl (list :|@type| "smc.runGetMethod"
-                                           :|id| id
-                                           :|method| (list :|@type| "smc.methodIdName" :|name| method)
-                                           :|stack| (mapcar #'stack-item->json stack)))))
+            (let ((r (tonlib-call tl (tlapi-make "smc.runGetMethod"
+                                                 :id id
+                                                 :method (tlapi-make "smc.methodIdName" :name method)
+                                                 :stack (mapcar #'%stack-entry stack)))))
               (values (mapcar #'json->stack-item (json-get r "stack"))
                       (json-get r "exit_code")))
-         (ignore-errors (tonlib-call tl (list :|@type| "smc.forget" :|id| id))))))))
+         (ignore-errors (tonlib-call tl (tlapi-make "smc.forget" :id id))))))))
 
 (defmethod tonlib-json-op ((tl tonlib) (op (eql :send-message)) &key message-cell)
-  (json-get (tonlib-call tl (list :|@type| "raw.sendMessageReturnHash"
-                                  :|body| (cell->base64 message-cell)))
+  (json-get (tonlib-call tl (tlapi-make "raw.sendMessageReturnHash" :body (%cell-octets message-cell)))
             "hash"))
 
 (defmethod tonlib-json-op ((tl tonlib) (op (eql :config-cell)) &key)
   (base64->cell (json-get (retrying (lambda ()
-                                      (tonlib-call tl (list :|@type| "getConfigAll" :|mode| 0))))
+                                      (tonlib-call tl (tlapi-make "getConfigAll" :mode 0))))
                           "config" "bytes")))
 
 (defmethod tonlib-json-op ((tl tonlib) (op (eql :shard-account-cell)) &key addr)
   (base64->cell (json-get (retrying (lambda ()
-                                      (tonlib-call tl (list :|@type| "getShardAccountCell"
-                                                            :|account_address| (account-address-json addr)))))
+                                      (tonlib-call tl (tlapi-make "getShardAccountCell"
+                                                            :account-address (%account-address-obj addr)))))
                           "bytes")))
 
 (defmethod tonlib-json-op ((tl tonlib) (op (eql :libraries)) &key hashes)
   (let ((r (retrying (lambda ()
-                       (tonlib-call tl (list :|@type| "smc.getLibraries"
-                                             :|library_list| (mapcar #'base64-encode hashes)))))))
+                       (tonlib-call tl (tlapi-make "smc.getLibraries"
+                                             :library-list (mapcar (lambda (h) (coerce h 'tl-octets)) hashes)))))))
     (mapcar (lambda (entry)
               (cons (octets->hex (base64-decode (json-get entry "hash")))
                     (base64->cell (json-get entry "data"))))
@@ -438,14 +478,124 @@ that must touch no real network)."
 (defmethod tonlib-json-op ((tl tonlib) (op (eql :transactions)) &key addr from-lt from-hash)
   (let* ((st (if (and from-lt from-hash) nil (tonlib-account-state tl addr)))
          (lt (or from-lt (account-state-last-lt st)))
-         (hash (or from-hash (account-state-last-hash st))))
+         (hash (or from-hash (base64-decode (account-state-last-hash st)))))
     (if (zerop lt)
         '()
-        (json-get (retrying (lambda ()
-                              (tonlib-call tl (list :|@type| "raw.getTransactions"
-                                                    :|account_address| (account-address-json addr)
-                                                    :|from_transaction_id|
-                                                    (list :|@type| "internal.transactionId"
-                                                          :|lt| (format nil "~D" lt)
-                                                          :|hash| hash)))))
-                  "transactions"))))
+        (mapcar #'json->tlapi
+                (json-get (retrying (lambda ()
+                              (tonlib-call tl (tlapi-make "raw.getTransactions"
+                                                          :private-key (tlapi-make "inputKeyFake")
+                                                          :account-address (%account-address-obj addr)
+                                                          :from-transaction-id
+                                                          (tlapi-make "internal.transactionId"
+                                                                      :lt lt
+                                                                      :hash (coerce hash 'tl-octets))))))
+                  "transactions")))))
+
+;;; --- tonlibjson's JSON stack entries (a test-side format; the application feeds libemulator a stack cell) ------------------
+
+(defun stack-item->json (item)
+  (cond ((eq item :null)
+         (ton-error "tonlib cannot pass null stack entries"))
+        ((integerp item)
+         (list :|@type| "tvm.stackEntryNumber"
+               :|number| (list :|@type| "tvm.numberDecimal" :|number| (format nil "~D" item))))
+        ((cell-p item)
+         (list :|@type| "tvm.stackEntryCell"
+               :|cell| (list :|@type| "tvm.cell" :|bytes| (cell->base64 item))))
+        ((slice-p item)
+         (unless (and (zerop (slice-bit-pos item)) (zerop (slice-ref-pos item)))
+           (ton-error "tonlib slices must start at the cell beginning"))
+         (list :|@type| "tvm.stackEntrySlice"
+               :|slice| (list :|@type| "tvm.slice" :|bytes| (cell->base64 (slice-cell item)))))
+        (t (ton-error "Cannot encode stack item ~S for tonlib" item))))
+
+(defun json->stack-item (entry)
+  (let ((type (json-get entry "@type")))
+    (cond ((equal type "tvm.stackEntryNumber")
+           (parse-integer (json-get entry "number" "number")))
+          ((equal type "tvm.stackEntryCell")
+           (base64->cell (json-get entry "cell" "bytes")))
+          ((equal type "tvm.stackEntrySlice")
+           (cell-slice (base64->cell (json-get entry "slice" "bytes"))))
+          ((member type '("tvm.stackEntryTuple" "tvm.stackEntryList") :test #'equal)
+           (cons :tuple (mapcar #'json->stack-item
+                                (json-get entry (if (equal type "tvm.stackEntryTuple") "tuple" "list")
+                                          "elements"))))
+          (t (ton-error "Unsupported tonlib stack entry ~S" type)))))
+
+;;; --- the JSON bridge of the typed tonlib API (tonlib's tl_json conventions) ------------------------------------------------------------
+
+(defun %tlapi->json (type value)
+  (ecase (if (consp type) (first type) type)
+    ((:int32 :int53 :flags) value)
+    (:int64 (format nil "~D" value))
+    ((:int256 :bytes :secure-bytes) (base64-encode value))
+    ((:string :secure-string) value)
+    (:bool (if value t :false))
+    (:double value)
+    (:vector (map 'list (lambda (e) (%tlapi->json (second type) e)) (coerce value 'vector)))
+    ((:bare :class :object :function) (tlapi->plist value))))
+
+(defun tlapi->plist (obj)
+  "OBJ as the plist tonlibjson takes: (:|@type| NAME :|field_name| VALUE ...), fields in schema
+order, nested objects as nested plists, int64 as a decimal string, bytes as base64, Bool as
+T / :FALSE (what Jonathan turns into true / false)."
+  (let ((con (tlapi-find (tlapi-obj-name obj))) (fields (tlapi-obj-fields obj)))
+    (list* :|@type| (tlapi-obj-name obj)
+           (loop for (fname . type) in (tlapi-con-fields con)
+                 for key = (tl-field-key fname)
+                 when (tl-plist-has-key-p fields key)
+                   append (list (intern fname :keyword)
+                                (%tlapi->json (if (eq (and (consp type) (first type)) :if) (fourth type) type)
+                                              (getf fields key)))))))
+
+(defun %json->tlapi (type json path)
+  (flet ((need (ok what) (unless ok (%tlapi-bad path "expected ~A in JSON, got ~S" what json))))
+    (ecase (if (consp type) (first type) type)
+      ((:int32 :int53 :flags) (need (integerp json) "a number") json)
+      (:int64 (cond ((integerp json) json)
+                    ((stringp json) (or (ignore-errors (parse-integer json))
+                                        (%tlapi-bad path "bad int64 string ~S" json)))
+                    (t (need nil "an int64"))))
+      ((:int256 :bytes :secure-bytes)
+       (need (stringp json) "a base64 string")
+       (let ((octets (coerce (base64-decode json) 'tl-octets)))
+         (when (and (eq type :int256) (/= (length octets) 32))
+           (%tlapi-bad path "int256 of ~D octets" (length octets)))
+         octets))
+      ((:string :secure-string) (need (stringp json) "a string") json)
+      (:bool (and json (not (eq json :false)) t))
+      (:double (need (realp json) "a number") (float json 1d0))
+      (:vector (need (listp json) "an array")
+       (loop for e in json for i from 0
+             collect (%json->tlapi (second type) e (format nil "~A[~D]" path i))))
+      ((:bare :class :object :function)
+       (need (hash-table-p json) "an object")
+       (let ((obj (%json->obj json path)))
+         (case (if (consp type) (first type) type)
+           (:bare (unless (string= (tlapi-obj-name obj) (second type))
+                    (%tlapi-bad path "expected a ~A, got a ~A" (second type) (tlapi-obj-name obj))))
+           (:class (unless (string= (tlapi-con-class (tlapi-find (tlapi-obj-name obj))) (second type))
+                     (%tlapi-bad path "expected a ~A, got a ~A" (second type) (tlapi-obj-name obj)))))
+         obj)))))
+
+(defun %json->obj (json path)
+  (let* ((name (gethash "@type" json))
+         (con (progn (unless (stringp name) (%tlapi-bad path "JSON object without @type"))
+                     (tlapi-find name)))
+         (path (if (equal path "") name path)))
+    (%make-tlapi-obj
+     name
+     (loop for (fname . type) in (tlapi-con-fields con)
+           for json-value = (multiple-value-list (gethash fname json))
+           when (second json-value)
+             append (list (tl-field-key fname)
+                          (%json->tlapi (if (eq (and (consp type) (first type)) :if) (fourth type) type)
+                                        (first json-value) (format nil "~A.~A" path fname)))))))
+
+(defun json->tlapi (json)
+  "A decoded tonlibjson answer (a Jonathan hash table with \"@type\") -> a typed object.  Lenient
+about what tonlib may add or omit (unknown JSON fields are dropped, absent ones stay absent -- use
+TLAPI-VALIDATE to demand a complete object); strict about types and constructor classes."
+  (%json->obj json ""))

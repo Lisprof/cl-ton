@@ -26,11 +26,13 @@
     :serial t  
     :components
     ((:file "package")
+     (:file "json")          ; the one place that touches JSON (libemulator results, config files)
      (:file "ton-boc")
      (:file "errors")  
      (:file "base64")  
      (:file "slice")  
-     (:file "tl")            ; Phase A: TL codec + lite_api/ton_api schema subset
+     (:file "tl")            ; the TL codec (no schema data in it)
+			     (:file "tl-schema")     ; GENERATED: the lite_api / ton_api / tonlib_api schemas as Lisp data
      (:file "types")  
      (:file "vm-stack")  
      (:file "tonlib")  
@@ -61,6 +63,7 @@
 			     (:file "files")         ; BUNDLED-ENV-BINARY: locates the fift/proxy-liteserver released
                                              ; binaries (test environment only): <bin>/env/ or beside the
                                              ; binary, cl-ton/tests/ in a checkout, TON_*_BINARY, PATH
+			     (:file "tl-generate")   ; the generator of src/tl-schema.lisp from the vendored .tl files (test-side)
 			     (:file "tonlib-oracle") ; the JSON tonlib (libtonlibjson via CFFI): a TEST ORACLE, not part of the lean build
 			     (:file "fakechain")     ; the emulator-backed liteserver (the test network), tests only
 			     (:file "client")
@@ -72,7 +75,8 @@
 			     (:file "cells")
 			     (:file "verify")
 			     (:file "sync")
-			     (:file "lite"))))   ; validator sets, signatures, block links   ; the lite proof verifier   ; cell levels, pruned branches, Merkle proofs   ; the typed tonlib API: schema, validation, JSON bridge, A/B vs tonlibjson
+			     (:file "lite")
+			     (:file "coverage"))))   ; Stage 3: code the other suites never ran   ; validator sets, signatures, block links   ; the lite proof verifier   ; cell levels, pruned branches, Merkle proofs   ; the typed tonlib API: schema, validation, JSON bridge, A/B vs tonlibjson
 
   :perform (test-op (o c)  
              (uiop:symbol-call :cl-ton/test :run-tests)))  

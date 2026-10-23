@@ -177,11 +177,10 @@ OUTPUT-PATH to OPEN-TONLIB exactly as you would GLOBAL-CONFIG-PATH itself.
 Everything before the final WRITE-FILE-STRING here (reading, parsing,
 CONFIG-WITH-LITESERVERS) is the same pure transform as
 PROXY-LITESERVER-CONFIG; only the read and the write are side effects."
-  (let* ((parsed (let ((jonathan:*false-value* :false) (jonathan:*null-value* :null))
-                  (jonathan:parse (uiop:read-file-string global-config-path) :as :hash-table)))
+  (let* ((parsed (json-decode (uiop:read-file-string global-config-path) :keep-literals t))
          (routed (proxy-liteserver-config proxy parsed)))
     (with-open-file (out output-path :direction :output :if-exists :supersede :if-does-not-exist :create)
-      (write-string (jonathan:to-json routed) out))
+      (write-string (json-encode routed) out))
     output-path))
 
 (defun check-routed-config (path)
@@ -727,6 +726,9 @@ function-octets): an optional waitMasterchainSeqno prefix and the rest."
   (let ((obj (handler-case (tl-decode answer) (error () nil))))
     (and (tl-is obj "liteServer.error")
          (or (eql (tl-get obj :code) 651)
+             ;; code 411 "too future block": the block asked for (the head the client just proved, via a faster
+             ;; upstream) is newer than this server's state; another upstream has it
+             (eql (tl-get obj :code) 411)
              (let ((msg (tl-get obj :message)))
                (and (stringp msg)
                     (or (search "not in db" msg) (search "out of sync" msg)

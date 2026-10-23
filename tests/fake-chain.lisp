@@ -72,15 +72,18 @@ the way a DEFSTRUCT would -- this is what MAKE-FAKE-CHAIN's export promises."
   (prog1 (fake-flow-events c) (setf (fake-flow-events c) '())))
 
 (defun make-fake-tx (c hash out-count)
-  "A raw.transaction-shaped hash table consuming the external message HASH."
-  (flet ((table (&rest kv)
-           (let ((h (make-hash-table :test 'equal)))
-             (loop for (k v) on kv by #'cddr do (setf (gethash k h) v))
-             h)))
-    (table "utime" (fake-now c)
-           "transaction_id" (table "lt" (format nil "~D" (incf (fake-tx-counter c))) "hash" "fake-tx")
-           "in_msg" (table "source" "" "hash" hash "body_hash" "fake-body-hash")
-           "out_msgs" (loop repeat out-count collect (table "source" "wallet")))))
+  "A typed raw.transaction consuming the external message whose base64 hash is HASH (a string that is not valid
+base64 stands for its own ASCII octets)."
+  (let ((octets (or (ignore-errors (base64-decode hash))
+                    (map '(vector (unsigned-byte 8)) #'char-code hash))))
+    (make-raw-transaction :utime (fake-now c)
+                          :lt (incf (fake-tx-counter c))
+                          :hash (map '(vector (unsigned-byte 8)) #'char-code "fake-tx")
+                          :in-msg (make-raw-message :hash octets
+                                                    :body-hash (map '(vector (unsigned-byte 8)) #'char-code
+                                                                    "fake-body-hash"))
+                          :out-msgs (loop repeat out-count
+                                          collect (make-raw-message :source "wallet")))))
 
 (defmethod chain-wallet-deployed-p ((c fake-chain)) t)
 (defmethod chain-wallet-seqno ((c fake-chain)) (fake-seqno c))
@@ -98,7 +101,8 @@ the way a DEFSTRUCT would -- this is what MAKE-FAKE-CHAIN's export promises."
 (defmethod chain-send ((c fake-chain) external)
   (push external (fake-sent c))
   (let ((reaction (pop (fake-script c)))
-        (hash (format nil "fake-hash-~D" (length (fake-sent c)))))
+        (hash (base64-encode (map '(vector (unsigned-byte 8)) #'char-code
+                                  (format nil "fake-hash-~D" (length (fake-sent c)))))))
     (when (eq reaction :end) (error "fake chain: script exhausted"))
     ;; A step that advances the seqno is the wallet consuming the external
     ;; message: record the matching transaction too, so both the seqno-based
@@ -149,15 +153,12 @@ the way a DEFSTRUCT would -- this is what MAKE-FAKE-CHAIN's export promises."
     (check "drain clears" (null (cl-ton::drain-flow-events scanner))))
   (let* ((left (fake-address #x11))
          (right (fake-address #xF1))
-         (left-shard (make-hash-table :test #'equal))
-         (right-shard (make-hash-table :test #'equal))
-         (tx (make-hash-table :test #'equal)))
-    (setf (gethash "workchain" left-shard) 0
-          (gethash "shard" left-shard) "4611686018427387904"
-          (gethash "workchain" right-shard) 0
-          (gethash "shard" right-shard) "-4611686018427387904"
-          (gethash "account" tx)
-          (cl-ton::base64-encode (address-hash right)))
+         (zero (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0))
+         (left-shard (cl-ton:make-block-id :workchain 0 :shard 4611686018427387904 :seqno 1
+                                           :root-hash zero :file-hash zero))
+         (right-shard (cl-ton:make-block-id :workchain 0 :shard -4611686018427387904 :seqno 1
+                                            :root-hash zero :file-hash zero))
+         (tx (cl-ton:make-short-tx-id :account (address-hash right) :lt 1 :hash zero)))
     (check "left shard selected by address prefix"
            (and (cl-ton::shard-includes-address-p left-shard left)
                 (not (cl-ton::shard-includes-address-p right-shard left))))

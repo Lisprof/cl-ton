@@ -20,9 +20,8 @@
 ;;;; method arguments are pushed and in which results are documented).
 ;;;; Items are: integers, :NULL, CELLs, SLICEs, or (:TUPLE . items).
 ;;;;
-;;;; Two encodings are supported:
-;;;;   * the TL-B VmStack cell used by libemulator
-;;;;   * the tonlibjson tvm.stackEntry* JSON objects
+;;;; The encoding is the TL-B VmStack cell libemulator takes and returns (tuples can be read from it, not written; the
+;;;; tonlibjson tvm.stackEntry* JSON form lives in the test oracle).
 
 (in-package :cl-ton)
 
@@ -127,38 +126,15 @@
                          (append (walk (cell-slice rest) (1- n)) (list tos)))))))
         (walk s depth)))))
 
-;;; --- tonlibjson JSON -------------------------------------------------
+;;; --- comparing stack items ---------------------------------------------
 
-(defun stack-item->json (item)
-  (cond ((eq item :null)
-         (ton-error "tonlib cannot pass null stack entries"))
-        ((integerp item)
-         (list :|@type| "tvm.stackEntryNumber"
-               :|number| (list :|@type| "tvm.numberDecimal" :|number| (format nil "~D" item))))
-        ((cell-p item)
-         (list :|@type| "tvm.stackEntryCell"
-               :|cell| (list :|@type| "tvm.cell" :|bytes| (cell->base64 item))))
-        ((slice-p item)
-         (unless (and (zerop (slice-bit-pos item)) (zerop (slice-ref-pos item)))
-           (ton-error "tonlib slices must start at the cell beginning"))
-         (list :|@type| "tvm.stackEntrySlice"
-               :|slice| (list :|@type| "tvm.slice" :|bytes| (cell->base64 (slice-cell item)))))
-        (t (ton-error "Cannot encode stack item ~S for tonlib" item))))
-
-(defun json-get (obj &rest keys)
-  "Nested lookup in a Jonathan hash-table document."
-  (reduce (lambda (o k) (and (hash-table-p o) (gethash k o))) keys :initial-value obj))
-
-(defun json->stack-item (entry)
-  (let ((type (json-get entry "@type")))
-    (cond ((equal type "tvm.stackEntryNumber")
-           (parse-integer (json-get entry "number" "number")))
-          ((equal type "tvm.stackEntryCell")
-           (base64->cell (json-get entry "cell" "bytes")))
-          ((equal type "tvm.stackEntrySlice")
-           (cell-slice (base64->cell (json-get entry "slice" "bytes"))))
-          ((member type '("tvm.stackEntryTuple" "tvm.stackEntryList") :test #'equal)
-           (cons :tuple (mapcar #'json->stack-item
-                                (json-get entry (if (equal type "tvm.stackEntryTuple") "tuple" "list")
-                                          "elements"))))
-          (t (ton-error "Unsupported tonlib stack entry ~S" type)))))
+(defun stack-item-key (item)
+  "A value comparable with EQUAL that is the same for two stack items exactly when they are the same TVM value: an
+integer as (:INT n), a cell as (:CELL hash-hex), a slice as (:SLICE hash-hex bit-pos ref-pos), a tuple or list as (:TUPLE
+key...), the null as :NULL."
+  (cond ((eq item :null) :null)
+        ((integerp item) (list :int item))
+        ((cell-p item) (list :cell (cell-hash-hex item)))
+        ((slice-p item) (list :slice (cell-hash-hex (slice-cell item)) (slice-bit-pos item) (slice-ref-pos item)))
+        ((and (consp item) (eq (car item) :tuple)) (cons :tuple (mapcar #'stack-item-key (cdr item))))
+        (t (ton-error "Cannot compare stack item ~S" item))))
