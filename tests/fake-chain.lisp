@@ -24,51 +24,63 @@
 
 (in-package :cl-ton/test)
 
-(defclass fake-chain (chain)
-  ((pools :initarg :pools :accessor fake-pools)
-   (ton :initarg :ton :accessor fake-ton)
-   (usdt :initarg :usdt :initform 0 :accessor fake-usdt)
-   (seqno :initform 5 :accessor fake-seqno)
-   (now :initform 1800000000 :accessor fake-now)
-   (head :initform 1 :accessor fake-head)
-   (block-waits :initform 0 :accessor fake-block-waits)
-   (script :initarg :script :initform '() :accessor fake-script)
-   (pending :initform '() :accessor fake-pending)
-   (sent :initform '() :accessor fake-sent)
-   (emulate-fn :initform (constantly t) :accessor fake-emulate-fn)
-   (pool-hook :initform nil :accessor fake-pool-hook)
-   ;; jetton balances by master address string; USDT keeps its own slot.
-   (jettons :initarg :jettons :initform (make-hash-table :test 'equal) :accessor fake-jettons)
-   ;; raw.transaction-shaped documents the wallet "processed", newest first
-   (txs :initform '() :accessor fake-txs)
-   (tx-counter :initform 0 :accessor fake-tx-counter)
-   ;; FLOW-EVENTs awaiting CHAIN-DRAIN-FLOW-EVENTS (oldest first)
-   (flow-events :initform '() :accessor fake-flow-events)
-   (wallet-txs-fn :initform nil :accessor fake-wallet-txs-fn)))
+(defstruct (fake-chain (:include chain) (:constructor %make-fake-chain) (:conc-name fake-) (:copier nil))
+  pools
+  ton
+  (usdt 0)
+  (seqno 5)
+  (now 1800000000)
+  (head 1)
+  (block-waits 0)
+  (script '())
+  (pending '())
+  (sent '())
+  (emulate-fn (constantly t))
+  (pool-hook nil)
+  ;; jetton balances by master address string; USDT keeps its own slot.
+  (jettons (make-hash-table :test 'equal))
+  ;; raw.transaction-shaped documents the wallet "processed", newest first
+  (txs '())
+  (tx-counter 0)
+  ;; FLOW-EVENTs awaiting CHAIN-DRAIN-FLOW-EVENTS (oldest first)
+  (flow-events '())
+  (wallet-txs-fn nil))
 
 (defun make-fake-chain (&rest initargs)
-  "MAKE-INSTANCE convenience wrapper: FAKE-CHAIN is a DEFCLASS (needed for
-CHAIN generic-function dispatch), so it has no auto-generated constructor
-the way a DEFSTRUCT would -- this is what MAKE-FAKE-CHAIN's export promises."
-  (apply #'make-instance 'fake-chain initargs))
+  "A FAKE-CHAIN (see the keyword slots above) with its CHAIN operations installed."
+  (let ((c (apply #'%make-fake-chain initargs)))
+    (setf (cl-ton::chain-op-pools c) (lambda () (%fake-chain-pools c))
+          (cl-ton::chain-op-ton-balance c) (lambda () (fake-ton c))
+          (cl-ton::chain-op-usdt-balance c) (lambda () (fake-usdt c))
+          (cl-ton::chain-op-jetton-balance c) (lambda (master) (fake-jetton-balance c master))
+          (cl-ton::chain-op-wallet-transactions c) (lambda (limit) (%fake-chain-wallet-transactions c limit))
+          (cl-ton::chain-op-drain-flow-events c) (lambda () (%fake-chain-drain-flow-events c))
+          (cl-ton::chain-op-wallet-deployed-p c) (constantly t)
+          (cl-ton::chain-op-wallet-seqno c) (lambda () (fake-seqno c))
+          (cl-ton::chain-op-now c) (lambda () (fake-now c))
+          (cl-ton::chain-op-set-wallet c) (lambda (wallet usdt-wallet) (declare (ignore wallet usdt-wallet)))
+          (cl-ton::chain-op-getter c) (lambda () (lambda (&rest args) (declare (ignore args)) (error "no getter")))
+          (cl-ton::chain-op-close c) (lambda ())
+          (cl-ton::chain-op-emulate c) (lambda (external pretend-balance) (%fake-chain-emulate c external pretend-balance))
+          (cl-ton::chain-op-send c) (lambda (external) (%fake-chain-send c external))
+          (cl-ton::chain-op-sleep c) (lambda (seconds) (%fake-chain-sleep c seconds))
+          (cl-ton::chain-op-wait-block c) (lambda (timeout) (%fake-chain-wait-block c timeout)))
+    c))
 
-(defmethod chain-pools ((c fake-chain))
+(defun %fake-chain-pools (c)
   (when (fake-pool-hook c) (funcall (fake-pool-hook c) c))
   (fake-pools c))
-(defmethod chain-ton-balance ((c fake-chain)) (fake-ton c))
-(defmethod chain-usdt-balance ((c fake-chain)) (fake-usdt c))
 (defun fake-jetton-balance (c master)
   (gethash (address->string master) (fake-jettons c) 0))
 (defun (setf fake-jetton-balance) (value c master)
   (setf (gethash (address->string master) (fake-jettons c)) value))
 
-(defmethod chain-jetton-balance ((c fake-chain) master) (fake-jetton-balance c master))
 
-(defmethod chain-wallet-transactions ((c fake-chain) &key (limit 16))
+(defun %fake-chain-wallet-transactions (c limit)
   (when (fake-wallet-txs-fn c) (funcall (fake-wallet-txs-fn c) c))
   (let ((txs (fake-txs c))) (subseq txs 0 (min limit (length txs)))))
 
-(defmethod chain-drain-flow-events ((c fake-chain))
+(defun %fake-chain-drain-flow-events (c)
   (prog1 (fake-flow-events c) (setf (fake-flow-events c) '())))
 
 (defun make-fake-tx (c hash out-count)
@@ -85,20 +97,14 @@ base64 stands for its own ASCII octets)."
                           :out-msgs (loop repeat out-count
                                           collect (make-raw-message :source "wallet")))))
 
-(defmethod chain-wallet-deployed-p ((c fake-chain)) t)
-(defmethod chain-wallet-seqno ((c fake-chain)) (fake-seqno c))
-(defmethod chain-now ((c fake-chain)) (fake-now c))
-(defmethod chain-set-wallet ((c fake-chain) wallet usdt-wallet) (declare (ignore wallet usdt-wallet)))
-(defmethod chain-getter ((c fake-chain)) (lambda (&rest args) (declare (ignore args)) (error "no getter")))
-(defmethod chain-close ((c fake-chain)))
 
-(defmethod chain-emulate ((c fake-chain) external &key pretend-balance)
+(defun %fake-chain-emulate (c external pretend-balance)
   (declare (ignore external pretend-balance))
   (if (funcall (fake-emulate-fn c) c)
       (cl-ton::make-emulation-result :success-p t :fees (nano 1/100))
       (cl-ton::make-emulation-result :success-p nil :error "scripted rejection" :exit-code 65535)))
 
-(defmethod chain-send ((c fake-chain) external)
+(defun %fake-chain-send (c external)
   (push external (fake-sent c))
   (let ((reaction (pop (fake-script c)))
         (hash (base64-encode (map '(vector (unsigned-byte 8)) #'char-code
@@ -130,14 +136,14 @@ base64 stands for its own ASCII octets)."
              (:flow (setf (fake-flow-events c) (append (fake-flow-events c) (list v))))
              (:pools (setf (fake-pools c) v)))))
 
-(defmethod chain-sleep ((c fake-chain) seconds)
+(defun %fake-chain-sleep (c seconds)
   (incf (fake-now c) seconds)
   (loop for due = (find-if (lambda (p) (<= (car p) (fake-now c))) (fake-pending c))
         while due
         do (setf (fake-pending c) (remove due (fake-pending c)))
            (apply-effects c (cdr due))))
 
-(defmethod chain-wait-block ((c fake-chain) &key (timeout 3))
+(defun %fake-chain-wait-block (c timeout)
   (chain-sleep c timeout)
   (incf (fake-block-waits c))
   (incf (fake-head c)))
@@ -154,11 +160,11 @@ base64 stands for its own ASCII octets)."
   (let* ((left (fake-address #x11))
          (right (fake-address #xF1))
          (zero (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0))
-         (left-shard (cl-ton:make-block-id :workchain 0 :shard 4611686018427387904 :seqno 1
+         (left-shard (cl-ton::make-block-id :workchain 0 :shard 4611686018427387904 :seqno 1
                                            :root-hash zero :file-hash zero))
-         (right-shard (cl-ton:make-block-id :workchain 0 :shard -4611686018427387904 :seqno 1
+         (right-shard (cl-ton::make-block-id :workchain 0 :shard -4611686018427387904 :seqno 1
                                             :root-hash zero :file-hash zero))
-         (tx (cl-ton:make-short-tx-id :account (address-hash right) :lt 1 :hash zero)))
+         (tx (cl-ton::make-short-tx-id :account (address-hash right) :lt 1 :hash zero)))
     (check "left shard selected by address prefix"
            (and (cl-ton::shard-includes-address-p left-shard left)
                 (not (cl-ton::shard-includes-address-p right-shard left))))

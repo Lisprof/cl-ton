@@ -389,15 +389,22 @@ that must touch no real network)."
 (setf *tonlib-oracle* (list :load #'load-tonlib-library :open #'open-tonlib :close #'close-tonlib-ffi
                             :sync #'tonlib-sync :open-via-proxy #'open-tonlib-via-proxy :call #'tonlib-call))
 
+(defmacro def-oracle-op ((tl op &rest keys) &body body)
+  "Register the JSON tonlib operation OP: a function of the client TL and the keywords KEYS (see TONLIB-JSON-OP)."
+  `(setf (gethash ,op *tonlib-oracle-ops*)
+         (lambda (,tl &key ,@keys &allow-other-keys)
+           (declare (ignorable ,tl))
+           ,@body)))
+
 ;;; --- the operations of TONLIB-JSON-OP ----------------------------------------------------------------------------------
 
 
-(defmethod tonlib-json-op ((tl tonlib) (op (eql :masterchain-block)) &key timeout)
+(def-oracle-op (tl :masterchain-block timeout)
   (json->tlapi (json-get (tonlib-call tl (tlapi-make "blocks.getMasterchainInfo")
                                       :timeout (or timeout (tonlib-timeout tl)))
                          "last")))
 
-(defmethod tonlib-json-op ((tl tonlib) (op (eql :shards)) &key block timeout)
+(def-oracle-op (tl :shards block timeout)
   (mapcar #'json->tlapi
           (json-get (retrying
                      (lambda ()
@@ -405,7 +412,7 @@ that must touch no real network)."
                                     :timeout (or timeout (tonlib-timeout tl)))))
                     "shards")))
 
-(defmethod tonlib-json-op ((tl tonlib) (op (eql :block-transactions)) &key block count timeout)
+(def-oracle-op (tl :block-transactions block count timeout)
   (collect-block-transactions
    (lambda (block mode count after)
      (let ((response (retrying (lambda ()
@@ -415,7 +422,7 @@ that must touch no real network)."
                (json-get response "incomplete"))))
    block count))
 
-(defmethod tonlib-json-op ((tl tonlib) (op (eql :account-state)) &key addr)
+(def-oracle-op (tl :account-state addr)
   (let* ((r (retrying (lambda ()
                         (tonlib-call tl (tlapi-make "raw.getAccountState" :account-address (%account-address-obj addr))))))
          (code (json-get r "code"))
@@ -433,7 +440,7 @@ that must touch no real network)."
                    (t :uninit))
      :sync-utime (json-get r "sync_utime"))))
 
-(defmethod tonlib-json-op ((tl tonlib) (op (eql :run-get-method)) &key addr method stack)
+(def-oracle-op (tl :run-get-method addr method stack)
   "smc.load + smc.runGetMethod + smc.forget; smc.load is pinned to *GET-METHOD-BLOCK* via withBlock when it is set."
   (retrying
    (lambda ()
@@ -451,22 +458,22 @@ that must touch no real network)."
                       (json-get r "exit_code")))
          (ignore-errors (tonlib-call tl (tlapi-make "smc.forget" :id id))))))))
 
-(defmethod tonlib-json-op ((tl tonlib) (op (eql :send-message)) &key message-cell)
+(def-oracle-op (tl :send-message message-cell)
   (json-get (tonlib-call tl (tlapi-make "raw.sendMessageReturnHash" :body (%cell-octets message-cell)))
             "hash"))
 
-(defmethod tonlib-json-op ((tl tonlib) (op (eql :config-cell)) &key)
+(def-oracle-op (tl :config-cell)
   (base64->cell (json-get (retrying (lambda ()
                                       (tonlib-call tl (tlapi-make "getConfigAll" :mode 0))))
                           "config" "bytes")))
 
-(defmethod tonlib-json-op ((tl tonlib) (op (eql :shard-account-cell)) &key addr)
+(def-oracle-op (tl :shard-account-cell addr)
   (base64->cell (json-get (retrying (lambda ()
                                       (tonlib-call tl (tlapi-make "getShardAccountCell"
                                                             :account-address (%account-address-obj addr)))))
                           "bytes")))
 
-(defmethod tonlib-json-op ((tl tonlib) (op (eql :libraries)) &key hashes)
+(def-oracle-op (tl :libraries hashes)
   (let ((r (retrying (lambda ()
                        (tonlib-call tl (tlapi-make "smc.getLibraries"
                                              :library-list (mapcar (lambda (h) (coerce h 'tl-octets)) hashes)))))))
@@ -475,7 +482,7 @@ that must touch no real network)."
                     (base64->cell (json-get entry "data"))))
             (json-get r "result"))))
 
-(defmethod tonlib-json-op ((tl tonlib) (op (eql :transactions)) &key addr from-lt from-hash)
+(def-oracle-op (tl :transactions addr from-lt from-hash)
   (let* ((st (if (and from-lt from-hash) nil (tonlib-account-state tl addr)))
          (lt (or from-lt (account-state-last-lt st)))
          (hash (or from-hash (base64-decode (account-state-last-hash st)))))

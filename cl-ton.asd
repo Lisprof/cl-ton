@@ -39,16 +39,19 @@
      (:file "emulator")
      (:file "ed25519-batch") ; many Ed25519 signatures at once, pure, on ironclad's curve operations
      (:file "proof-verify") ; checking a liteserver answer against a trusted block hash
+     (:file "proof")        ; the proof an answer was verified against, as a typed TL object (clton.Proof)
      (:file "sync")         ; trusted block -> newer block: validator signatures over block links  
      (:file "jetton")  
      (:file "wallet")  
      (:file "adnl-ext")            ; Phase B: X25519 glue, AES-CTR framing, init packet
      (:file "adnl-ext-client")     ; Phase C: outbound upstream client (reconnect loop, query table)
      (:file "adnl-ext-server")     ; Phase D: inbound listener/handshake, shared with fakechain
+     (:file "adnl-udp")            ; ADNL over UDP: datagrams, signed packets, queries (the DHT and peer discovery build on it)
+     (:file "dht")                 ; the TON DHT client: signed nodes and values, Kademlia search, candidate cache
      (:file "proxy-liteserver")    ; uses CONFIG-WITH-LITESERVERS/JSON-GET from tonlib
      (:file "lite-client")         ; verifying liteserver client: sync, account state, transactions, getters
      (:file "lite-backend")        ; the lite client as a drop-in for the tonlib client (R2b)
-     (:file "dex")  
+     (:file "lite-api")            ; the typed Lite API on the lite client: LITE-EXECUTE
      (:file "indexer")     ; before chain: chain-close calls stop-flow-scanner  
      (:file "chain"))))  
   :in-order-to ((test-op (test-op "cl-ton/test"))))  
@@ -76,7 +79,13 @@
 			     (:file "verify")
 			     (:file "sync")
 			     (:file "lite")
-			     (:file "coverage"))))   ; Stage 3: code the other suites never ran   ; validator sets, signatures, block links   ; the lite proof verifier   ; cell levels, pruned branches, Merkle proofs   ; the typed tonlib API: schema, validation, JSON bridge, A/B vs tonlibjson
+			     (:file "coverage")
+			     (:file "api")
+			     (:file "fake-network")
+			     (:file "fake-world")
+			     (:file "scenario-kit")
+			     (:file "adnl-udp")
+			     (:file "dht"))))   ; Stage 3: code the other suites never ran   ; validator sets, signatures, block links   ; the lite proof verifier   ; cell levels, pruned branches, Merkle proofs   ; the typed tonlib API: schema, validation, JSON bridge, A/B vs tonlibjson
 
   :perform (test-op (o c)  
              (uiop:symbol-call :cl-ton/test :run-tests)))  

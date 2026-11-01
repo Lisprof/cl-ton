@@ -59,68 +59,68 @@ state's own hash, which is what the client's global config names."
   (format t "sync: validator sets and signature weights~%")
   (let* ((k (mapcar #'%vkey '(0 1 2 3)))
          (id (%block-id))
-         (vset3 (cl-ton:parse-validator-set (%vset-cell (subseq k 0 3) '(1 1 1)))))
+         (vset3 (cl-ton::parse-validator-set (%vset-cell (subseq k 0 3) '(1 1 1)))))
     (check "a validator_ext set parses: window, main count, total weight, members with their short ids"
-           (and (= 0 (cl-ton:validator-set-since vset3)) (= #xffffffff (cl-ton:validator-set-until vset3))
-                (= 3 (cl-ton:validator-set-main vset3)) (= 3 (cl-ton:validator-set-total-weight vset3))
-                (= 3 (length (cl-ton:validator-set-members vset3)))
-                (equalp (first (aref (cl-ton:validator-set-members vset3) 0))
+           (and (= 0 (cl-ton::validator-set-since vset3)) (= #xffffffff (cl-ton::validator-set-until vset3))
+                (= 3 (cl-ton::validator-set-main vset3)) (= 3 (cl-ton::validator-set-total-weight vset3))
+                (= 3 (length (cl-ton::validator-set-members vset3)))
+                (equalp (first (aref (cl-ton::validator-set-members vset3) 0))
                         (cl-ton::adnl-short-id (cl-ton::keypair-public (first k))))))
     (check "a plain validators#11 set parses too"
-           (= 3 (cl-ton:validator-set-total-weight
-                 (cl-ton:parse-validator-set (%vset-cell (subseq k 0 3) '(1 1 1) :tag #x11)))))
+           (= 3 (cl-ton::validator-set-total-weight
+                 (cl-ton::parse-validator-set (%vset-cell (subseq k 0 3) '(1 1 1) :tag #x11)))))
     (check "mainnet shape: the stated total weight covers all validators, the signing weight only the main ones"
-           (let ((v (cl-ton:parse-validator-set (%vset-cell (subseq k 0 4) '(4 5 6 7) :main 2 :total-weight 22))))
-             (and (= 2 (length (cl-ton:validator-set-members v))) (= 9 (cl-ton:validator-set-total-weight v)))))
+           (let ((v (cl-ton::parse-validator-set (%vset-cell (subseq k 0 4) '(4 5 6 7) :main 2 :total-weight 22))))
+             (and (= 2 (length (cl-ton::validator-set-members v))) (= 9 (cl-ton::validator-set-total-weight v)))))
     (check "only the main validators count: 3 listed, main 2, the third is not a member"
-           (let ((v (cl-ton:parse-validator-set (%vset-cell (subseq k 0 3) '(4 5 6) :main 2))))
-             (and (= 2 (length (cl-ton:validator-set-members v))) (= 9 (cl-ton:validator-set-total-weight v)))))
-    (macrolet ((refuses (what form) `(check ,what (%signals cl-ton:proof-error ,form))))
+           (let ((v (cl-ton::parse-validator-set (%vset-cell (subseq k 0 3) '(4 5 6) :main 2))))
+             (and (= 2 (length (cl-ton::validator-set-members v))) (= 9 (cl-ton::validator-set-total-weight v)))))
+    (macrolet ((refuses (what form) `(check ,what (%signals cl-ton::proof-error ,form))))
       (refuses "a stated total weight that is not the sum over all the validators"
-               (cl-ton:parse-validator-set (%vset-cell (subseq k 0 3) '(1 1 1) :total-weight 4)))
-      (refuses "more main validators than validators" (cl-ton:parse-validator-set (%vset-cell (subseq k 0 2) '(1 1) :main 3)))
-      (refuses "a validator of weight 0" (cl-ton:parse-validator-set (%vset-cell (subseq k 0 2) '(1 0))))
-      (refuses "the same key listed twice" (cl-ton:parse-validator-set (%vset-cell (list (first k) (first k)) '(1 1))))
-      (refuses "something that is not a validator set" (cl-ton:parse-validator-set (%vset-cell (subseq k 0 1) '(1) :tag #x13))))
+               (cl-ton::parse-validator-set (%vset-cell (subseq k 0 3) '(1 1 1) :total-weight 4)))
+      (refuses "more main validators than validators" (cl-ton::parse-validator-set (%vset-cell (subseq k 0 2) '(1 1) :main 3)))
+      (refuses "a validator of weight 0" (cl-ton::parse-validator-set (%vset-cell (subseq k 0 2) '(1 0))))
+      (refuses "the same key listed twice" (cl-ton::parse-validator-set (%vset-cell (list (first k) (first k)) '(1 1))))
+      (refuses "something that is not a validator set" (cl-ton::parse-validator-set (%vset-cell (subseq k 0 1) '(1) :tag #x13))))
     (check "the validity window: since <= time < until"
-           (let ((v (cl-ton:parse-validator-set (%vset-cell (subseq k 0 1) '(1) :since 100 :until 200))))
-             (and (not (cl-ton:validator-set-active-p v 99)) (cl-ton:validator-set-active-p v 100)
-                  (cl-ton:validator-set-active-p v 199) (not (cl-ton:validator-set-active-p v 200)))))
+           (let ((v (cl-ton::parse-validator-set (%vset-cell (subseq k 0 1) '(1) :since 100 :until 200))))
+             (and (not (cl-ton::validator-set-active-p v 99)) (cl-ton::validator-set-active-p v 100)
+                  (cl-ton::validator-set-active-p v 199) (not (cl-ton::validator-set-active-p v 200)))))
     ;; the two-thirds rule, strictly more than
     (check "weights 1,1,1: all three signing passes, two do not (2/3 is not MORE than 2/3)"
-           (and (cl-ton:check-block-signatures vset3 id (%sigset id (subseq k 0 3)))
-                (%signals cl-ton:proof-error (cl-ton:check-block-signatures vset3 id (%sigset id (subseq k 0 2))))))
-    (let ((v4 (cl-ton:parse-validator-set (%vset-cell k '(1 1 1 1)))))
+           (and (cl-ton::check-block-signatures vset3 id (%sigset id (subseq k 0 3)))
+                (%signals cl-ton::proof-error (cl-ton::check-block-signatures vset3 id (%sigset id (subseq k 0 2))))))
+    (let ((v4 (cl-ton::parse-validator-set (%vset-cell k '(1 1 1 1)))))
       (check "weights 1,1,1,1: three of four pass, two do not"
-             (and (cl-ton:check-block-signatures v4 id (%sigset id (subseq k 0 3)))
-                  (%signals cl-ton:proof-error (cl-ton:check-block-signatures v4 id (%sigset id (subseq k 0 2)))))))
-    (let ((v (cl-ton:parse-validator-set (%vset-cell (subseq k 0 3) '(5 1 1)))))
+             (and (cl-ton::check-block-signatures v4 id (%sigset id (subseq k 0 3)))
+                  (%signals cl-ton::proof-error (cl-ton::check-block-signatures v4 id (%sigset id (subseq k 0 2)))))))
+    (let ((v (cl-ton::parse-validator-set (%vset-cell (subseq k 0 3) '(5 1 1)))))
       (check "weights 5,1,1: the heavy validator alone passes (15 > 14), the two light ones do not"
-             (and (= 5 (cl-ton:check-block-signatures v id (%sigset id (list (first k)))))
-                  (%signals cl-ton:proof-error (cl-ton:check-block-signatures v id (%sigset id (cdr (subseq k 0 3))))))))
+             (and (= 5 (cl-ton::check-block-signatures v id (%sigset id (list (first k)))))
+                  (%signals cl-ton::proof-error (cl-ton::check-block-signatures v id (%sigset id (cdr (subseq k 0 3))))))))
     (check "no signatures at all do not pass"
-           (%signals cl-ton:proof-error (cl-ton:check-block-signatures vset3 id (%sigset id '()))))
+           (%signals cl-ton::proof-error (cl-ton::check-block-signatures vset3 id (%sigset id '()))))
     ;; every strictness rule
-    (macrolet ((refuses (what form) `(check ,what (%signals cl-ton:proof-error ,form))))
+    (macrolet ((refuses (what form) `(check ,what (%signals cl-ton::proof-error ,form))))
       (refuses "a signer signing twice (it would count twice)"
-               (cl-ton:check-block-signatures vset3 id (%sigset id (list (first k) (first k) (second k) (third k)))))
+               (cl-ton::check-block-signatures vset3 id (%sigset id (list (first k) (first k) (second k) (third k)))))
       (refuses "a signature by someone outside the set, even with all members signing"
-               (cl-ton:check-block-signatures vset3 id (%sigset id (list (first k) (second k) (third k) (fourth k)))))
+               (cl-ton::check-block-signatures vset3 id (%sigset id (list (first k) (second k) (third k) (fourth k)))))
       (refuses "one invalid signature among valid ones (a bit flipped)"
                (let* ((good (%sigset id (subseq k 0 3)))
                       (sigs (copy-seq (cl-ton::tl-get good :signatures)))
                       (bad (cl-ton::tl-get (aref sigs 1) :signature)))
                  (setf (aref sigs 1) (%sig-entry (second k) (%flip-octet bad 5)))
-                 (cl-ton:check-block-signatures vset3 id (cl-ton::tl-make "liteServer.signatureSet.ordinary"
+                 (cl-ton::check-block-signatures vset3 id (cl-ton::tl-make "liteServer.signatureSet.ordinary"
                                                                           :validator-set-hash 0 :catchain-seqno 0 :signatures sigs))))
       (refuses "signatures over a different block"
-               (cl-ton:check-block-signatures vset3 id (%sigset (%block-id 9) (subseq k 0 3))))
+               (cl-ton::check-block-signatures vset3 id (%sigset (%block-id 9) (subseq k 0 3))))
       (refuses "a signature of the wrong length"
-               (cl-ton:check-block-signatures
+               (cl-ton::check-block-signatures
                 vset3 id (cl-ton::tl-make "liteServer.signatureSet.ordinary" :validator-set-hash 0 :catchain-seqno 0
                                           :signatures (vector (%sig-entry (first k) (subseq (%sign (first k) id) 0 63))))))
       (refuses "a signature set of a type this code does not know"
-               (cl-ton:check-block-signatures vset3 id (cl-ton::tl-make "liteServer.signatureSet.simplex" :cc-seqno 0 :validator-set-hash 0
+               (cl-ton::check-block-signatures vset3 id (cl-ton::tl-make "liteServer.signatureSet.simplex" :cc-seqno 0 :validator-set-hash 0
                                                                       :signatures (vector) :session-id (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)
                                                                       :slot 0 :candidate (make-array 0 :element-type '(unsigned-byte 8)))))))
   (test-simplex-signatures)
@@ -135,11 +135,11 @@ state's own hash, which is what the client's global config names."
 
 (defun test-ironclad-assembly ()
   (format t "ironclad: the SBCL assembly optimizer is on, and what it computes is right~%")
-  (let ((status (cl-ton:ironclad-assembly-status)))
+  (let ((status (cl-ton::ironclad-assembly-status)))
     (check "ironclad was built with :ironclad-assembly (AES-NI / PCLMULQDQ VOPs, fast rotates)" (getf status :assembly))
     (check "its VOP package IRONCLAD-VM is loaded" (getf status :vm-package))
-    (check "the diagnostics line says so" (search "optimizer: on" (cl-ton:ironclad-assembly-line)))
-    (format t "  (~A)~%" (cl-ton:ironclad-assembly-line)))
+    (check "the diagnostics line says so" (search "optimizer: on" (cl-ton::ironclad-assembly-line)))
+    (format t "  (~A)~%" (cl-ton::ironclad-assembly-line)))
   ;; NIST SP 800-38A F.5.5 (CTR-AES256), the cipher of every ADNL-ext connection: the AES-NI path, when the
   ;; CPU has it, must give the standard's answer on one call over four blocks and on block-by-block calls
   (let* ((key (%hex-octets "603deb1015ca71be2b73aef0857d77811f352c073b6108d72d9810a30914dff4"))
@@ -178,21 +178,21 @@ state's own hash, which is what the client's global config names."
 (defun %vector-refused-p (thunk)
   "True when THUNK is refused with a proof-error; an error of another kind is let through."
   (handler-case (progn (funcall thunk) nil)
-    (cl-ton:proof-error () t)))
+    (cl-ton::proof-error () t)))
 
 (defun %check-link-vector (bin)
   "All the checks of one link vector, BIN a link-*.bin path (as written by SAVE-LINK-VECTOR)."
-  (multiple-value-bind (known proof meta) (cl-ton:load-link-vector bin)
+  (multiple-value-bind (known proof meta) (cl-ton::load-link-vector bin)
     (let* ((kind (getf meta :kind)) (name (file-namestring bin))
            (link (aref (cl-ton::tl-get proof :steps) 0))
            (set (cl-ton::tl-get link :signatures))
            (sigs (cl-ton::tl-get set :signatures))
            (counts (list :ordinary 0 :simplex 0))
-           (result (let ((cl-ton::*signature-set-counts* counts)) (cl-ton:verify-partial-block-proof proof known))))
+           (result (let ((cl-ton::*signature-set-counts* counts)) (cl-ton::verify-partial-block-proof proof known))))
       (flet ((refused-with (&rest fields)
                ;; the proof with the signature set's FIELDS replaced
                (%vector-refused-p (lambda ()
-                                    (cl-ton:verify-partial-block-proof
+                                    (cl-ton::verify-partial-block-proof
                                      (%obj-with proof :steps (vector (%obj-with link :signatures (apply #'%obj-with set fields))))
                                      known)))))
         (check (format nil "~A: the link verifies from its start block" name)
@@ -200,7 +200,7 @@ state's own hash, which is what the client's global config names."
         (check (format nil "~A: it carries one ~(~A~) signature set, as its description says" name kind)
                (and (= 1 (getf counts kind)) (= 0 (getf counts (if (eq kind :simplex) :ordinary :simplex)))))
         (check (format nil "~A: from another start block it is refused" name)
-               (%vector-refused-p (lambda () (cl-ton:verify-partial-block-proof
+               (%vector-refused-p (lambda () (cl-ton::verify-partial-block-proof
                                               proof (cl-ton::tl-block-id-ext
                                                      :workchain -1 :seqno (cl-ton::tl-get known :seqno)
                                                      :root-hash (%flip-byte (cl-ton::tl-get known :root-hash) 0)
@@ -222,7 +222,7 @@ state's own hash, which is what the client's global config names."
           (check (format nil "~A: the same signatures in an ORDINARY set are refused" name)
                  (%vector-refused-p
                   (lambda ()
-                    (cl-ton:verify-partial-block-proof
+                    (cl-ton::verify-partial-block-proof
                      (%obj-with proof :steps (vector (%obj-with link :signatures
                                                                (cl-ton::tl-make "liteServer.signatureSet.ordinary"
                                                                                 :validator-set-hash (cl-ton::tl-get set :validator-set-hash)
@@ -236,8 +236,8 @@ state's own hash, which is what the client's global config names."
                 do (let ((p (handler-case (cl-ton::tl-decode (%flip-byte bytes at)) (error () nil))))
                      (if (null p)
                          (incf undecodable)
-                         (handler-case (progn (cl-ton:verify-partial-block-proof p known) (incf verified))
-                           (cl-ton:proof-error () (incf refused))
+                         (handler-case (progn (cl-ton::verify-partial-block-proof p known) (incf verified))
+                           (cl-ton::proof-error () (incf refused))
                            (error (e) (push e other))))))
           (check (format nil "~A: 60 damaged encodings -- refused or not decodable, never another kind of error, at most 3 untouched by the damage (~D refused, ~D undecodable, ~D verified)"
                          name refused undecodable verified)
@@ -287,59 +287,59 @@ state's own hash, which is what the client's global config names."
   (format t "sync: Simplex signature sets~%")
   (let* ((k (mapcar #'%vkey '(0 1 2 3)))
          (id (%block-id))
-         (vset3 (cl-ton:parse-validator-set (%vset-cell (subseq k 0 3) '(1 1 1))))
+         (vset3 (cl-ton::parse-validator-set (%vset-cell (subseq k 0 3) '(1 1 1))))
          (three (subseq k 0 3)))
     (check "a Simplex set signed by every validator over this block passes with their weight"
-           (= 3 (cl-ton:check-block-signatures vset3 id (%simplex-set three))))
+           (= 3 (cl-ton::check-block-signatures vset3 id (%simplex-set three))))
     (check "...also for an empty-block candidate, and 3 of 4 equal validators is above two thirds"
-           (and (= 3 (cl-ton:check-block-signatures vset3 id (%simplex-set three :kind :empty)))
-                (= 3 (cl-ton:check-block-signatures (cl-ton:parse-validator-set (%vset-cell k '(1 1 1 1))) id (%simplex-set three)))))
+           (and (= 3 (cl-ton::check-block-signatures vset3 id (%simplex-set three :kind :empty)))
+                (= 3 (cl-ton::check-block-signatures (cl-ton::parse-validator-set (%vset-cell k '(1 1 1 1))) id (%simplex-set three)))))
     (check "two of three is not above two thirds"
-           (%signals cl-ton:proof-error (cl-ton:check-block-signatures vset3 id (%simplex-set (subseq k 0 2)))))
-    (macrolet ((refuses (what form) `(check ,what (%signals cl-ton:proof-error ,form))))
+           (%signals cl-ton::proof-error (cl-ton::check-block-signatures vset3 id (%simplex-set (subseq k 0 2)))))
+    (macrolet ((refuses (what form) `(check ,what (%signals cl-ton::proof-error ,form))))
       (refuses "signatures over the ORDINARY message (a block id) in a Simplex set"
                (let ((ord (%sigset id three)))
-                 (cl-ton:check-block-signatures vset3 id
+                 (cl-ton::check-block-signatures vset3 id
                                                 (%obj-with (%simplex-set three) :signatures (cl-ton::tl-get ord :signatures)))))
       (refuses "Simplex signatures in an ordinary set"
-               (cl-ton:check-block-signatures vset3 id
+               (cl-ton::check-block-signatures vset3 id
                                               (%obj-with (%sigset id three) :signatures (cl-ton::tl-get (%simplex-set three) :signatures))))
       (refuses "a candidate for another block than the one being proved"
-               (cl-ton:check-block-signatures vset3 id (%simplex-set three :candidate-block (%block-id 9))))
+               (cl-ton::check-block-signatures vset3 id (%simplex-set three :candidate-block (%block-id 9))))
       (refuses "a candidate that names this block's seqno but other hashes"
-               (cl-ton:check-block-signatures
+               (cl-ton::check-block-signatures
                 vset3 id (%simplex-set three :candidate-block (cl-ton::tl-block-id-ext :workchain -1 :shard (- (expt 2 63)) :seqno 1
                                                                                         :root-hash (make-array 32 :element-type '(unsigned-byte 8) :initial-element 77)
                                                                                         :file-hash (make-array 32 :element-type '(unsigned-byte 8) :initial-element 2)))))
       (refuses "signatures made for another slot"
-               (cl-ton:check-block-signatures vset3 id (%simplex-set three :signed-slot 43)))
+               (cl-ton::check-block-signatures vset3 id (%simplex-set three :signed-slot 43)))
       (refuses "signatures made for another session"
-               (cl-ton:check-block-signatures vset3 id (%simplex-set three :signed-session-fill 6)))
+               (cl-ton::check-block-signatures vset3 id (%simplex-set three :signed-session-fill 6)))
       (refuses "a notarize vote (the first round) presented as the final one"
-               (cl-ton:check-block-signatures vset3 id (%simplex-set three :vote "consensus.simplex.notarizeVote")))
+               (cl-ton::check-block-signatures vset3 id (%simplex-set three :vote "consensus.simplex.notarizeVote")))
       (refuses "a candidate that does not parse"
-               (cl-ton:check-block-signatures vset3 id (%simplex-set three :candidate-octets (coerce (loop repeat 30 collect (%srnd 256)) '(vector (unsigned-byte 8))))))
+               (cl-ton::check-block-signatures vset3 id (%simplex-set three :candidate-octets (coerce (loop repeat 30 collect (%srnd 256)) '(vector (unsigned-byte 8))))))
       (refuses "a candidate with trailing bytes (not canonical)"
-               (cl-ton:check-block-signatures
+               (cl-ton::check-block-signatures
                 vset3 id (let ((c (cl-ton::tl-encode (%simplex-candidate id))))
                            (%simplex-set three :candidate-octets (concatenate '(vector (unsigned-byte 8)) c (vector 0 0 0 0))))))
       (refuses "a candidate of another TL type"
-               (cl-ton:check-block-signatures
+               (cl-ton::check-block-signatures
                 vset3 id (%simplex-set three :candidate-octets (cl-ton::tl-encode (cl-ton::tl-make "ton.blockId" :root-cell-hash (cl-ton::tl-get id :root-hash)
                                                                                                    :file-hash (cl-ton::tl-get id :file-hash))))))
       (refuses "a session id of the wrong length"
-               (cl-ton:check-block-signatures vset3 id (%obj-with (%simplex-set three) :session-id (make-array 31 :element-type '(unsigned-byte 8) :initial-element 5))))
+               (cl-ton::check-block-signatures vset3 id (%obj-with (%simplex-set three) :session-id (make-array 31 :element-type '(unsigned-byte 8) :initial-element 5))))
       (refuses "the slot of the set changed after signing"
-               (cl-ton:check-block-signatures vset3 id (%obj-with (%simplex-set three) :slot 43)))
+               (cl-ton::check-block-signatures vset3 id (%obj-with (%simplex-set three) :slot 43)))
       (refuses "a signer outside the set"
-               (cl-ton:check-block-signatures vset3 id (%simplex-set (list (first k) (second k) (third k) (fourth k)))))
+               (cl-ton::check-block-signatures vset3 id (%simplex-set (list (first k) (second k) (third k) (fourth k)))))
       (refuses "a signer twice"
-               (cl-ton:check-block-signatures vset3 id (%simplex-set (list (first k) (first k) (second k) (third k))))))
+               (cl-ton::check-block-signatures vset3 id (%simplex-set (list (first k) (first k) (second k) (third k))))))
     (check "the catchain seqno of a Simplex set is its cc_seqno field (header binding)"
            (let ((info (list :catchain-seqno 7 :validator-list-hash 0)))
-             (and (%signals cl-ton:proof-error (cl-ton:check-validator-set-binding vset3 (%obj-with (%simplex-set three) :cc-seqno 8) info nil))
+             (and (%signals cl-ton::proof-error (cl-ton::check-validator-set-binding vset3 (%obj-with (%simplex-set three) :cc-seqno 8) info nil))
                   (let ((*verify-validator-set-hash* nil))
-                    (cl-ton:check-validator-set-binding vset3 (%obj-with (%simplex-set three) :cc-seqno 7) info nil)
+                    (cl-ton::check-validator-set-binding vset3 (%obj-with (%simplex-set three) :cc-seqno 7) info nil)
                     t))))))
 
 (defun %obj-with (obj &rest changes)
@@ -361,79 +361,79 @@ state's own hash, which is what the client's global config names."
                   (proof (cl-ton::tl-decode
                           (cl-ton::fc-answer-block-proof
                            fc (cl-ton::tl-make "liteServer.getBlockProof" :mode 0 :known-block zero))))
-                  (result (cl-ton:verify-partial-block-proof proof zero))
+                  (result (cl-ton::verify-partial-block-proof proof zero))
                   (link (aref (cl-ton::tl-get proof :steps) 0)))
              (check "the zero state's block proof verifies: one link, ending at the head, marked complete"
                     (and (= 1 (getf result :steps)) (getf result :complete)
                          (= (cl-ton::tl-get (getf result :to) :seqno) (cl-ton::fc-head-seqno fc))
-                         (equalp (getf result :state-hash) (cl-ton:node-hash (cl-ton::fc-block-mc-state blk)))))
+                         (equalp (getf result :state-hash) (cl-ton::node-hash (cl-ton::fc-block-mc-state blk)))))
              (check "...a proof that is already at the trusted block has no links and returns it unchanged"
-                    (let ((r (cl-ton:verify-partial-block-proof
+                    (let ((r (cl-ton::verify-partial-block-proof
                               (cl-ton::tl-make "liteServer.partialBlockProof" :complete t :from (getf result :to)
                                                                               :to (getf result :to) :steps (vector))
                               (getf result :to) :trusted-state-hash (getf result :state-hash))))
                       (and (zerop (getf r :steps)) (getf r :complete))))
              (let* ((trusted (getf result :to))
                     (answer (%served-answer fc blk addr))
-                    (verified (cl-ton:verify-account-state answer addr trusted)))
+                    (verified (cl-ton::verify-account-state answer addr trusted)))
                (check "end to end: the block reached by the verified chain is trusted for an account proof"
                       (getf verified :exists)))
-             (macrolet ((refuses (what form) `(check ,what (%signals cl-ton:proof-error ,form))))
+             (macrolet ((refuses (what form) `(check ,what (%signals cl-ton::proof-error ,form))))
                (flet ((with-link (&rest changes) (%obj-with proof :steps (vector (apply #'%obj-with link changes))))
                       (sigs (&rest signature-entries)
                         (cl-ton::tl-make "liteServer.signatureSet.ordinary" :validator-set-hash 0 :catchain-seqno 0
                                          :signatures (coerce signature-entries 'vector))))
                  (refuses "starting from a block that is not the one the proof is from"
-                          (cl-ton:verify-partial-block-proof proof (%obj-with zero :root-hash (%flip-octet (cl-ton::tl-get zero :root-hash) 0))))
+                          (cl-ton::verify-partial-block-proof proof (%obj-with zero :root-hash (%flip-octet (cl-ton::tl-get zero :root-hash) 0))))
                  (refuses "a link that starts at another block than the trusted one"
-                          (cl-ton:verify-partial-block-proof
+                          (cl-ton::verify-partial-block-proof
                            (with-link :from (%obj-with zero :seqno 5)) zero))
                  (refuses "a link that does not move forward"
-                          (cl-ton:verify-partial-block-proof
+                          (cl-ton::verify-partial-block-proof
                            (%obj-with (with-link :to (%obj-with (cl-ton::tl-get link :to) :seqno 0))
                                       :to (%obj-with (cl-ton::tl-get link :to) :seqno 0))
                            zero))
                  (refuses "a link to a block in a basechain shard"
-                          (cl-ton:verify-partial-block-proof (with-link :to (%obj-with (cl-ton::tl-get link :to) :workchain 0)) zero))
+                          (cl-ton::verify-partial-block-proof (with-link :to (%obj-with (cl-ton::tl-get link :to) :workchain 0)) zero))
                  (refuses "a link whose destination id is not the block the header proof proves"
-                          (cl-ton:verify-partial-block-proof
+                          (cl-ton::verify-partial-block-proof
                            (%obj-with (with-link :to (%obj-with (cl-ton::tl-get link :to) :root-hash (%flip-octet (cl-ton::tl-get (cl-ton::tl-get link :to) :root-hash) 2)))
                                       :to (%obj-with (cl-ton::tl-get link :to) :root-hash (%flip-octet (cl-ton::tl-get (cl-ton::tl-get link :to) :root-hash) 2)))
                            zero))
                  (refuses "a header proof of a different block"
                           (progn (cl-ton::fakechain-advance fc 2)
-                                 (cl-ton:verify-partial-block-proof
+                                 (cl-ton::verify-partial-block-proof
                                   (with-link :dest-proof (cl-ton::tl-get (aref (cl-ton::tl-get (cl-ton::tl-decode
                                                                                    (cl-ton::fc-answer-block-proof fc (cl-ton::tl-make "liteServer.getBlockProof" :mode 0 :known-block zero)))
                                                                                   :steps) 0)
                                                                           :dest-proof))
                                   zero)))
                  (refuses "the config proof and header proof swapped"
-                          (cl-ton:verify-partial-block-proof
+                          (cl-ton::verify-partial-block-proof
                            (with-link :dest-proof (cl-ton::tl-get link :config-proof) :config-proof (cl-ton::tl-get link :dest-proof)) zero))
                  (refuses "to_key_block claimed for a block that is not a key block"
-                          (cl-ton:verify-partial-block-proof (with-link :to-key-block (not (cl-ton::tl-get link :to-key-block))) zero))
-                 (refuses "no signatures" (cl-ton:verify-partial-block-proof (with-link :signatures (sigs)) zero))
+                          (cl-ton::verify-partial-block-proof (with-link :to-key-block (not (cl-ton::tl-get link :to-key-block))) zero))
+                 (refuses "no signatures" (cl-ton::verify-partial-block-proof (with-link :signatures (sigs)) zero))
                  (let ((sig (aref (cl-ton::tl-get (cl-ton::tl-get link :signatures) :signatures) 0)))
                    (refuses "the same genuine signature twice"
-                            (cl-ton:verify-partial-block-proof (with-link :signatures (sigs sig sig)) zero))
+                            (cl-ton::verify-partial-block-proof (with-link :signatures (sigs sig sig)) zero))
                    (refuses "a signature by some other key"
                             (let ((other (%vkey 7)) (to (cl-ton::tl-get link :to)))
-                              (cl-ton:verify-partial-block-proof
+                              (cl-ton::verify-partial-block-proof
                                (with-link :signatures (sigs (%sig-entry other (%sign other to)))) zero)))
                    (refuses "the genuine signature with a bit flipped"
-                            (cl-ton:verify-partial-block-proof
+                            (cl-ton::verify-partial-block-proof
                              (with-link :signatures
                                (sigs (%sig-entry-from sig (%flip-octet (cl-ton::tl-get sig :signature) 9))))
                              zero)))
                  (refuses "the config proof of a state that is not the trusted block's"
-                          (cl-ton:verify-partial-block-proof
+                          (cl-ton::verify-partial-block-proof
                            (with-link :config-proof (cl-ton::fc-proof-boc (cl-ton::fc-config-proof-node (cl-ton::fc-block-mc-state blk))))
                            zero))
                  (refuses "a chain that ends somewhere else than the proof claims"
-                          (cl-ton:verify-partial-block-proof (%obj-with proof :steps (vector)) zero))
+                          (cl-ton::verify-partial-block-proof (%obj-with proof :steps (vector)) zero))
                  (refuses "a backward link where a forward one is expected"
-                          (cl-ton:verify-partial-block-proof
+                          (cl-ton::verify-partial-block-proof
                            (%obj-with proof :steps (vector (cl-ton::tl-make "liteServer.blockLinkBack" :to-key-block nil
                                                                             :from (cl-ton::tl-get link :to) :to zero
                                                                             :dest-proof (cl-ton::tl-get link :dest-proof)
@@ -441,10 +441,10 @@ state's own hash, which is what the client's global config names."
                                                                             :state-proof (cl-ton::tl-get link :dest-proof))))
                            zero))
                  (refuses "garbage instead of the header proof"
-                          (cl-ton:verify-partial-block-proof
+                          (cl-ton::verify-partial-block-proof
                            (with-link :dest-proof (coerce (loop repeat 50 collect (%srnd 256)) '(vector (unsigned-byte 8)))) zero))
                  (refuses "a forward link out of a trusted block that is not a key block (its config proof cannot match)"
-                          (cl-ton:verify-partial-block-proof (with-link :from (getf result :to)) (getf result :to)))))))))))
+                          (cl-ton::verify-partial-block-proof (with-link :from (getf result :to)) (getf result :to)))))))))))
 
 (defun %sig-entry-from (entry signature)
   (cl-ton::tl-make "liteServer.signature" :node-id-short (cl-ton::tl-get entry :node-id-short) :signature signature))
@@ -464,10 +464,10 @@ state's own hash, which is what the client's global config names."
                 (link (aref (cl-ton::tl-get proof :steps) 0))
                 (accepted 0) (refused 0) (other '()))
            (flet ((try (altered-link)
-                    (handler-case (progn (cl-ton:verify-partial-block-proof
+                    (handler-case (progn (cl-ton::verify-partial-block-proof
                                           (%obj-with proof :steps (vector altered-link)) zero)
                                          (incf accepted))
-                      (cl-ton:proof-error () (incf refused))
+                      (cl-ton::proof-error () (incf refused))
                       (error (e) (push (princ-to-string e) other)))))
              (dolist (field '(:dest-proof :config-proof))
                (let ((octets (cl-ton::tl-get link field)))
@@ -500,28 +500,28 @@ state's own hash, which is what the client's global config names."
 (defun test-catchain-config ()
   (format t "sync: the catchain configuration (parameter 28)~%")
   (check "catchain_config#c1: four lifetimes/counts, no shuffle"
-         (equal (cl-ton:parse-catchain-config (%catchain-cell #xc1))
+         (equal (cl-ton::parse-catchain-config (%catchain-cell #xc1))
                 '(:shuffle-mc-validators nil :mc-catchain-lifetime 25 :shard-catchain-lifetime 26
                   :shard-validators-lifetime 27 :shard-validators-num 8)))
   (check "catchain_config_new#c2: the shuffle flag in front, both settings"
-         (and (getf (cl-ton:parse-catchain-config (%catchain-cell #xc2 :shuffle t)) :shuffle-mc-validators)
-              (not (getf (cl-ton:parse-catchain-config (%catchain-cell #xc2 :shuffle nil)) :shuffle-mc-validators))
-              (= 8 (getf (cl-ton:parse-catchain-config (%catchain-cell #xc2 :shuffle t)) :shard-validators-num))))
+         (and (getf (cl-ton::parse-catchain-config (%catchain-cell #xc2 :shuffle t)) :shuffle-mc-validators)
+              (not (getf (cl-ton::parse-catchain-config (%catchain-cell #xc2 :shuffle nil)) :shuffle-mc-validators))
+              (= 8 (getf (cl-ton::parse-catchain-config (%catchain-cell #xc2 :shuffle t)) :shard-validators-num))))
   (check "an absent parameter means the defaults: no shuffle"
-         (not (getf (cl-ton:parse-catchain-config nil) :shuffle-mc-validators)))
+         (not (getf (cl-ton::parse-catchain-config nil) :shuffle-mc-validators)))
   (check "unknown constructors and non-zero flags are refused"
-         (and (%signals cl-ton:proof-error (cl-ton:parse-catchain-config (%catchain-cell #xc3)))
-              (%signals cl-ton:proof-error (cl-ton:parse-catchain-config (%catchain-cell #xc2 :flags 1)))
-              (%signals cl-ton:proof-error (cl-ton:parse-catchain-config (%catchain-cell #xc1 :values '(1 2))))))
+         (and (%signals cl-ton::proof-error (cl-ton::parse-catchain-config (%catchain-cell #xc3)))
+              (%signals cl-ton::proof-error (cl-ton::parse-catchain-config (%catchain-cell #xc2 :flags 1)))
+              (%signals cl-ton::proof-error (cl-ton::parse-catchain-config (%catchain-cell #xc1 :values '(1 2))))))
   (if (not (%libs-available-p))
       (skip-missing "the fakechain's parameter 28 (emulator shared library)")
       (call-with-fc-session
        (lambda (fc tl proxy cfg)
          (declare (ignore tl proxy cfg))
          (let* ((blk (cl-ton::fc-head fc))
-                (cfg28 (cl-ton:config-param (cl-ton:masterchain-config-root (cl-ton::fc-block-mc-state blk)) 28)))
+                (cfg28 (cl-ton::config-param (cl-ton::masterchain-config-root (cl-ton::fc-block-mc-state blk)) 28)))
            (check "the fakechain's own parameter 28 (tonlib accepts it) parses: 25/25/25 and 8, no shuffle"
-                  (equal (cl-ton:parse-catchain-config cfg28)
+                  (equal (cl-ton::parse-catchain-config cfg28)
                          '(:shuffle-mc-validators nil :mc-catchain-lifetime 25 :shard-catchain-lifetime 25
                            :shard-validators-lifetime 25 :shard-validators-num 8))))))))
 
@@ -545,57 +545,57 @@ state's own hash, which is what the client's global config names."
          (cl-ton::fakechain-advance fc 2)
          (let* ((blk (cl-ton::fc-head fc)) (trusted (cl-ton::fc-mc-id blk))
                 (genuine (cl-ton::tl-decode (cl-ton::fc-answer-config-all fc (cl-ton::tl-make "liteServer.getConfigAll" :mode 0 :id trusted))))
-                (all (cl-ton:verify-config-info genuine trusted :all t :params '(34 99)))
+                (all (cl-ton::verify-config-info genuine trusted :all t :params '(34 99)))
                 (partial (%config-answer fc blk :params '(28 34))))
            (check "getConfigAll verifies with every parameter checked visible; parameter 34 is the validator set"
-                  (and (cl-ton:cell-p (cdr (assoc 34 (getf all :params))))
-                       (= 1 (length (cl-ton:validator-set-members (cl-ton:parse-validator-set (cdr (assoc 34 (getf all :params)))))))))
+                  (and (cl-ton::cell-p (cdr (assoc 34 (getf all :params))))
+                       (= 1 (length (cl-ton::validator-set-members (cl-ton::parse-validator-set (cdr (assoc 34 (getf all :params)))))))))
            (check "...an absent parameter (99) is proved absent, not an error" (null (cdr (assoc 99 (getf all :params)))))
            (check "...and the state hash it ends at is the masterchain state's"
-                  (equalp (getf all :state-hash) (cl-ton:node-hash (cl-ton::fc-block-mc-state blk))))
+                  (equalp (getf all :state-hash) (cl-ton::node-hash (cl-ton::fc-block-mc-state blk))))
            (check "a partial proof verifies for the parameters it reveals (28 and 34)"
-                  (let ((r (cl-ton:verify-config-info partial trusted :params '(28 34))))
+                  (let ((r (cl-ton::verify-config-info partial trusted :params '(28 34))))
                     (and (cdr (assoc 28 (getf r :params))) (cdr (assoc 34 (getf r :params))))))
-           (macrolet ((refuses (what form) `(check ,what (%signals cl-ton:proof-error ,form))))
+           (macrolet ((refuses (what form) `(check ,what (%signals cl-ton::proof-error ,form))))
              (refuses "a partial proof when the whole configuration is demanded (pruned cells)"
-                      (cl-ton:verify-config-info partial trusted :all t))
+                      (cl-ton::verify-config-info partial trusted :all t))
              (refuses "a parameter the partial proof does not reveal (31)"
-                      (cl-ton:verify-config-info partial trusted :params '(31)))
-             (refuses "a different trusted block" (cl-ton:verify-config-info genuine (%id-with trusted :seqno 1)))
+                      (cl-ton::verify-config-info partial trusted :params '(31)))
+             (refuses "a different trusted block" (cl-ton::verify-config-info genuine (%id-with trusted :seqno 1)))
              (refuses "a different trusted root hash"
-                      (cl-ton:verify-config-info genuine (%id-with trusted :root-hash (%flip-octet (cl-ton::tl-get trusted :root-hash) 0))))
+                      (cl-ton::verify-config-info genuine (%id-with trusted :root-hash (%flip-octet (cl-ton::tl-get trusted :root-hash) 0))))
              (refuses "an answer claiming another block than the one it proves"
-                      (cl-ton:verify-config-info
+                      (cl-ton::verify-config-info
                        (%obj-with genuine :id (%id-with trusted :root-hash (%flip-octet (cl-ton::tl-get trusted :root-hash) 1)))
                        (%id-with trusted :root-hash (%flip-octet (cl-ton::tl-get trusted :root-hash) 1))))
              (refuses "the two proofs swapped"
-                      (cl-ton:verify-config-info (%obj-with genuine :state-proof (cl-ton::tl-get genuine :config-proof)
+                      (cl-ton::verify-config-info (%obj-with genuine :state-proof (cl-ton::tl-get genuine :config-proof)
                                                                     :config-proof (cl-ton::tl-get genuine :state-proof))
                                                  trusted))
              (refuses "the config proof of another block"
                       (progn (cl-ton::fakechain-advance fc 2)
-                             (cl-ton:verify-config-info
+                             (cl-ton::verify-config-info
                               (%obj-with genuine :config-proof (cl-ton::tl-get (%config-answer fc (cl-ton::fc-head fc)) :config-proof))
                               trusted)))
              (refuses "garbage for the config proof"
-                      (cl-ton:verify-config-info
+                      (cl-ton::verify-config-info
                        (%obj-with genuine :config-proof (coerce (loop repeat 50 collect (%srnd 256)) '(vector (unsigned-byte 8))))
                        trusted))
              (refuses "a truncated config proof"
-                      (cl-ton:verify-config-info
+                      (cl-ton::verify-config-info
                        (%obj-with genuine :config-proof (subseq (cl-ton::tl-get genuine :config-proof) 0
                                                                (floor (length (cl-ton::tl-get genuine :config-proof)) 2)))
                        trusted))
              (refuses "one flipped byte in the config proof"
-                      (cl-ton:verify-config-info
+                      (cl-ton::verify-config-info
                        (%obj-with genuine :config-proof (%flip-octet (cl-ton::tl-get genuine :config-proof)
                                                                     (floor (length (cl-ton::tl-get genuine :config-proof)) 2)))
                        trusted))
              (refuses "a config proof whose validator-set parameter was swapped for another (consistently rebuilt)"
-                      (let* ((roots (cl-ton:parse-boc (cl-ton::tl-get genuine :config-proof))))
+                      (let* ((roots (cl-ton::parse-boc (cl-ton::tl-get genuine :config-proof))))
                         (multiple-value-bind (forged did) (%forge-pruned (first roots))
                           (declare (ignore did))
-                          (cl-ton:verify-config-info (%obj-with genuine :config-proof (cl-ton::fc-proof-boc (if (cl-ton:cell-p forged) forged (first roots))))
+                          (cl-ton::verify-config-info (%obj-with genuine :config-proof (cl-ton::fc-proof-boc (if (cl-ton::cell-p forged) forged (first roots))))
                                                      trusted))))))))))
 
 (defun test-config-fuzz ()
@@ -613,8 +613,8 @@ state's own hash, which is what the client's global config names."
                (dotimes (i 150)
                  (let ((v (copy-seq octets)))
                    (dotimes (k (1+ (%srnd 3))) (setf (aref v (%srnd (length v))) (%srnd 256)))
-                   (handler-case (progn (cl-ton:verify-config-info (%obj-with genuine field v) trusted :all t) (incf accepted))
-                     (cl-ton:proof-error () (incf refused))
+                   (handler-case (progn (cl-ton::verify-config-info (%obj-with genuine field v) trusted :all t) (incf accepted))
+                     (cl-ton::proof-error () (incf refused))
                      (error (e) (push (princ-to-string e) other)))))))
            (check (format nil "300 corrupted answers: ~D refused, ~D still verified, ~D failed with another kind of error ~S"
                           refused accepted (length other) (subseq other 0 (min 3 (length other))))
@@ -628,34 +628,34 @@ state's own hash, which is what the client's global config names."
 (defun test-validator-set-hash ()
   (format t "sync: the validator-set hash, the masterchain shuffle and their binding to a block~%")
   ;; the expected values below come from an independent Python rendering of the node's source
-  (let ((g (cl-ton:make-validator-prng :cc-seqno 0)))
+  (let ((g (cl-ton::make-validator-prng :cc-seqno 0)))
     (check "the PRNG's first ten u64 (SHA-512 of the big-endian descriptor, seed incremented per hash)"
-           (equal (loop repeat 10 collect (cl-ton:prng-next-ulong g))
+           (equal (loop repeat 10 collect (cl-ton::prng-next-ulong g))
                   '(6186953295200455061 9716249430906648876 893850564141714240 16362499097668570104
                     7550721807492789767 8027788155046975774 2198044665159296191 15889925754150310949
                     2854201576873883948 3908958851740847745))))
   (check "...for another catchain seqno"
-         (let ((g (cl-ton:make-validator-prng :cc-seqno 7)))
-           (equal (loop repeat 3 collect (cl-ton:prng-next-ulong g))
+         (let ((g (cl-ton::make-validator-prng :cc-seqno 7)))
+           (equal (loop repeat 3 collect (cl-ton::prng-next-ulong g))
                   '(7740061943499001564 8939104149805571666 8341264594806853058))))
   (check "the shuffle of 10 at seqno 5, of 7 at 123456, and the head of 100 at a seqno above 2^31"
-         (and (equalp (cl-ton:shuffle-masterchain-validators (loop for i below 10 collect i) 5)
+         (and (equalp (cl-ton::shuffle-masterchain-validators (loop for i below 10 collect i) 5)
                       #(7 3 1 9 8 5 2 0 6 4))
-              (equalp (cl-ton:shuffle-masterchain-validators (loop for i below 7 collect i) 123456)
+              (equalp (cl-ton::shuffle-masterchain-validators (loop for i below 7 collect i) 123456)
                       #(5 6 4 3 1 0 2))
-              (equalp (subseq (cl-ton:shuffle-masterchain-validators (loop for i below 100 collect i) 4000000000) 0 12)
+              (equalp (subseq (cl-ton::shuffle-masterchain-validators (loop for i below 100 collect i) 4000000000) 0 12)
                       #(11 27 46 90 57 80 6 38 97 53 98 28))))
   (check "the CRC32C check value (\"123456789\")"
-         (= #xE3069283 (cl-ton:crc32c (map '(vector (unsigned-byte 8)) #'char-code "123456789"))))
+         (= #xE3069283 (cl-ton::crc32c (map '(vector (unsigned-byte 8)) #'char-code "123456789"))))
   (let ((nodes (loop for i below 3 collect (list (make-array 32 :element-type '(unsigned-byte 8) :initial-element i)
                                                  (+ 10 i)
                                                  (make-array 32 :element-type '(unsigned-byte 8) :initial-element (+ #xa0 i))))))
     (check "the set hash of three validators with adnl addresses at seqno 9, and of the empty set"
-           (and (= 1508102348 (cl-ton:compute-validator-set-hash 9 nodes))
-                (= 3900357565 (cl-ton:compute-validator-set-hash 0 '())))))
+           (and (= 1508102348 (cl-ton::compute-validator-set-hash 9 nodes))
+                (= 3900357565 (cl-ton::compute-validator-set-hash 0 '())))))
   (check "the fakechain's validator set hashes to the value real tonlib checks (1234420764)"
          (= 1234420764
-            (cl-ton:compute-validator-set-hash
+            (cl-ton::compute-validator-set-hash
              0 (list (list (cl-ton::keypair-public (cl-ton::seed->keypair cl-ton::+fc-validator-seed+)) 1 (%zero32))))))
   ;; the binding, on a ten-validator set
   (let* ((kps (mapcar #'%vkey (loop for i below 10 collect i)))
@@ -669,34 +669,34 @@ state's own hash, which is what the client's global config names."
     (flet ((info (cc hash) (list :catchain-seqno cc :validator-list-hash hash))
            (sigset (cc hash) (cl-ton::tl-make "liteServer.signatureSet.ordinary" :validator-set-hash hash
                                                                                   :catchain-seqno cc :signatures (vector))))
-      (let ((h-plain (cl-ton:compute-validator-set-hash 5 nodes))
-            (h-shuffled (cl-ton:compute-validator-set-hash 5 shuffled)))
+      (let ((h-plain (cl-ton::compute-validator-set-hash 5 nodes))
+            (h-shuffled (cl-ton::compute-validator-set-hash 5 shuffled)))
         (check "the masterchain hash of a shuffled set is the hash of the permuted list; unshuffled, of the list as is"
-               (and (= h-shuffled (cl-ton:masterchain-validator-set-hash vset 5 t))
-                    (= h-plain (cl-ton:masterchain-validator-set-hash vset 5 nil))
+               (and (= h-shuffled (cl-ton::masterchain-validator-set-hash vset 5 t))
+                    (= h-plain (cl-ton::masterchain-validator-set-hash vset 5 nil))
                     (/= h-plain h-shuffled)))
         (check "a block, a signature set and a configuration that agree pass (shuffling on, shuffling off, no parameter 28)"
-               (and (null (cl-ton:check-validator-set-binding vset (sigset 5 h-shuffled) (info 5 h-shuffled) shuffling))
-                    (null (cl-ton:check-validator-set-binding vset (sigset 5 h-plain) (info 5 h-plain) plain))
-                    (null (cl-ton:check-validator-set-binding vset (sigset 5 h-plain) (info 5 h-plain) without))))
-        (macrolet ((refuses (what form) `(check ,what (%signals cl-ton:proof-error ,form))))
+               (and (null (cl-ton::check-validator-set-binding vset (sigset 5 h-shuffled) (info 5 h-shuffled) shuffling))
+                    (null (cl-ton::check-validator-set-binding vset (sigset 5 h-plain) (info 5 h-plain) plain))
+                    (null (cl-ton::check-validator-set-binding vset (sigset 5 h-plain) (info 5 h-plain) without))))
+        (macrolet ((refuses (what form) `(check ,what (%signals cl-ton::proof-error ,form))))
           (refuses "a header hash that is the unshuffled one when the configuration shuffles"
-                   (cl-ton:check-validator-set-binding vset (sigset 5 h-plain) (info 5 h-plain) shuffling))
+                   (cl-ton::check-validator-set-binding vset (sigset 5 h-plain) (info 5 h-plain) shuffling))
           (refuses "a header hash that is the shuffled one when the configuration does not shuffle"
-                   (cl-ton:check-validator-set-binding vset (sigset 5 h-shuffled) (info 5 h-shuffled) plain))
+                   (cl-ton::check-validator-set-binding vset (sigset 5 h-shuffled) (info 5 h-shuffled) plain))
           (refuses "a header hash that is the shuffled one when parameter 28 is absent"
-                   (cl-ton:check-validator-set-binding vset (sigset 5 h-shuffled) (info 5 h-shuffled) without))
+                   (cl-ton::check-validator-set-binding vset (sigset 5 h-shuffled) (info 5 h-shuffled) without))
           (refuses "a signature set for another catchain seqno than the header's"
-                   (cl-ton:check-validator-set-binding vset (sigset 6 h-shuffled) (info 5 h-shuffled) shuffling))
+                   (cl-ton::check-validator-set-binding vset (sigset 6 h-shuffled) (info 5 h-shuffled) shuffling))
           (refuses "a signature set with another validator set hash than the header's"
-                   (cl-ton:check-validator-set-binding vset (sigset 5 (1+ h-shuffled)) (info 5 h-shuffled) shuffling))
+                   (cl-ton::check-validator-set-binding vset (sigset 5 (1+ h-shuffled)) (info 5 h-shuffled) shuffling))
           (refuses "a header at another catchain seqno than the hash was made for"
-                   (cl-ton:check-validator-set-binding vset (sigset 6 h-shuffled) (info 6 h-shuffled) shuffling)))
+                   (cl-ton::check-validator-set-binding vset (sigset 6 h-shuffled) (info 6 h-shuffled) shuffling)))
         (check "with recomputation switched off the two stated hashes must still agree, the recomputation is skipped"
-               (let ((cl-ton:*verify-validator-set-hash* nil))
-                 (and (null (cl-ton:check-validator-set-binding vset (sigset 5 777) (info 5 777) shuffling))
-                      (%signals cl-ton:proof-error
-                        (cl-ton:check-validator-set-binding vset (sigset 5 778) (info 5 777) shuffling))))))))
+               (let ((cl-ton::*verify-validator-set-hash* nil))
+                 (and (null (cl-ton::check-validator-set-binding vset (sigset 5 777) (info 5 777) shuffling))
+                      (%signals cl-ton::proof-error
+                        (cl-ton::check-validator-set-binding vset (sigset 5 778) (info 5 777) shuffling))))))))
   ;; the same on a real link of the fakechain
   (if (not (%libs-available-p))
       (skip-missing "link binding (emulator shared library)")
@@ -713,16 +713,16 @@ state's own hash, which is what the client's global config names."
            (flet ((with-sigs (&rest changes)
                     (%obj-with proof :steps (vector (%obj-with link :signatures (apply #'%obj-with sigs changes))))))
              (check "the fakechain's link verifies with the hash recomputed from its configuration"
-                    (getf (cl-ton:verify-partial-block-proof proof zero) :complete))
+                    (getf (cl-ton::verify-partial-block-proof proof zero) :complete))
              (check "...and with the recomputation off"
-                    (let ((cl-ton:*verify-validator-set-hash* nil))
-                      (getf (cl-ton:verify-partial-block-proof proof zero) :complete)))
+                    (let ((cl-ton::*verify-validator-set-hash* nil))
+                      (getf (cl-ton::verify-partial-block-proof proof zero) :complete)))
              (check "a link whose signature set names another catchain seqno is refused"
-                    (%signals cl-ton:proof-error
-                      (cl-ton:verify-partial-block-proof (with-sigs :catchain-seqno 1) zero)))
+                    (%signals cl-ton::proof-error
+                      (cl-ton::verify-partial-block-proof (with-sigs :catchain-seqno 1) zero)))
              (check "a link whose signature set carries another validator set hash is refused"
-                    (%signals cl-ton:proof-error
-                      (cl-ton:verify-partial-block-proof
+                    (%signals cl-ton::proof-error
+                      (cl-ton::verify-partial-block-proof
                        (with-sigs :validator-set-hash (1+ (cl-ton::tl-get sigs :validator-set-hash))) zero)))))))))
 
 
@@ -736,7 +736,7 @@ state's own hash, which is what the client's global config names."
 (defun %key-block (head &key (seqno 1) (key t) (utime 1))
   "A masterchain Block cell of SEQNO that carries the configuration of HEAD's state in its McBlockExtra
 (KEY_BLOCK set when KEY), and its blockIdExt."
-  (let* ((config (cl-ton:masterchain-config-root (cl-ton::fc-block-mc-state head)))
+  (let* ((config (cl-ton::masterchain-config-root (cl-ton::fc-block-mc-state head)))
          (custom (cl-ton:end-cell
                   (cl-ton:store-ref
                    (cl-ton:store-ref
@@ -759,29 +759,29 @@ state's own hash, which is what the client's global config names."
                                                         cl-ton::+fake-global-id+ 32)
                                       info)
                     (cl-ton::%value-flow-cell))
-                   (svref (cl-ton:cell-refs head-block) 2))
+                   (svref (cl-ton::cell-refs head-block) 2))
                   (cl-ton::%block-extra-cell utime custom)))))
     (values blk
             (cl-ton::tl-block-id-ext :workchain -1 :shard (- (expt 2 63)) :seqno seqno
-                                     :root-hash (cl-ton:node-hash blk)
+                                     :root-hash (cl-ton::node-hash blk)
                                      :file-hash (cl-ton::%file-hash blk)))))
 
 (defun %key-block-config-proof (block)
   "BLOCK revealed as a node reveals a key block's configuration: the block cell, its BlockExtra, the
 McBlockExtra and the configuration parameters a node reveals in a forward link (35, 34 and 28: the next set, 36, stays pruned); the rest pruned."
   (let* ((visible (make-hash-table :test #'equalp))
-         (extra (svref (cl-ton:cell-refs block) 3))
-         (custom (svref (cl-ton:cell-refs extra) 3))
-         (config (svref (cl-ton:cell-refs custom) (1- (length (cl-ton:cell-refs custom))))))
-    (flet ((show (c) (setf (gethash (cl-ton:node-hash c) visible) t)))
+         (extra (svref (cl-ton::cell-refs block) 3))
+         (custom (svref (cl-ton::cell-refs extra) 3))
+         (config (svref (cl-ton::cell-refs custom) (1- (length (cl-ton::cell-refs custom))))))
+    (flet ((show (c) (setf (gethash (cl-ton::node-hash c) visible) t)))
       (show block) (show extra) (show custom)
       (dolist (key '(35 34 28))
         (let ((path (cl-ton::dict-path-cells config key 32)))
           (mapc #'show path)
           (let ((leaf (car (last path))))
-            (when (plusp (length (cl-ton:cell-refs leaf)))
+            (when (plusp (length (cl-ton::cell-refs leaf)))
               (mapc #'show (cl-ton::collect-nodes (cl-ton::first-ref-cell leaf))))))))
-    (cl-ton::fc-proof-boc (cl-ton::prune-tree block (lambda (c) (gethash (cl-ton:node-hash c) visible))))))
+    (cl-ton::fc-proof-boc (cl-ton::prune-tree block (lambda (c) (gethash (cl-ton::node-hash c) visible))))))
 
 (defun test-key-block-links ()
   (format t "sync: forward links out of a non-zero key block (init_block)~%")
@@ -799,44 +799,44 @@ McBlockExtra and the configuration parameters a node reveals in a forward link (
                     (proof (cl-ton::tl-make "liteServer.partialBlockProof" :complete t :from kid
                                             :to (cl-ton::fc-mc-id head) :steps (vector link))))
                (check "a forward link out of a key block verifies from its id alone (no state hash)"
-                      (let ((r (cl-ton:verify-partial-block-proof proof kid)))
+                      (let ((r (cl-ton::verify-partial-block-proof proof kid)))
                         (and (getf r :complete) (= 1 (getf r :steps))
                              (= (cl-ton::tl-get (getf r :to) :seqno) (cl-ton::tl-get (cl-ton::fc-mc-id head) :seqno)))))
                (check "a node's forward link: the destination header proof shows only BlockInfo (state_update pruned)"
                       (let* ((hb (cl-ton::fc-block-mc-block head))
                              (vis (make-hash-table :test #'equalp)))
-                        (setf (gethash (cl-ton:node-hash hb) vis) t)
-                        (dolist (n (cl-ton::collect-nodes (svref (cl-ton:cell-refs hb) 0)))
-                          (setf (gethash (cl-ton:node-hash n) vis) t))
-                        (let* ((thin (cl-ton::fc-proof-boc (cl-ton::prune-tree hb (lambda (c) (gethash (cl-ton:node-hash c) vis)))))
-                               (r (cl-ton:verify-partial-block-proof
+                        (setf (gethash (cl-ton::node-hash hb) vis) t)
+                        (dolist (n (cl-ton::collect-nodes (svref (cl-ton::cell-refs hb) 0)))
+                          (setf (gethash (cl-ton::node-hash n) vis) t))
+                        (let* ((thin (cl-ton::fc-proof-boc (cl-ton::prune-tree hb (lambda (c) (gethash (cl-ton::node-hash c) vis)))))
+                               (r (cl-ton::verify-partial-block-proof
                                    (%obj-with proof :steps (vector (%obj-with link :dest-proof thin))) kid)))
                           (and (getf r :complete) (null (getf r :state-hash))
                                (= (cl-ton::tl-get (getf r :to) :seqno) (cl-ton::tl-get (cl-ton::fc-mc-id head) :seqno))))))
                (check "...and a wrong state hash passed along changes nothing"
-                      (getf (cl-ton:verify-partial-block-proof proof kid :trusted-state-hash (%flip-octet (cl-ton::tl-get kid :root-hash) 0))
+                      (getf (cl-ton::verify-partial-block-proof proof kid :trusted-state-hash (%flip-octet (cl-ton::tl-get kid :root-hash) 0))
                             :complete))
-               (macrolet ((refuses (what form) `(check ,what (%signals cl-ton:proof-error ,form))))
+               (macrolet ((refuses (what form) `(check ,what (%signals cl-ton::proof-error ,form))))
                  (refuses "a config proof of another block than the trusted key block"
                           (multiple-value-bind (other) (%key-block head :utime 2)
-                            (cl-ton:verify-partial-block-proof
+                            (cl-ton::verify-partial-block-proof
                              (%obj-with proof :steps (vector (%obj-with link :config-proof (%key-block-config-proof other)))) kid)))
                  (refuses "a trusted id whose root hash is not the proved block's"
                           (let ((bad (%id-with kid :root-hash (%flip-octet (cl-ton::tl-get kid :root-hash) 3))))
-                            (cl-ton:verify-partial-block-proof
+                            (cl-ton::verify-partial-block-proof
                              (%obj-with proof :from bad :steps (vector (%obj-with link :from bad))) bad)))
                  (refuses "a block without the key_block flag (no configuration)"
                           (multiple-value-bind (plain pid) (%key-block head :key nil)
-                            (cl-ton:verify-partial-block-proof
+                            (cl-ton::verify-partial-block-proof
                              (%obj-with proof :from pid :steps (vector (%obj-with link :from pid :config-proof (%key-block-config-proof plain))))
                              pid)))
                  (refuses "a state proof (the zero state's) in place of the key block's proof"
-                          (cl-ton:verify-partial-block-proof
+                          (cl-ton::verify-partial-block-proof
                            (%obj-with proof :steps (vector (%obj-with link :config-proof
                                                                       (cl-ton::fc-proof-boc (cl-ton::fc-config-proof-node (cl-ton::fakechain-zero-state fc))))))
                            kid))
                  (refuses "garbage for the config proof"
-                          (cl-ton:verify-partial-block-proof
+                          (cl-ton::verify-partial-block-proof
                            (%obj-with proof :steps (vector (%obj-with link :config-proof (coerce (loop repeat 50 collect (%srnd 256)) '(vector (unsigned-byte 8))))))
                            kid))))))))))
 
@@ -863,21 +863,21 @@ McBlockExtra and the configuration parameters a node reveals in a forward link (
   (format t "sync: batched Ed25519 verification, pure and in parallel~%")
   (let* ((good (loop repeat 30 collect (%ed-entry)))
          (agree 0) (checked 0))
-    (check "an empty batch is valid" (null (cl-ton:ed25519-first-invalid '())))
+    (check "an empty batch is valid" (null (cl-ton::ed25519-first-invalid '())))
     (check "30 valid signatures verify as one batch"
-           (null (cl-ton:ed25519-first-invalid good)))
+           (null (cl-ton::ed25519-first-invalid good)))
     (check "the batch check is pure: the same answer every time, no input changed"
            (let ((before (copy-tree good)))
-             (and (null (cl-ton:ed25519-first-invalid good)) (null (cl-ton:ed25519-first-invalid good))
+             (and (null (cl-ton::ed25519-first-invalid good)) (null (cl-ton::ed25519-first-invalid good))
                   (equalp before good))))
     (dolist (how '(:signature :s-part :message :key))
       (let* ((position (random 30))
              (entries (loop for e in good for i from 0 collect (if (= i position) (%ed-damage e how) e))))
         (check (format nil "a ~(~A~) damaged in one of 30 is found, and it is the right one" how)
-               (eql position (cl-ton:ed25519-first-invalid entries)))))
+               (eql position (cl-ton::ed25519-first-invalid entries)))))
     (check "the first of several bad ones is reported (whether a bad one is not even a point or not)"
            (loop repeat 12
-                 always (eql 4 (cl-ton:ed25519-first-invalid
+                 always (eql 4 (cl-ton::ed25519-first-invalid
                                 (loop for e in good for i from 0
                                       collect (if (member i '(4 9 20)) (%ed-damage e (if (= i 4) :s-part :signature)) e))))))
     (check "a signature with s not below the group order is refused"
@@ -885,21 +885,21 @@ McBlockExtra and the configuration parameters a node reveals in a forward link (
              (replace s (ironclad:integer-to-octets (+ crypto::+ed25519-l+ (ironclad:octets-to-integer s :start 32 :end 64 :big-endian nil))
                                                     :n-bits 256 :big-endian nil)
                       :start1 32)
-             (eql 0 (cl-ton:ed25519-first-invalid (list (list (first e) (second e) s))))))
+             (eql 0 (cl-ton::ed25519-first-invalid (list (list (first e) (second e) s))))))
     (check "wrong lengths are refused, not signalled"
-           (and (eql 0 (cl-ton:ed25519-first-invalid (list (list (subseq (first (first good)) 0 31) (second (first good)) (third (first good))))))
-                (eql 0 (cl-ton:ed25519-first-invalid (list (list (first (first good)) (second (first good)) (subseq (third (first good)) 0 63)))))))
+           (and (eql 0 (cl-ton::ed25519-first-invalid (list (list (subseq (first (first good)) 0 31) (second (first good)) (third (first good))))))
+                (eql 0 (cl-ton::ed25519-first-invalid (list (list (first (first good)) (second (first good)) (subseq (third (first good)) 0 63)))))))
     (check "one signer signing many messages (a validator over many links) is one batch"
            (multiple-value-bind (priv pub) (%ed-keypair)
              (let ((entries (loop repeat 20 collect (let ((m (ironclad:random-data 33))) (list pub m (ironclad:sign-message priv m))))))
-               (and (null (cl-ton:ed25519-first-invalid entries))
-                    (eql 13 (cl-ton:ed25519-first-invalid
+               (and (null (cl-ton::ed25519-first-invalid entries))
+                    (eql 13 (cl-ton::ed25519-first-invalid
                              (loop for e in entries for i from 0 collect (if (= i 13) (%ed-damage e :message) e))))))))
     ;; agreement with ironclad's own verification, valid and damaged alike
     (dotimes (i 40)
       (let* ((e (%ed-entry)) (e (if (evenp i) e (%ed-damage e (nth (mod i 4) '(:signature :s-part :message :key)))))
              (alone (ironclad:verify-signature (ironclad:make-public-key :ed25519 :y (first e)) (second e) (third e)))
-             (batched (null (cl-ton:ed25519-first-invalid (list e)))))
+             (batched (null (cl-ton::ed25519-first-invalid (list e)))))
         (incf checked) (when (eq (and alone t) batched) (incf agree))))
     (check "40 single signatures, half of them damaged: batch and ironclad always agree" (= agree checked))
     (check "the multi-scalar multiplication equals the sum of ironclad scalar multiplications"
@@ -911,10 +911,10 @@ McBlockExtra and the configuration parameters a node reveals in a forward link (
                            acc)))
              (ironclad:ec-point-equal m naive)))
     (check "parallel-map equals mapcar, in order, on several workers"
-           (equal (cl-ton:parallel-map (lambda (x) (* x x)) (loop for i below 25 collect i) :workers 4)
+           (equal (cl-ton::parallel-map (lambda (x) (* x x)) (loop for i below 25 collect i) :workers 4)
                   (loop for i below 25 collect (* i i))))
     (check "an error in a worker is raised by the caller"
-           (%signals error (cl-ton:parallel-map (lambda (x) (if (= x 7) (error "boom") x)) (loop for i below 12 collect i) :workers 3)))
+           (%signals error (cl-ton::parallel-map (lambda (x) (if (= x 7) (error "boom") x)) (loop for i below 12 collect i) :workers 3)))
     (check "signature jobs: all valid pass; the failing link is named"
            (let* ((jobs (loop for l from 1 to 6
                               collect (cons (format nil "link ~D" l)
@@ -924,9 +924,9 @@ McBlockExtra and the configuration parameters a node reveals in a forward link (
                                          (cons (car job) (cons (append (%ed-damage (subseq (first (cdr job)) 0 3) :signature) (list (ironclad:random-data 32)))
                                                                (cdr (cdr job))))
                                          job))))
-             (and (progn (let ((cl-ton:*worker-count* 3)) (cl-ton:check-signature-jobs jobs)) t)
-                  (handler-case (progn (let ((cl-ton:*worker-count* 3)) (cl-ton:check-signature-jobs bad)) nil)
-                    (cl-ton:proof-error (e) (search "link 4" (princ-to-string e)))))))))
+             (and (progn (let ((cl-ton::*worker-count* 3)) (cl-ton::check-signature-jobs jobs)) t)
+                  (handler-case (progn (let ((cl-ton::*worker-count* 3)) (cl-ton::check-signature-jobs bad)) nil)
+                    (cl-ton::proof-error (e) (search "link 4" (princ-to-string e)))))))))
 
 (defun test-sync ()
   (test-validator-sets)

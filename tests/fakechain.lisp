@@ -355,9 +355,26 @@ DepthBalanceInfo with genuine aggregated augmentation."
 (defmacro with-fc-lock ((fc) &body body)
   `(fc-lock-call ,fc (lambda () ,@body)))
 
+(defconstant +fc-mc-key-offset+ (ash 1 256)
+  "Added to the 256-bit account hash to key a MASTERCHAIN account in the one table of accounts (and of transactions).")
+
+(defun fc-key-of-hash (workchain hash)
+  "The table key of the account of WORKCHAIN (0 or -1) with the 32 octets HASH: NIL for another workchain."
+  (case workchain
+    (0 (octets->uint hash))
+    (-1 (+ +fc-mc-key-offset+ (octets->uint hash)))
+    (t nil)))
+
 (defun fc-address-key (addr)
-  "Integer key of an ADDRESS (workchain 0 only carries accounts here)."
-  (octets->uint (address-hash addr)))
+  "Table key of an ADDRESS: accounts of workchain 0 and of the masterchain (-1) live in one table, the masterchain's offset."
+  (fc-key-of-hash (address-workchain addr) (address-hash addr)))
+
+(defun fc-key-of (account-obj)
+  "Table key of a typed liteServer.accountId."
+  (fc-key-of-hash (tl-get account-obj :workchain) (tl-get account-obj :id)))
+
+(defun fc-key-mc-p (key) (>= key +fc-mc-key-offset+))
+(defun fc-raw-key (key) (ldb (byte 256 0) key))
 
 (defun fc-now (fc) (fakechain-clock fc))
 
@@ -593,7 +610,7 @@ account an AccountBlock whose transaction dictionary maps each lt to its Transac
 fork nodes are zeros; no reader here looks at them)."
   (let ((by-account (make-hash-table)) (update (end-cell (store-uint (begin-cell) 77 64))))
     (dolist (p processed)
-      (push (cons (fc-tx-lt (car p)) (car p)) (gethash (fc-address-key (cdr p)) by-account)))
+      (push (cons (fc-tx-lt (car p)) (car p)) (gethash (fc-raw-key (fc-address-key (cdr p))) by-account)))
     (let ((dict (hashmap-cell
                  (loop for key being the hash-keys of by-account using (hash-value txs)
                        collect (cons key
@@ -639,10 +656,10 @@ fork nodes are zeros; no reader here looks at them)."
   (%bt-leaf :seqno seqno :reg-mc-seqno reg-mc :start-lt start-lt :end-lt end-lt
             :root-hash root :file-hash file :gen-utime utime))
 
-(defun %mc-state (fc &key seqno utime lt wc0-leaf master-ref)
+(defun %mc-state (fc &key seqno utime lt wc0-leaf master-ref (accounts-root (%empty-accounts-cell)))
   (declare (ignore master-ref))
   (build-shard-state :workchain -1 :shard +mc-shard+ :seqno seqno :utime utime :lt lt
-                     :accounts-root (%empty-accounts-cell) :total 0
+                     :accounts-root accounts-root :total 0
                      :libraries (with-fc-lock (fc) (copy-list (fakechain-libraries fc)))
                      :custom (build-mc-state-extra :shard-entries (list (cons 0 wc0-leaf))
                                                    :config-dict (fakechain-config fc)
@@ -705,6 +722,15 @@ empty) and seal block 1 so tonlib always finds a real block to sync to."
 
 (defun fc-log (fc &rest entry) (push entry (fakechain-log fc)))
 
+(defun fakechain-external-outs (fc)
+  "The outgoing external messages (events, logs) the chain processed, oldest first, each a plist (:MESSAGE the Message cell
+:SRC the emitting address :UTIME the chain time).  They are not delivered anywhere, as on the real network: this is how a test
+sees them."
+  (with-fc-lock (fc)
+    (loop for e in (reverse (fakechain-log fc))
+          when (and (consp e) (eq (first e) :external-out))
+            collect (list :message (second e) :src (third e) :utime (fourth e)))))
+
 (defun fc-next-lt (fc) (incf (fakechain-lt fc) 1000))
 
 (defun fc-emulate-one (fc msg)
@@ -720,10 +746,10 @@ bounces, refunds and chained hops are just out-messages that re-enter the queue.
       (fc-log fc :unparseable-message)
       (return-from fc-emulate-one (values nil nil nil)))
     (when (eq (getf header :type) :external-out)
-      (fc-log fc :external-out msg)
+      (fc-log fc :external-out msg (getf header :src) (fc-now fc))
       (return-from fc-emulate-one (values nil nil nil)))
     (let ((dest (getf header :dest)))
-      (unless (and dest (eql (address-workchain dest) 0))
+      (unless (and dest (member (address-workchain dest) '(0 -1)))
         (fc-log fc :undeliverable (getf header :type) dest)
         (return-from fc-emulate-one (values nil nil nil)))
       (let* ((lt (fc-next-lt fc))
@@ -763,10 +789,12 @@ bounces, refunds and chained hops are just out-messages that re-enter the queue.
     (setf (fakechain-queue fc) (append (fakechain-queue fc) (nreverse out-of-round)))
     (nreverse done)))
 
-(defun fc-accounts-root (fc)
+(defun fc-accounts-root (fc &key mc)
+  "The ShardAccounts of workchain 0, or with MC of the masterchain."
   (build-shard-accounts
    (loop for k being the hash-keys of (fakechain-accounts fc) using (hash-value sa)
-         collect (cons k sa) into l
+         when (eq (and mc t) (and (fc-key-mc-p k) t))
+           collect (cons (fc-raw-key k) sa) into l
          finally (return (sort l #'< :key #'car)))))
 
 (defun fc-seal-block (fc processed)
@@ -776,6 +804,8 @@ bounces, refunds and chained hops are just out-messages that re-enter the queue.
          (start-lt (if prev (fc-block-end-lt prev) 0))
          (end-lt (+ (fakechain-lt fc) (length processed) 1))
          (accounts-root (fc-accounts-root fc))
+         (wc0-processed (remove-if (lambda (p) (eql (address-workchain (cdr p)) -1)) processed))
+         (mc-processed (remove-if-not (lambda (p) (eql (address-workchain (cdr p)) -1)) processed))
          (old-wc0 (if prev (fc-block-sh-state prev) (fakechain-wc0-zero-state fc)))
          (new-wc0 (build-shard-state :workchain 0 :shard +mc-shard+ :seqno seqno :utime utime :lt end-lt
                                      :accounts-root accounts-root
@@ -794,18 +824,20 @@ bounces, refunds and chained hops are just out-messages that re-enter the queue.
                                     :prev-ref prev-sh-ref :master-ref prev-mc-ref))
          (sh-block (build-block :info sh-info :utime utime
                                 :state-update (make-state-update old-wc0 new-wc0)
-                                :account-blocks (and processed (%account-blocks-cell processed))))
+                                :account-blocks (and wc0-processed (%account-blocks-cell wc0-processed))))
          (sh-root (node-hash sh-block))
          (sh-file (%file-hash sh-block))
          (leaf (%shard-leaf-for :seqno seqno :reg-mc seqno :start-lt start-lt :end-lt end-lt
                                 :root sh-root :file sh-file :utime utime))
          (old-mc (if prev (fc-block-mc-state prev) (fakechain-zero-state fc)))
-         (new-mc (%mc-state fc :seqno seqno :utime utime :lt end-lt :wc0-leaf leaf))
+         (new-mc (%mc-state fc :seqno seqno :utime utime :lt end-lt :wc0-leaf leaf
+                                :accounts-root (fc-accounts-root fc :mc t)))
          (mc-info (%block-info-cell :not-master nil :seqno seqno :workchain -1 :shard +mc-shard+
                                     :utime utime :start-lt start-lt :end-lt end-lt
                                     :prev-ref prev-mc-ref))
          (mc-block (build-block :info mc-info :utime utime :mc-shard-entries (list (cons 0 leaf))
-                                :state-update (make-state-update old-mc new-mc)))
+                                :state-update (make-state-update old-mc new-mc)
+                                :account-blocks (and mc-processed (%account-blocks-cell mc-processed))))
          (mc-root (node-hash mc-block))
          (mc-file (%file-hash mc-block))
          (sig (sign-octets (fakechain-validator fc)
@@ -1052,12 +1084,19 @@ prev_blocks path to the destination, the destination's header proof (none for th
       ((zerop (tl-get known :seqno))
        (tl-encode (tl-make "liteServer.partialBlockProof" :complete t :from known :to (fc-mc-id blk)
                                                          :steps (vector (fc-forward-link fc known blk)))))
+      ((and known-blk (> target-seqno (tl-get known :seqno)))
+       ;; a NEWER target from a block that is no key block: as a real liteserver, back to the previous key block (the only
+       ;; one this chain has is the zero state), then forward from it to the target
+       (tl-encode (tl-make "liteServer.partialBlockProof" :complete t :from known :to (fc-mc-id blk)
+                                                         :steps (vector (fc-back-link fc known-blk 0)
+                                                                        (fc-forward-link fc (fc-zero-block-id fc) blk)))))
       (t (fc-error 651 "unsupported block proof request")))))
 
 (defun fc-account-from-blk (blk addr-obj)
-  (let ((accounts (fc-block-accounts blk))
-        (key (octets->uint (tl-get addr-obj :id))))
-    (values (and (eql (tl-get addr-obj :workchain) 0) (gethash key accounts)) key)))
+  "(VALUES ShardAccount-or-NIL RAW-KEY) of the account in the accounts as of BLK (workchain 0 or the masterchain)."
+  (let* ((accounts (fc-block-accounts blk))
+         (key (fc-key-of addr-obj)))
+    (values (and key (gethash key accounts)) (octets->uint (tl-get addr-obj :id)))))
 
 (defun fc-account-cell (shard-account)
   "The ^Account of a ShardAccount, or NIL for account_none."
@@ -1071,14 +1110,22 @@ prev_blocks path to the destination, the destination's header proof (none for th
     (multiple-value-bind (sa key) (fc-account-from-blk blk addr)
       (let ((acc (and sa (fc-account-cell sa))))
         (tl-encode
-         (tl-make "liteServer.accountState"
-                  :id (fc-mc-id blk) :shardblk (fc-sh-id blk)
-                  :shard-proof (fc-proof-boc (fc-header-proof-node (fc-block-mc-block blk))
-                                             (fc-mc-state-proof-node (fc-block-mc-state blk)
-                                                                     (tl-get addr :workchain)))
-                  :proof (fc-proof-boc (fc-header-proof-node (fc-block-sh-block blk))
-                                       (fc-state-proof-node (fc-block-sh-state blk) key (and sa t)))
-                  :state (if acc (fc-cells-boc (list acc)) (fc-cells-boc '()))))))))
+         (if (eql (tl-get addr :workchain) -1)
+             ;; a masterchain account is proved in the masterchain block itself, with no shard proof
+             (tl-make "liteServer.accountState"
+                      :id (fc-mc-id blk) :shardblk (fc-mc-id blk)
+                      :shard-proof (make-array 0 :element-type '(unsigned-byte 8))
+                      :proof (fc-proof-boc (fc-header-proof-node (fc-block-mc-block blk))
+                                           (fc-state-proof-node (fc-block-mc-state blk) key (and sa t)))
+                      :state (if acc (fc-cells-boc (list acc)) (fc-cells-boc '())))
+             (tl-make "liteServer.accountState"
+                      :id (fc-mc-id blk) :shardblk (fc-sh-id blk)
+                      :shard-proof (fc-proof-boc (fc-header-proof-node (fc-block-mc-block blk))
+                                                 (fc-mc-state-proof-node (fc-block-mc-state blk)
+                                                                         (tl-get addr :workchain)))
+                      :proof (fc-proof-boc (fc-header-proof-node (fc-block-sh-block blk))
+                                           (fc-state-proof-node (fc-block-sh-state blk) key (and sa t)))
+                      :state (if acc (fc-cells-boc (list acc)) (fc-cells-boc '())))))))))
 
 (defun fc-answer-run-smc-method (fc fn)
   "liteServer.runSmcMethod served by the emulator on the account's state at the asked block (result only: no proofs,
@@ -1094,7 +1141,8 @@ as a real server answers mode 4)."
               (run-account-get-method acc (tl-get fn :method-id) (parse-vm-stack (first (parse-boc (tl-get fn :params))))
                                       :libraries (with-fc-lock (fc) (copy-list (fakechain-libraries fc))))
             (tl-encode (tl-make "liteServer.runMethodResult"
-                                :mode (tl-get fn :mode) :id (fc-mc-id blk) :shardblk (fc-sh-id blk)
+                                :mode (tl-get fn :mode) :id (fc-mc-id blk)
+                                :shardblk (if (eql (tl-get addr :workchain) -1) (fc-mc-id blk) (fc-sh-id blk))
                                 :exit-code exit
                                 :result (fc-cells-boc (list (serialize-vm-stack items))))))))))
 
@@ -1103,7 +1151,7 @@ as a real server answers mode 4)."
 
 (defun fc-answer-transactions (fc fn)
   (let* ((addr (tl-get fn :account))
-         (key (octets->uint (tl-get addr :id)))
+         (key (or (fc-key-of addr) -1))
          (all (gethash key (fakechain-txs fc)))
          (start (position-if (lambda (e) (and (= (fc-tx-lt (car e)) (tl-get fn :lt))
                                               (equalp (node-hash (car e)) (tl-get fn :hash))))
@@ -1112,26 +1160,27 @@ as a real server answers mode 4)."
     (if (null picked)
         (fc-error 651 "cannot find transaction")
         (tl-encode (tl-make "liteServer.transactionList"
-                            :ids (map 'vector (lambda (e) (fc-sh-id (cdr e))) picked)
+                            :ids (map 'vector (lambda (e) (if (fc-key-mc-p key) (fc-mc-id (cdr e)) (fc-sh-id (cdr e)))) picked)
                             :transactions (fc-cells-boc (mapcar #'car picked)))))))
 
-(defun fc-answer-list-block-transactions (fc fn)
+(defun fc-block-transactions-object (fc fn)
   "liteServer.listBlockTransactions served from the chain model (no proof: tonlib
 only asks for one with want_proof).  Order is (account, lt) ascending, or descending
 with reverse_order; AFTER (a transactionId3) is exclusive; the answer is INCOMPLETE
 when more transactions remain than COUNT."
   (let* ((id (tl-get fn :id))
          (mode (tl-get fn :mode))
-         (blk (and (= (tl-get id :workchain) 0) (fc-find-block fc (tl-get id :seqno))))
+         (mc (eql (tl-get id :workchain) -1))
+         (blk (and (member (tl-get id :workchain) '(0 -1)) (fc-find-block fc (tl-get id :seqno))))
          (after (tl-get fn :after))
          (reverse (tl-get fn :reverse-order))
          (count (min (tl-get fn :count) 1000))
          (entries '()))
-    (when (and blk (equalp (tl-get id :root-hash) (fc-block-sh-root blk)))
+    (when (and blk (equalp (tl-get id :root-hash) (if mc (fc-block-mc-root blk) (fc-block-sh-root blk))))
       (maphash (lambda (key list)
                  (dolist (e list)
-                   (when (eq (cdr e) blk)
-                     (push (list key (fc-tx-lt (car e)) (car e)) entries))))
+                   (when (and (eq (cdr e) blk) (eq mc (and (fc-key-mc-p key) t)))
+                     (push (list (fc-raw-key key) (fc-tx-lt (car e)) (car e)) entries))))
                (fakechain-txs fc)))
     (setf entries (sort entries (lambda (a b) (or (< (first a) (first b))
                                                   (and (= (first a) (first b)) (< (second a) (second b)))))))
@@ -1145,7 +1194,7 @@ when more transactions remain than COUNT."
                                      entries))))
     (let* ((page (subseq entries 0 (min count (length entries))))
            (incomplete (> (length entries) (length page))))
-      (tl-encode
+      (values
        (tl-make "liteServer.blockTransactions"
                 :id id :req-count count :incomplete incomplete
                 :ids (map 'vector
@@ -1155,8 +1204,49 @@ when more transactions remain than COUNT."
                                      :lt (second e) :hash (node-hash (third e))))
                           page)
                 :proof (if (logtest mode 32)
-                           (fc-proof-boc (fc-block-sh-block blk))
-                           (make-array 0 :element-type '(unsigned-byte 8))))))))
+                           (fc-proof-boc (if mc (fc-block-mc-block blk) (fc-block-sh-block blk)))
+                           (make-array 0 :element-type '(unsigned-byte 8))))
+       page))))
+
+(defun fc-answer-list-block-transactions (fc fn)
+  (tl-encode (values (fc-block-transactions-object fc fn))))
+
+(defun fc-answer-list-block-transactions-ext (fc fn)
+  "liteServer.listBlockTransactionsExt: the same page as listBlockTransactions, with the transaction cells themselves."
+  (multiple-value-bind (plain page) (fc-block-transactions-object fc fn)
+    (tl-encode (tl-make "liteServer.blockTransactionsExt"
+                        :id (tl-get plain :id) :req-count (tl-get plain :req-count) :incomplete (tl-get plain :incomplete)
+                        :transactions (if page
+                                          (serialize-boc (mapcar #'third page))
+                                          (make-array 0 :element-type '(unsigned-byte 8)))
+                        :proof (tl-get plain :proof)))))
+
+(defun fc-answer-block (fc fn)
+  "liteServer.getBlock: the serialized block (masterchain or workchain 0) whose SHA-256 is the id's file hash."
+  (let* ((id (tl-get fn :id))
+         (blk (fc-find-block fc (tl-get id :seqno)))
+         (mc (= (tl-get id :workchain) -1))
+         (cell (and blk (if mc (fc-block-mc-block blk) (fc-block-sh-block blk))))
+         (root (and blk (if mc (fc-block-mc-root blk) (fc-block-sh-root blk)))))
+    (unless (and cell (member (tl-get id :workchain) '(-1 0)) (equalp (tl-get id :root-hash) root))
+      (fc-error 651 "block not found"))
+    (tl-encode (tl-make "liteServer.blockData" :id id :data (boc-of cell)))))
+
+(defun fc-answer-one-transaction (fc fn)
+  "liteServer.getOneTransaction: the transaction of the account at LT in a workchain-0 block, with a proof of the whole block."
+  (let* ((id (tl-get fn :id))
+         (mc (eql (tl-get id :workchain) -1))
+         (blk (and (member (tl-get id :workchain) '(0 -1)) (fc-find-block fc (tl-get id :seqno))))
+         (key (or (fc-key-of (tl-get fn :account)) -1))
+         (lt (tl-get fn :lt))
+         (hit nil))
+    (unless (and blk (equalp (tl-get id :root-hash) (if mc (fc-block-mc-root blk) (fc-block-sh-root blk))))
+      (fc-error 651 "block not found"))
+    (dolist (e (gethash key (fakechain-txs fc)))
+      (when (and (eq (cdr e) blk) (= (fc-tx-lt (car e)) lt)) (setf hit (car e))))
+    (unless hit (fc-error 651 "transaction not found"))
+    (tl-encode (tl-make "liteServer.transactionInfo" :id id :proof (fc-proof-boc (if mc (fc-block-mc-block blk) (fc-block-sh-block blk)))
+                                                     :transaction (serialize-boc (list hit))))))
 
 (defun fc-answer-send-message (fc fn)
   (let* ((body (tl-get fn :body))
@@ -1176,6 +1266,14 @@ when more transactions remain than COUNT."
     (tl-encode (tl-make "liteServer.configInfo" :mode 0 :id (fc-mc-id h)
                                                :state-proof (fc-proof-boc (fc-header-proof-node (fc-block-mc-block h)))
                                                :config-proof (fc-proof-boc (fc-config-proof-node (fc-block-mc-state h) :all))))))
+
+(defun fc-answer-config-params (fc fn)
+  "liteServer.getConfigParams: the config proof reveals only the parameters asked for (what getConfigParam needs)."
+  (let ((h (or (let ((id (tl-get fn :id))) (and id (fc-find-block fc (tl-get id :seqno)))) (fc-head fc)))
+        (params (coerce (tl-get fn :param-list) 'list)))
+    (tl-encode (tl-make "liteServer.configInfo" :mode (tl-get fn :mode) :id (fc-mc-id h)
+                                               :state-proof (fc-proof-boc (fc-header-proof-node (fc-block-mc-block h)))
+                                               :config-proof (fc-proof-boc (fc-config-proof-node (fc-block-mc-state h) params))))))
 
 ;;; getAllShardsInfo: a Merkle proof of the masterchain block that reveals the path to its McBlockExtra
 ;;; (everything else pruned, as MerkleProofBuilder leaves it: the shard_hashes dictionary itself is only
@@ -1453,6 +1551,10 @@ to the one asked for."
                   ((tl-is fn "liteServer.listBlockTransactions") (fc-answer-list-block-transactions fc fn))
                   ((tl-is fn "liteServer.sendMessage") (fc-answer-send-message fc fn))
                   ((tl-is fn "liteServer.getConfigAll") (fc-answer-config-all fc fn))
+                  ((tl-is fn "liteServer.listBlockTransactionsExt") (fc-answer-list-block-transactions-ext fc fn))
+                  ((tl-is fn "liteServer.getOneTransaction") (fc-answer-one-transaction fc fn))
+                  ((tl-is fn "liteServer.getBlock") (fc-answer-block fc fn))
+                  ((tl-is fn "liteServer.getConfigParams") (fc-answer-config-params fc fn))
                   ((tl-is fn "liteServer.getLibraries") (fc-answer-get-libraries fc fn))
                   ((tl-is fn "liteServer.getLibrariesWithProof") (fc-answer-libraries-with-proof fc fn))
                   ((tl-is fn "liteServer.getBlockHeader") (fc-answer-block-header fc fn))

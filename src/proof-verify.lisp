@@ -1092,3 +1092,48 @@ list of (HASH . CELL) for the published libraries (CELL is NIL when MODE has bit
                       (%prove (<= (node-depth-at cell 0) +max-library-depth+) "a library that is too deep")
                       (push (cons hash cell) found)))))))
       (nreverse found))))
+
+
+;;; --- one transaction, and the full transactions of a block ------------------------------------------------------------------------
+
+(defun verify-one-transaction (answer block-id account lt)
+  "ANSWER, a decoded liteServer.transactionInfo, for the transaction of ACCOUNT (32 octets) at LT in BLOCK-ID (a blockIdExt the
+caller trusts): the proof must be a Merkle proof of that block, the block must hold a transaction of the account at LT, and the
+transaction served must be exactly that one.  Returns (:TRANSACTION cell :HASH octets)."
+  (with-proof-errors
+    (%prove-same-block-id (tl-get answer :id) block-id "one transaction")
+    (let* ((block (verify-merkle-proof (%single-root (tl-get answer :proof) "one transaction proof") (tl-get block-id :root-hash)))
+           (roots (parse-boc (tl-get answer :transaction))))
+      (%prove (and (cell-p block) (not (cell-exotic-p block)) (= (load-uint (cell-slice block) 32) #x11ef55aa))
+              "one transaction: the proof is not of a Block")
+      (%prove (= 1 (length roots)) "one transaction: ~D transactions served, not 1" (length roots))
+      (multiple-value-bind (tx found) (find-block-transaction block account lt)
+        (%prove found "the block has no transaction of this account at lt ~D" lt)
+        (%prove (equalp (node-hash-at tx 0) (node-hash (first roots)))
+                "the transaction served is not the block's transaction at lt ~D" lt)
+        (list :transaction (first roots) :hash (node-hash (first roots)))))))
+
+(defun %transaction-root-id (root)
+  "The (ACCOUNT-OCTETS LT HASH) of a transaction cell: transaction$0111 account_addr:bits256 lt:uint64 ..."
+  (let ((s (cell-slice root)))
+    (multiple-value-bind (tag s) (load-uint s 4)
+      (%prove (= tag 7) "not a transaction cell")
+      (multiple-value-bind (account s) (load-uint s 256)
+        (let ((lt (load-uint s 64)))
+          (list (uint->octets account 32) lt (node-hash root)))))))
+
+(defun verify-block-transactions-ext (answer block-id &key count reverse)
+  "ANSWER, a decoded liteServer.blockTransactionsExt: every transaction served is identified by its own hash (so its whole content
+is bound), and the identities must be those the block proves, as VERIFY-BLOCK-TRANSACTIONS checks them.  Returns what that does."
+  (with-proof-errors
+    (let* ((octets (tl-get answer :transactions))
+           (roots (if (plusp (length octets)) (parse-boc octets) '()))
+           (ids (mapcar (lambda (root)
+                          (destructuring-bind (account lt hash) (%transaction-root-id root)
+                            (tl-make "liteServer.transactionId" :mode 7 :account account :lt lt :hash hash)))
+                        roots)))
+      (verify-block-transactions (tl-make "liteServer.blockTransactions" :id (tl-get answer :id)
+                                                                         :req-count (tl-get answer :req-count)
+                                                                         :incomplete (tl-get answer :incomplete)
+                                                                         :ids (coerce ids 'vector) :proof (tl-get answer :proof))
+                                 block-id :count count :reverse reverse))))

@@ -98,8 +98,8 @@ normalized (comments, markers and the semicolon removed), KIND :TYPE or :FUNCTIO
         (merge-pathnames (concatenate 'string "tests/tl/" name) (asdf:system-source-directory "cl-ton")))))
 
 (defun tl-generate-declaration-texts ()
-  "The non-builtin declarations of ton_api.tl then lite_api.tl, in file order (what TL-REGISTER takes)."
-  (loop for file in '("ton_api.tl" "lite_api.tl")
+  "The non-builtin declarations of ton_api.tl, lite_api.tl then cl_ton_api.tl (cl-ton's own), in file order (what TL-REGISTER takes)."
+  (loop for file in '("ton_api.tl" "lite_api.tl" "cl_ton_api.tl")
         append (loop for (text . nil) in (tl-schema-chunks (%tl-vendored-path file))
                      unless (member (subseq text 0 (position-if (lambda (c) (member c '(#\Space #\#))) text))
                                     *tl-builtin-names* :test #'string=)

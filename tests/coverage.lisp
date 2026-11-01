@@ -169,8 +169,80 @@
         (sb-int:unencapsulate f 'stage3)))
     (check "the stand-ins answered the masterchain block twice (two scans)" (= 2 master-calls))))
 
+;;; --- TONLIB-CHAIN: the chain-client methods, with stand-ins for the TONLIB-* functions they call -------------------------
+
+(defmacro with-encapsulated ((&rest bindings) &body body)
+  "Run BODY with each (NAME (F &REST ARGS) FORM...) stand-in wrapped around the global function NAME (F is the original,
+ignored by most)."
+  `(progn
+     ,@(loop for (name lambda-list . forms) in bindings
+             collect `(sb-int:encapsulate ',name 'coverage (lambda ,lambda-list ,@forms)))
+     (unwind-protect (progn ,@body)
+       ,@(loop for (name) in bindings collect `(sb-int:unencapsulate ',name 'coverage)))))
+
+(defun test-tonlib-chain-methods ()
+  (format t "tonlib-chain: balances, jetton wallets, transactions, send, deployed, seqno~%")
+  (let* ((wallet (make-wallet-v5r1 *test-keypair*))
+         (usdt-wallet (fake-address #x31))
+         (getter (lambda (address method stack) (declare (ignore address stack))
+                   (error "getter stand-in: ~A" method)))
+         (states (make-hash-table :test 'equal))
+         (sent '()))
+    (flet ((state (addr status balance)
+             (setf (gethash (address->string addr) states)
+                   (cl-ton::make-account-state :address addr :status status :balance balance))))
+      (let ((c (make-tonlib-chain :stand-in-tl getter '(dex) wallet usdt-wallet)))
+        (state (wallet-address wallet) :active 5000)
+        (state usdt-wallet :active 1)
+        (with-encapsulated
+            ((cl-ton::tonlib-account-state (f tl addr) (declare (ignore f tl))
+              (or (gethash (address->string addr) states) (error "no state for ~A" (address->string addr))))
+             (cl-ton::jetton-wallet-balance (f getter addr) (declare (ignore f getter addr)) 777)
+             (cl-ton::jetton-wallet-address (f getter master owner) (declare (ignore f getter master owner)) usdt-wallet)
+             (cl-ton::tonlib-transactions (f tl addr &rest r) (declare (ignore f tl addr r))
+              (list (make-raw-transaction :lt 3) (make-raw-transaction :lt 2) (make-raw-transaction :lt 1)))
+             (cl-ton::tonlib-send-message (f tl external) (declare (ignore f tl)) (push external sent) "the-hash")
+             (cl-ton::wallet-seqno (f getter w) (declare (ignore f getter w)) 42))
+          (check "chain-ton-balance: the wallet account's balance"
+                 (eql 5000 (chain-ton-balance c)))
+          (check "chain-usdt-balance: the jetton wallet's balance while it is active"
+                 (eql 777 (chain-usdt-balance c)))
+          (state usdt-wallet :uninit 0)
+          (check "chain-usdt-balance: 0 while the jetton wallet is not deployed"
+                 (eql 0 (chain-usdt-balance c)))
+          (state usdt-wallet :active 1)
+          (check "chain-jetton-balance: derives the wallet once per master and reads its balance"
+                 (and (eql 777 (chain-jetton-balance c (fake-address #x41)))
+                      (eql 777 (chain-jetton-balance c (fake-address #x41)))
+                      (= 1 (hash-table-count (cl-ton::tonlib-chain-jetton-wallets c)))))
+          (check "chain-wallet-transactions: newest first, limited"
+                 (equal '(3 2) (mapcar #'raw-tx-lt (chain-wallet-transactions c :limit 2))))
+          (check "chain-wallet-transactions: the default limit returns what there is"
+                 (= 3 (length (chain-wallet-transactions c))))
+          (check "chain-wallet-deployed-p: true for an active wallet account"
+                 (chain-wallet-deployed-p c))
+          (state (wallet-address wallet) :uninit 0)
+          (check "chain-wallet-deployed-p: false before deployment"
+                 (not (chain-wallet-deployed-p c)))
+          (check "chain-wallet-seqno asks the wallet getter" (eql 42 (chain-wallet-seqno c)))
+          (check "chain-send hands the external message to the client and returns its hash"
+                 (and (equal "the-hash" (chain-send c :external)) (equal '(:external) sent)))
+          (check "chain-now is a plausible Unix time" (> (chain-now c) 1700000000))))
+      (let ((c (make-tonlib-chain :stand-in-tl getter nil nil nil)))
+        (check "no wallet attached: the balance read says so"
+               (handler-case (progn (chain-ton-balance c) nil) (ton-error () t)))
+        (check "no USDT wallet attached: the USDT balance read says so"
+               (handler-case (progn (chain-usdt-balance c) nil) (ton-error () t)))
+        (check "no pool fetcher: the pools read says so"
+               (handler-case (progn (chain-pools c) nil) (ton-error () t))))
+      (let ((c (make-tonlib-chain :stand-in-tl getter '(the-dexes) wallet usdt-wallet
+                                  :pool-fetcher (lambda (g d) (declare (ignore g)) (list :pools d)))))
+        (check "chain-pools calls the fetcher with the getter and the dexes"
+               (equal '(:pools (the-dexes)) (chain-pools c)))))))
+
 (defun test-coverage-stage3 ()
   (test-proxy-shard-routing)
   (test-vm-tuples)
   (test-wait-for-published-head)
-  (test-scan-confirmed-flow))
+  (test-scan-confirmed-flow)
+  (test-tonlib-chain-methods))

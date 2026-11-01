@@ -21,8 +21,43 @@
   (require :sb-posix))  ; TON_MNEMONIC / TON_MNEMONIC_FILE env-var tests
 
 (defpackage :cl-ton/test  
-  (:use
-   :cl :cl-ton)  
+  (:use :cl)
+  (:import-from :cl-ton #:*flow-event-backlog* #:*get-method-block* #:*tonlib-oracle*
+    #:*tonlib-sync-retry-delay* #:*verify-validator-set-hash* #:*wallet* #:account-state #:account-state-balance
+    #:account-state-code #:account-state-data #:account-state-last-hash #:account-state-last-lt
+    #:account-state-status #:address #:address->raw-string #:address->string #:address-equal #:address-hash
+    #:address-workchain #:base64->cell #:base64-decode #:base64-encode #:begin-cell #:block-id-seqno
+    #:build-cell #:builder #:cell #:cell->base64 #:cell-bit #:cell-bit-length #:cell-bits #:cell-exotic-p
+    #:cell-hash #:cell-hash-hex #:cell-p #:cell-refs #:cell-slice #:cell-uint #:chain #:chain-emulate
+    #:chain-jetton-balance #:chain-now #:chain-pools #:chain-send #:chain-sleep #:chain-ton-balance
+    #:chain-usdt-balance #:chain-wallet-deployed-p #:chain-wallet-seqno #:chain-wallet-transactions
+    #:check-routed-config #:close-proxy-liteserver #:close-tonlib #:collect-nodes #:crc32c #:diagnose-proxy
+    #:dict-entries #:drain-flow-events #:emulate-message #:emulation-out-message-cells #:emulation-result-error
+    #:emulation-result-shard-account #:emulation-result-success-p #:emulator-version #:end-cell
+    #:external-message #:external-message-normalized-hash #:flow-event-observed-at #:funded-shard-account
+    #:head-poller #:hex->octets #:internal-message-relaxed #:jetton-transfer-body #:json->tlapi #:keypair
+    #:keypair-public #:lite-error #:lite-libraries #:lite-lookup-block #:lite-prove-block #:lite-shard-info
+    #:lite-shards #:lite-sync #:load-address #:load-bit #:load-coins #:load-emulator-library #:load-hm-label
+    #:load-int #:load-link-vector #:load-maybe-ref #:load-ref #:load-tonlib-library #:load-uint #:make-address
+    #:make-block-id #:make-cell #:make-message-spec #:make-pruned-branch #:make-raw-message
+    #:make-raw-transaction #:make-short-tx-id #:make-state-init #:make-tonlib-chain #:make-wallet-v5r1
+    #:mnemonic->keypair #:nano #:node #:node-depth-at #:node-equal #:node-hash #:node-hash-at #:octets
+    #:octets->hex #:octets->uint #:open-proxy-liteserver #:open-tonlib #:open-tonlib-via-proxy #:parallel-map
+    #:parse-address #:parse-boc #:parse-message-header #:parse-message-summary #:parse-vm-stack #:pmap
+    #:proof-error #:proof-single-links #:proxy-diagnostics #:proxy-liteserver #:proxy-liteserver-db
+    #:proxy-liteserver-global-config-path #:proxy-progress-function #:proxy-wait-ready #:pruned-branch-p
+    #:publish-flow-event #:raw-tx-lt #:run-account-get-method #:run-get-method-local #:save-link-vector
+    #:seed->keypair #:serialize-boc #:serialize-vm-stack #:sha256 #:short-tx-account #:short-tx-lt #:skip-bits
+    #:slice #:slice-empty-p #:slice-p #:slice-remaining-bits #:slice-remaining-refs #:slice-rest-bits
+    #:stack-null #:stack-slice #:store-address #:store-bit #:store-bits #:store-builder #:store-bytes
+    #:store-coins #:store-int #:store-ref #:store-uint #:tlapi->plist #:tlapi-get #:tlapi-make #:tlapi-obj-name
+    #:tlapi-obj-p #:tlapi-validate #:ton-error #:tonlib #:tonlib-account-state #:tonlib-call #:tonlib-chain
+    #:tonlib-error #:tonlib-error-code #:tonlib-error-message #:tonlib-json-op
+    #:tonlib-libraries #:tonlib-sync #:transaction-matches-broadcast-p #:transaction-messages #:uint->octets
+    #:unix-now #:validate-proxy-liteserver-preconditions #:validator-set #:verify-lookup-header
+    #:verify-lookup-prev-header #:verify-merkle-proof #:verify-merkle-update #:verify-shard-block-proof
+    #:wallet-address #:wallet-external-message #:wallet-from-mnemonic #:wallet-from-mnemonic-source
+    #:wallet-seqno #:wallet-state-init #:wallet-v5r1-code #:wallet-v5r1-id #:with-tonlib #:x25519)  
   (:shadow
    #:run-tests)
   (:export
@@ -667,7 +702,7 @@ against the real binary)."
              (not (cl-ton::shard-includes-address-p (shard 1 #x8000000000000000) addr)))
       (check "the signed int64 of the typed block id is read as its unsigned bit pattern"
              (and (cl-ton::shard-includes-address-p (shard 0 #x8000000000000000) addr)
-                  (eql (cl-ton:block-id-shard (shard 0 #x8000000000000000)) (- (expt 2 63))))))))
+                  (eql (cl-ton::block-id-shard (shard 0 #x8000000000000000)) (- (expt 2 63))))))))
 
 (defun test-flow-event-plumbing ()
   (format t "flow event plumbing~%")
@@ -914,7 +949,7 @@ Skipped when TON_FIFT_BINARY isn't set."
 (defun run-tests ()  
   (setf *failures* 0 *checks* 0)  
   ;; 1. the BOC serializer's own self-test  
-  (check "cl-ton self-test" (eq t (cl-ton:run-boc-tests)))
+  (check "cl-ton self-test" (eq t (cl-ton::run-boc-tests)))
   (let ((vec (vectors)))
     (test-coins vec)
     (test-dict vec)
@@ -941,6 +976,19 @@ Skipped when TON_FIFT_BINARY isn't set."
     (test-cells)         ; cell levels / pruned branches / Merkle proofs (tests/cells.lisp)
     (test-verify)        ; lite proof verification (tests/verify.lisp)
     (test-sync)          ; key-block sync (tests/sync.lisp)
+    (test-lite-api-oracle) ; the typed Lite API against real tonlib, its proofs and forged proofs (tests/api.lisp)
+    (test-verdict-channel) ; the proxy told which answer did not verify (tests/api.lisp)
+    (test-fake-network)  ; the Fake Chain as a typed-API network (tests/fake-network.lisp)
+    (test-lite-api)      ; the typed Lite API on the same network (tests/fake-network.lisp)
+    (test-lite-api-more) ; block transactions, config parameters, libraries, shard info, block proofs, freshness floor
+    (test-lite-api-masterchain) ; masterchain accounts, transactions and messages across the workchains
+    (test-fake-external-out)    ; outgoing external messages are recorded for tests
+    (test-fake-world)           ; the captured DEX contracts on the fake network (tests/fake-world.lisp)
+    (test-scenario-jetton-transfer) ; a jetton transfer cascade on the fake world (tests/scenario-kit.lisp)
+    (test-adnl-udp)             ; ADNL over UDP: datagrams, signed packets, queries (tests/adnl-udp.lisp)
+    (test-adnl-udp-channels)    ; ADNL over UDP: channels, parts, peer statistics (tests/adnl-udp.lisp)
+    (test-dht)                  ; the DHT client: signed nodes and values (tests/dht.lisp)
+    (test-dht-search)           ; the DHT client: a search over simulated nodes (tests/dht.lisp)
     (test-coverage-stage3) ; proxy routing, tuples, head wait, flow scan (tests/coverage.lisp)
     (test-pmap-conveys)
     (cl-ton::test-tl-schema-generated (lambda (name ok) (check name ok)))

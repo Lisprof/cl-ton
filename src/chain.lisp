@@ -14,64 +14,94 @@
 ;;;; See the License for the specific language governing permissions and
 ;;;; limitations under the License.
 
-;;;; chain.lisp -- the bot's view of the blockchain as a small protocol.
+;;;; chain.lisp -- the bot's view of the blockchain: a structure of operations.
 ;;;;
 ;;;; Execution (execution.lisp) only ever talks to a CHAIN.  TONLIB-CHAIN is
 ;;;; the real thing (tonlib + libemulator); the test suite provides a fake
 ;;;; that scripts balances and swap outcomes so the state machine can be
-;;;; exercised without a network or a funded wallet.
+;;;; exercised without a network or a funded wallet.  Each is a CHAIN that
+;;;; includes this structure and fills in the operation slots.
 
 (in-package :cl-ton)
 
-(defclass chain () ())
+(defun %chain-op-unsupported (name)
+  (lambda (&rest args)
+    (declare (ignore args))
+    (ton-error "this chain does not support ~A" name)))
 
-(defgeneric chain-pools (chain)
-  (:documentation "Fresh POOL-STATE snapshots of all configured pools."))
-(defgeneric chain-ton-balance (chain)
-  (:documentation "Wallet TON balance in nanoTON."))
-(defgeneric chain-usdt-balance (chain)
-  (:documentation "Wallet USDT balance in base units; 0 while the jetton wallet is not deployed."))
-(defgeneric chain-jetton-balance (chain master)
-  (:documentation "The wallet's balance, in base units, of the jetton whose
-master contract is MASTER (an ADDRESS); 0 while its jetton wallet is not
-deployed.  CHAIN-USDT-BALANCE is the same question for USDT specifically."))
-(defgeneric chain-wallet-transactions (chain &key limit)
-  (:documentation "The wallet's most recent transactions as raw.transaction
-documents (see TRANSACTION-MATCHES-BROADCAST-P), newest first."))
-(defgeneric chain-drain-flow-events (chain)
-  (:documentation "FLOW-EVENTs the confirmed-flow scanner has seen on the
-watched pool addresses since the last drain (oldest first); NIL when this
-chain has no scanner.  Advisory only: an event proves a pool processed
-SOMETHING, never that it was this bot's message."))
-(defgeneric chain-wallet-deployed-p (chain))
-(defgeneric chain-wallet-seqno (chain))
-(defgeneric chain-send (chain external)
-  (:documentation "Broadcast an external message cell; returns its hash."))
-(defgeneric chain-emulate (chain external &key pretend-balance)
-  (:documentation "EMULATION-RESULT of EXTERNAL against the wallet account."))
-(defgeneric chain-now (chain)
-  (:documentation "Unix time; fakes may run a virtual clock."))
-(defgeneric chain-sleep (chain seconds))
-(defgeneric chain-wait-block (chain &key timeout))
-(defgeneric chain-set-wallet (chain wallet usdt-wallet))
-(defgeneric chain-getter (chain)
-  (:documentation "The (address method stack) -> items function, for resolution."))
-(defgeneric chain-close (chain))
+(defstruct (chain (:constructor %make-chain) (:copier nil))
+  "The bot's view of the blockchain: one FUNCTION per operation, held in the slots, so an implementation (TONLIB-CHAIN, the
+test suite's fake) is a CHAIN that includes this structure and fills them in; no generic function dispatch.  Call the
+operations through the CHAIN-* functions below, which say what each one does."
+  (op-pools (%chain-op-unsupported "chain-pools") :type function)
+  (op-ton-balance (%chain-op-unsupported "chain-ton-balance") :type function)
+  (op-usdt-balance (%chain-op-unsupported "chain-usdt-balance") :type function)
+  (op-jetton-balance (%chain-op-unsupported "chain-jetton-balance") :type function)
+  (op-wallet-transactions (%chain-op-unsupported "chain-wallet-transactions") :type function)
+  (op-drain-flow-events (constantly nil) :type function)
+  (op-wallet-deployed-p (%chain-op-unsupported "chain-wallet-deployed-p") :type function)
+  (op-wallet-seqno (%chain-op-unsupported "chain-wallet-seqno") :type function)
+  (op-send (%chain-op-unsupported "chain-send") :type function)
+  (op-emulate (%chain-op-unsupported "chain-emulate") :type function)
+  (op-now #'unix-now :type function)
+  (op-sleep #'sleep :type function)
+  (op-wait-block (%chain-op-unsupported "chain-wait-block") :type function)
+  (op-set-wallet (%chain-op-unsupported "chain-set-wallet") :type function)
+  (op-getter (%chain-op-unsupported "chain-getter") :type function)
+  (op-close (constantly nil) :type function))
+
+(defun chain-pools (chain)
+  "Fresh POOL-STATE snapshots of all configured pools."
+  (funcall (chain-op-pools chain)))
+(defun chain-ton-balance (chain)
+  "Wallet TON balance in nanoTON."
+  (funcall (chain-op-ton-balance chain)))
+(defun chain-usdt-balance (chain)
+  "Wallet USDT balance in base units; 0 while the jetton wallet is not deployed."
+  (funcall (chain-op-usdt-balance chain)))
+(defun chain-jetton-balance (chain master)
+  "The wallet's balance, in base units, of the jetton whose master contract is MASTER (an ADDRESS); 0 while its jetton wallet
+is not deployed.  CHAIN-USDT-BALANCE is the same question for USDT specifically."
+  (funcall (chain-op-jetton-balance chain) master))
+(defun chain-wallet-transactions (chain &key (limit 16))
+  "The wallet's most recent transactions as typed raw.transaction documents (see TRANSACTION-MATCHES-BROADCAST-P), newest first."
+  (funcall (chain-op-wallet-transactions chain) limit))
+(defun chain-drain-flow-events (chain)
+  "FLOW-EVENTs the confirmed-flow scanner has seen on the watched pool addresses since the last drain (oldest first); NIL when
+this chain has no scanner.  Advisory only: an event proves a pool processed SOMETHING, never that it was this bot's message."
+  (funcall (chain-op-drain-flow-events chain)))
+(defun chain-wallet-deployed-p (chain)
+  (funcall (chain-op-wallet-deployed-p chain)))
+(defun chain-wallet-seqno (chain)
+  (funcall (chain-op-wallet-seqno chain)))
+(defun chain-send (chain external)
+  "Broadcast an external message cell; returns its hash."
+  (funcall (chain-op-send chain) external))
+(defun chain-emulate (chain external &key pretend-balance)
+  "EMULATION-RESULT of EXTERNAL against the wallet account."
+  (funcall (chain-op-emulate chain) external pretend-balance))
+(defun chain-now (chain)
+  "Unix time; fakes may run a virtual clock."
+  (funcall (chain-op-now chain)))
+(defun chain-sleep (chain seconds)
+  (funcall (chain-op-sleep chain) seconds))
+(defun chain-wait-block (chain &key (timeout 3))
+  (funcall (chain-op-wait-block chain) timeout))
+(defun chain-set-wallet (chain wallet usdt-wallet)
+  (funcall (chain-op-set-wallet chain) wallet usdt-wallet))
+(defun chain-getter (chain)
+  "The (address method stack) -> items function, for resolution."
+  (funcall (chain-op-getter chain)))
+(defun chain-close (chain)
+  (funcall (chain-op-close chain)))
 
 ;;; --- tonlib implementation ---------------------------------------------
 
-(defclass tonlib-chain (chain)
-  ((tl :initarg :tl :reader tonlib-chain-tl)
-   (getter :initarg :getter :reader chain-getter)
-   (dexes :initarg :dexes :reader tonlib-chain-dexes)
-   (pool-fetcher :initarg :pool-fetcher :initform nil :reader tonlib-chain-pool-fetcher)
-   (wallet :initarg :wallet :accessor tonlib-chain-wallet)
-   (usdt-wallet :initarg :usdt-wallet :accessor tonlib-chain-usdt-wallet)
-   (head-poller :initarg :head-poller :initform nil :reader tonlib-chain-head-poller)
-   (scanner :initarg :scanner :initform nil :accessor tonlib-chain-scanner)
-   (proxy :initarg :proxy :initform nil :reader tonlib-chain-proxy) ; PROXY-LITESERVER owned by this chain
-   (config-cell :initform nil :accessor tonlib-chain-config-cell)
-   (jetton-wallets :initform (make-hash-table :test 'equal) :reader tonlib-chain-jetton-wallets)))
+(defstruct (tonlib-chain (:include chain) (:constructor %make-tonlib-chain) (:conc-name tonlib-chain-) (:copier nil))
+  tl dexes pool-fetcher wallet usdt-wallet head-poller scanner
+  proxy                                 ; PROXY-LITESERVER owned by this chain
+  (config-cell nil)
+  (jetton-wallets (make-hash-table :test 'equal)))
 
 (defun make-tonlib-chain (tl getter dexes wallet usdt-wallet
                           &key head-poller scanner pool-fetcher proxy)
@@ -80,11 +110,26 @@ caller: cl-ton itself has no DEX-contract knowledge (see dex.lisp's bare
 DEFGENERICs), so CHAIN-POOLS below can't know how to turn opaque DEXES
 objects into pool states without it -- the trader passes its own
 FETCH-POOL-STATES (dex-config.lisp) when it opens a chain."
-  (make-instance 'tonlib-chain :tl tl :getter getter :dexes dexes :pool-fetcher pool-fetcher
+  (let ((c (%make-tonlib-chain :tl tl :dexes dexes :pool-fetcher pool-fetcher
                                :wallet wallet :usdt-wallet usdt-wallet
-                               :head-poller head-poller :scanner scanner :proxy proxy))
+                               :head-poller head-poller :scanner scanner :proxy proxy)))
+    (setf (chain-op-pools c) (lambda () (%tonlib-chain-pools c))
+          (chain-op-ton-balance c) (lambda () (%tonlib-chain-ton-balance c))
+          (chain-op-usdt-balance c) (lambda () (%tonlib-chain-usdt-balance c))
+          (chain-op-jetton-balance c) (lambda (master) (%tonlib-chain-jetton-balance c master))
+          (chain-op-wallet-transactions c) (lambda (limit) (%tonlib-chain-wallet-transactions c limit))
+          (chain-op-drain-flow-events c) (lambda () (%tonlib-chain-drain-flow-events c))
+          (chain-op-wallet-deployed-p c) (lambda () (%tonlib-chain-wallet-deployed-p c))
+          (chain-op-wallet-seqno c) (lambda () (%tonlib-chain-wallet-seqno c))
+          (chain-op-send c) (lambda (external) (%tonlib-chain-send c external))
+          (chain-op-emulate c) (lambda (external pretend-balance) (%tonlib-chain-emulate c external pretend-balance))
+          (chain-op-wait-block c) (lambda (timeout) (%tonlib-chain-wait-block c timeout))
+          (chain-op-set-wallet c) (lambda (wallet usdt-wallet) (%tonlib-chain-set-wallet c wallet usdt-wallet))
+          (chain-op-getter c) (lambda () getter)
+          (chain-op-close c) (lambda () (%tonlib-chain-close c)))
+    c))
 
-(defmethod chain-pools ((c tonlib-chain))
+(defun %tonlib-chain-pools (c)
   (if (tonlib-chain-pool-fetcher c)
       (funcall (tonlib-chain-pool-fetcher c) (chain-getter c) (tonlib-chain-dexes c))
       (ton-error "this chain has no POOL-FETCHER (see MAKE-TONLIB-CHAIN); ~
@@ -93,10 +138,10 @@ FETCH-POOL-STATES (dex-config.lisp) when it opens a chain."
 (defun tonlib-chain-wallet-address (c)
   (wallet-address (or (tonlib-chain-wallet c) (ton-error "no wallet attached"))))
 
-(defmethod chain-ton-balance ((c tonlib-chain))
+(defun %tonlib-chain-ton-balance (c)
   (account-state-balance (tonlib-account-state (tonlib-chain-tl c) (tonlib-chain-wallet-address c))))
 
-(defmethod chain-usdt-balance ((c tonlib-chain))
+(defun %tonlib-chain-usdt-balance (c)
   ;; Network errors propagate so a transient failure is never read as 0.
   (let* ((addr (or (tonlib-chain-usdt-wallet c) (ton-error "no USDT wallet attached")))
          (state (tonlib-account-state (tonlib-chain-tl c) addr)))
@@ -112,7 +157,7 @@ FETCH-POOL-STATES (dex-config.lisp) when it opens a chain."
         (setf (gethash key table)
               (jetton-wallet-address (chain-getter c) master (tonlib-chain-wallet-address c))))))
 
-(defmethod chain-jetton-balance ((c tonlib-chain) master)
+(defun %tonlib-chain-jetton-balance (c master)
   ;; Network errors propagate so a transient failure is never read as 0.
   (let* ((addr (tonlib-chain-jetton-wallet c master))
          (state (tonlib-account-state (tonlib-chain-tl c) addr)))
@@ -120,36 +165,34 @@ FETCH-POOL-STATES (dex-config.lisp) when it opens a chain."
         (jetton-wallet-balance (chain-getter c) addr)
         0)))
 
-(defmethod chain-wallet-transactions ((c tonlib-chain) &key (limit 16))
+(defun %tonlib-chain-wallet-transactions (c limit)
   (let ((txs (tonlib-transactions (tonlib-chain-tl c) (tonlib-chain-wallet-address c))))
     (coerce (subseq txs 0 (min limit (length txs))) 'list)))
 
-(defmethod chain-drain-flow-events ((c tonlib-chain))
+(defun %tonlib-chain-drain-flow-events (c)
   (drain-flow-events (tonlib-chain-scanner c)))
 
-(defmethod chain-wallet-deployed-p ((c tonlib-chain))
+(defun %tonlib-chain-wallet-deployed-p (c)
   (eq :active (account-state-status
                (tonlib-account-state (tonlib-chain-tl c) (tonlib-chain-wallet-address c)))))
 
-(defmethod chain-wallet-seqno ((c tonlib-chain))
+(defun %tonlib-chain-wallet-seqno (c)
   (wallet-seqno (chain-getter c) (tonlib-chain-wallet c)))
 
-(defmethod chain-send ((c tonlib-chain) external)
+(defun %tonlib-chain-send (c external)
   (tonlib-send-message (tonlib-chain-tl c) external))
 
 (defun tonlib-chain-config (c)
   (or (tonlib-chain-config-cell c)
       (setf (tonlib-chain-config-cell c) (tonlib-config-cell (tonlib-chain-tl c)))))
 
-(defmethod chain-emulate ((c tonlib-chain) external &key pretend-balance)
+(defun %tonlib-chain-emulate (c external pretend-balance)
   (let* ((wallet (tonlib-chain-wallet c))
          (shard (if pretend-balance
                     (funded-shard-account (wallet-address wallet) (wallet-state-init wallet) pretend-balance)
                     (tonlib-shard-account-cell (tonlib-chain-tl c) (wallet-address wallet)))))
     (emulate-external-message (tonlib-chain-config c) shard external)))
 
-(defmethod chain-now ((c tonlib-chain)) (unix-now))
-(defmethod chain-sleep ((c tonlib-chain) seconds) (sleep seconds))
 
 (defstruct (head-poller (:constructor %make-head-poller (client)))
   client
@@ -161,7 +204,7 @@ FETCH-POOL-STATES (dex-config.lisp) when it opens a chain."
   thread)
 
 (defun publish-head (poller block)  
-  (let ((seqno (json-get block "seqno")))  
+  (let ((seqno (block-id-seqno block)))  
     (sb-thread:with-mutex ((head-poller-lock poller))  
       (when (or (null (head-poller-seqno poller))  
                 (> seqno (head-poller-seqno poller)))  
@@ -231,7 +274,7 @@ FETCH-POOL-STATES (dex-config.lisp) when it opens a chain."
                      :timeout remaining)  
               (return-from wait nil))))))))
 
-(defmethod chain-wait-block ((c tonlib-chain) &key (timeout 3))  
+(defun %tonlib-chain-wait-block (c timeout)  
   (let ((poller (tonlib-chain-head-poller c)))  
     (if poller  
         (let ((baseline  
@@ -244,14 +287,14 @@ FETCH-POOL-STATES (dex-config.lisp) when it opens a chain."
                (baseline-block  
                  (tonlib-masterchain-block  
                   tl :timeout (coerce (max 0.1 (min timeout 3)) 'double-float)))  
-               (baseline (json-get baseline-block "seqno")))  
+               (baseline (block-id-seqno baseline-block)))  
           (loop  
             for remaining = (/ (- deadline (get-internal-real-time))  
                                internal-time-units-per-second)  
             when (<= remaining 0) return nil  
             do (let* ((block (tonlib-masterchain-block  
                               tl :timeout (coerce (max 0.1 (min 1 remaining)) 'double-float)))  
-                      (seqno (json-get block "seqno")))  
+                      (seqno (block-id-seqno block)))  
                  (when (> seqno baseline) (return block)))  
                (sleep (min 0.1 (max 0 remaining))))))))
 
@@ -267,11 +310,11 @@ Returns the first true value or NIL on timeout."
            (chain-wait-block chain :timeout interval)
         finally (return value)))
 
-(defmethod chain-set-wallet ((c tonlib-chain) wallet usdt-wallet)
+(defun %tonlib-chain-set-wallet (c wallet usdt-wallet)
   (setf (tonlib-chain-wallet c) wallet
         (tonlib-chain-usdt-wallet c) usdt-wallet))
 
-(defmethod chain-close ((c tonlib-chain))
+(defun %tonlib-chain-close (c)
   ;; the proxy goes last and even when a close above signals: tonlib clients
   ;; first (they hold sessions to it), and a failed close never leaks the proxy
   (unwind-protect

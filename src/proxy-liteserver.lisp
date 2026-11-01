@@ -95,7 +95,9 @@ liteServer.error instead of leaving the client hanging.")
   (refresh-at 0)                        ; universal time the last refresh was started
   (refresh-running nil)                 ; a refresh thread is working
   (refresh-added 0)                     ; upstreams added by refreshes so far
-  (refresh-status nil))                 ; text of the last refresh outcome
+  (refresh-status nil)                  ; text of the last refresh outcome
+  (answer-origins (make-hash-table :test 'equal)) ; hex SHA-256 of an answer's payload -> (UPSTREAM . QINFO) that produced it
+  (answer-order nil))                   ; the keys of ANSWER-ORIGINS, newest first (see PROXY-REMEMBER-ANSWER)
 
 (defstruct (proxy-upstream (:copier nil))
   name client
@@ -111,6 +113,8 @@ liteServer.error instead of leaving the client hanging.")
   (latency (make-hash-table :test 'equal))     ; METHOD -> (n total-seconds max-seconds) of ANSWERED attempts
   (slowness nil)                        ; EWMA of answer time relative to the method's usual time (1.0 = typical)
   (fail-streak 0)                       ; consecutive timeouts / lost connections; reset by an answer
+  (ban-until 0)                         ; internal-real-time until which it is avoided: a client reported an answer of it as bad
+  (reject-streak 0)                     ; answers reported bad in a row of bans (see PROXY-REJECT-UPSTREAM)
   host port public                      ; where to connect (kept so a standby session can be started later)
   (started-p t))                        ; NIL while on standby: its session has not been opened yet
 
@@ -526,7 +530,9 @@ advertises slices only takes queries some slice covers."
 shard client is behind) is avoided in favour of upstreams that did not.")
 
 (defun proxy-upstream-penalized-p (up)
-  (> (proxy-upstream-penalty-until up) (get-internal-real-time)))
+  (let ((now (get-internal-real-time)))
+    (or (> (proxy-upstream-penalty-until up) now)
+        (> (proxy-upstream-ban-until up) now))))
 
 (defun proxy-penalize (proxy up)
   (sb-thread:with-mutex ((lisp-proxy-lock proxy))
@@ -927,6 +933,55 @@ thread, so a late answer of an attempt that lost the race still teaches the prox
         ((:timeout :dead) (proxy-note-failure proxy up)))
       (values answer kind))))
 
+;;; --- verdicts of clients (clton.reportVerdict) --------------------------------------------------------------------------
+
+(defparameter *proxy-answer-memory* 512
+  "How many of the latest answers the proxy remembers the upstream of, to match a client's verdict to it.")
+
+(defparameter *proxy-rejection-ban* 120
+  "Seconds an upstream is avoided after a client reports an answer of it did not verify; doubled by each further report within
+an hour of the ban ending, at most *PROXY-REJECTION-BAN-MAX*.")
+
+(defparameter *proxy-rejection-ban-max* 3600)
+
+(defun proxy-remember-answer (proxy answer up q)
+  "Remember that UP gave ANSWER (octets) to Q, so a verdict about it can be applied."
+  (let ((key (octets->hex (sha256 answer))))
+    (sb-thread:with-mutex ((lisp-proxy-lock proxy))
+      (let ((table (lisp-proxy-answer-origins proxy)))
+        (unless (gethash key table)
+          (setf (gethash key table) (cons up q))
+          (push key (lisp-proxy-answer-order proxy))
+          (when (> (hash-table-count table) *proxy-answer-memory*)
+            (let ((half (floor *proxy-answer-memory* 2)))
+              (dolist (old (nthcdr half (lisp-proxy-answer-order proxy))) (remhash old table))
+              (setf (lisp-proxy-answer-order proxy) (subseq (lisp-proxy-answer-order proxy) 0 half)))))))))
+
+(defun proxy-reject-upstream (proxy up)
+  "Avoid UP for a ban that doubles with each report close to the last one."
+  (sb-thread:with-mutex ((lisp-proxy-lock proxy))
+    (let ((now (get-internal-real-time)))
+      (when (> (- now (proxy-upstream-ban-until up)) (* 3600 internal-time-units-per-second))
+        (setf (proxy-upstream-reject-streak up) 0))
+      (let* ((streak (incf (proxy-upstream-reject-streak up)))
+             (seconds (min *proxy-rejection-ban-max* (* *proxy-rejection-ban* (expt 2 (min 10 (1- streak)))))))
+        (setf (proxy-upstream-ban-until up)
+              (max (proxy-upstream-ban-until up) (+ now (* seconds internal-time-units-per-second))))))))
+
+(defun proxy-apply-verdict (proxy answer-hash accepted reason)
+  "A client says the answer whose payload hashes to ANSWER-HASH verified (ACCEPTED) or did not.  An answer that did not
+verify bans the upstream that gave it for a while (the client then asks again and the proxy gives the query to another one).
+True when the answer is one the proxy remembers."
+  (let ((entry (sb-thread:with-mutex ((lisp-proxy-lock proxy))
+                 (gethash (octets->hex answer-hash) (lisp-proxy-answer-origins proxy)))))
+    (when entry
+      (destructuring-bind (up . q) entry
+        (cond (accepted (proxy-stat proxy :verdict-accepted))
+              (t (proxy-stat proxy :verdict-rejected)
+                 (proxy-record-outcome proxy up q :rejected reason)
+                 (proxy-reject-upstream proxy up))))
+      t)))
+
 (defun proxy-handle-query (proxy server conn query-id query)
   "ADNL-EXT-SERVER handler: PROXY-HANDLE-QUERY-1 plus the end-to-end latency tonlib sees."
   (let* ((t0 (get-internal-real-time))
@@ -1013,10 +1068,10 @@ proxy-liteserver does."
                   (loop repeat (1- (length batch)) do (sb-thread:try-semaphore sem))
                   (dolist (r batch)
                     (destructuring-bind (up a kind) r
-                      (declare (ignore up))
                       (incf collected)
                       (case kind
-                        ((nil) (return-from proxy-race a))
+                        ((nil) (proxy-remember-answer proxy a up q)
+                         (return-from proxy-race a))
                         (:error (setf answer a)
                          (unless history (return-from proxy-race a))
                          (launch-next :failover))
@@ -1041,7 +1096,14 @@ octets (always -- failures become liteServer.error); see PROXY-RACE for how upst
       (return-from proxy-handle-query-1 (proxy-error-answer "Gateway error: expected liteServer.query")))
     (multiple-value-bind (wait fn-octets) (proxy-split-query (tl-get outer :data))
       (let* ((fn (%decode-function fn-octets))
-             (q (proxy-query-info fn)))
+             (q (progn
+                  (when (tl-is fn "clton.reportVerdict")
+                    (return-from proxy-handle-query-1
+                      (tl-encode (tl-make "clton.verdictAck"
+                                          :known (and (proxy-apply-verdict proxy (tl-get fn :answer) (tl-get fn :accepted)
+                                                                           (tl-get fn :reason))
+                                                      t)))))
+                  (proxy-query-info fn))))
         (proxy-race proxy q wait fn-octets (proxy-history-query-p q) started)))))
 
 ;;; --- lifecycle ----------------------------------------------------------------

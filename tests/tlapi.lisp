@@ -37,8 +37,8 @@ no code with the schema parser."
     (nreverse result)))
 
 (defun %tlapi-equal (a b)
-  (cond ((and (cl-ton:tlapi-obj-p a) (cl-ton:tlapi-obj-p b))
-         (and (string= (cl-ton:tlapi-obj-name a) (cl-ton:tlapi-obj-name b))
+  (cond ((and (cl-ton::tlapi-obj-p a) (cl-ton::tlapi-obj-p b))
+         (and (string= (cl-ton::tlapi-obj-name a) (cl-ton::tlapi-obj-name b))
               (let ((fa (cl-ton::tlapi-obj-fields a)) (fb (cl-ton::tlapi-obj-fields b)))
                 (and (= (length fa) (length fb))
                      (loop for (k v) on fa by #'cddr
@@ -81,12 +81,12 @@ are unordered); lists of non-plists compare element by element."
                                         (incf n)))))
                       n)))
     (check "every non-builtin declaration of the file is in the registry (counted independently)"
-           (= (length (cl-ton:tlapi-constructor-names)) (- (length raw) builtins)))
+           (= (length (cl-ton::tlapi-constructor-names)) (- (length raw) builtins)))
     (check "the function declarations are exactly the registry's functions"
-           (= functions (count-if #'cl-ton:tlapi-function-p (cl-ton:tlapi-constructor-names))))
+           (= functions (count-if #'cl-ton::tlapi-function-p (cl-ton::tlapi-constructor-names))))
     (check "pinned: 220 constructors, 85 functions in this schema revision"
-           (and (= 220 (length (cl-ton:tlapi-constructor-names)))
-                (= 85 (count-if #'cl-ton:tlapi-function-p (cl-ton:tlapi-constructor-names)))))
+           (and (= 220 (length (cl-ton::tlapi-constructor-names)))
+                (= 85 (count-if #'cl-ton::tlapi-function-p (cl-ton::tlapi-constructor-names)))))
     (check "every declaration's fields and class match the raw text (names, order, class)"
            (every (lambda (entry)
                     (let ((con (gethash (car entry) cl-ton::*tlapi-cons*)))
@@ -99,13 +99,13 @@ are unordered); lists of non-plists compare element by element."
                                               collect (subseq tok 0 (position #\: tok)))))))))
                   raw))
     (check "every constructor the application uses today exists, functions as functions"
-           (every (lambda (n) (cl-ton:tlapi-function-p n))
+           (every (lambda (n) (cl-ton::tlapi-function-p n))
                   '("init" "sync" "blocks.getMasterchainInfo" "blocks.getShards" "blocks.getTransactions"
                     "raw.getAccountState" "raw.getTransactions" "raw.sendMessageReturnHash" "smc.load"
                     "smc.runGetMethod" "smc.forget" "smc.getLibraries" "getConfigAll" "getShardAccountCell"
                     "withBlock")))
     (check "...and the data constructors"
-           (every (lambda (n) (and (gethash n cl-ton::*tlapi-cons*) (not (cl-ton:tlapi-function-p n))))
+           (every (lambda (n) (and (gethash n cl-ton::*tlapi-cons*) (not (cl-ton::tlapi-function-p n))))
                   '("options" "config" "keyStoreTypeInMemory" "keyStoreTypeDirectory" "accountAddress"
                     "ton.blockIdExt" "internal.transactionId" "blocks.accountTransactionId" "smc.methodIdName"
                     "tvm.cell" "tvm.slice" "tvm.numberDecimal" "tvm.stackEntrySlice" "tvm.stackEntryNumber"
@@ -173,12 +173,12 @@ are unordered); lists of non-plists compare element by element."
     (check "validate also catches an object mutated after construction"
            (let ((o (cl-ton:tlapi-make "accountAddress" :account-address "EQ00")))
              (setf (getf (cl-ton::tlapi-obj-fields o) :account-address) 42)
-             (%signals error (cl-ton:tlapi-validate o))))))
+             (%signals error (cl-ton::tlapi-validate o))))))
 
 (defun %hand-requests ()
   "The requests tonlib.lisp builds by hand today (same shapes, same literals), as plists."
   (let* ((blk (list :|@type| "ton.blockIdExt" :|workchain| -1 :|shard| "-9223372036854775808" :|seqno| 5
-                    :|root_hash| (cl-ton:base64-encode (%zeros 32)) :|file_hash| (cl-ton:base64-encode (%zeros 32))))
+                    :|root_hash| (cl-ton::base64-encode (%zeros 32)) :|file_hash| (cl-ton::base64-encode (%zeros 32))))
          (acc (list :|@type| "accountAddress" :|account_address| "EQ00")))
     (list
      (cons (list :|@type| "init"
@@ -208,26 +208,26 @@ are unordered); lists of non-plists compare element by element."
      (cons (list :|@type| "getConfigAll" :|mode| 0) (cl-ton:tlapi-make "getConfigAll" :mode 0))
      (cons (list :|@type| "getShardAccountCell" :|account_address| acc)
            (cl-ton:tlapi-make "getShardAccountCell" :account-address (%addr-obj "EQ00")))
-     (cons (list :|@type| "raw.sendMessageReturnHash" :|body| (cl-ton:base64-encode (coerce '(1 2 3) '(vector (unsigned-byte 8)))))
+     (cons (list :|@type| "raw.sendMessageReturnHash" :|body| (cl-ton::base64-encode (coerce '(1 2 3) '(vector (unsigned-byte 8)))))
            (cl-ton:tlapi-make "raw.sendMessageReturnHash" :body (coerce '(1 2 3) '(vector (unsigned-byte 8)))))
      ;; the schema requires private_key:InputKey (inputKeyFake: no key); the application's current
      ;; hand-built request leaves it out and tonlib's JSON parser lets it, the typed form sends it
      (cons (list :|@type| "raw.getTransactions" :|private_key| (list :|@type| "inputKeyFake")
                  :|account_address| acc
                  :|from_transaction_id| (list :|@type| "internal.transactionId" :|lt| "123456789012"
-                                              :|hash| (cl-ton:base64-encode (%zeros 32))))
+                                              :|hash| (cl-ton::base64-encode (%zeros 32))))
            (cl-ton:tlapi-make "raw.getTransactions" :private-key (cl-ton:tlapi-make "inputKeyFake")
                               :account-address (%addr-obj "EQ00")
                               :from-transaction-id (cl-ton:tlapi-make "internal.transactionId" :lt 123456789012 :hash (%zeros 32))))
      (cons (list :|@type| "blocks.getTransactions" :|id| blk :|mode| 135 :|count| 256
                  :|after| (list :|@type| "blocks.accountTransactionId"
-                                :|account| (cl-ton:base64-encode (%zeros 32)) :|lt| "77"))
+                                :|account| (cl-ton::base64-encode (%zeros 32)) :|lt| "77"))
            (cl-ton:tlapi-make "blocks.getTransactions"
                               :id (cl-ton:tlapi-make "ton.blockIdExt" :workchain -1 :shard (- (expt 2 63)) :seqno 5
                                                                       :root-hash (%zeros 32) :file-hash (%zeros 32))
                               :mode 135 :count 256
                               :after (cl-ton:tlapi-make "blocks.accountTransactionId" :account (%zeros 32) :lt 77)))
-     (cons (list :|@type| "smc.getLibraries" :|library_list| (list (cl-ton:base64-encode (%zeros 32))))
+     (cons (list :|@type| "smc.getLibraries" :|library_list| (list (cl-ton::base64-encode (%zeros 32))))
            (cl-ton:tlapi-make "smc.getLibraries" :library-list (list (%zeros 32))))
      (cons (list :|@type| "withBlock" :|id| blk
                  :|function| (list :|@type| "smc.load" :|account_address| acc))
@@ -244,45 +244,45 @@ are unordered); lists of non-plists compare element by element."
   (let ((cases (%hand-requests)))
     (check "typed requests render to the plists the application builds by hand (all shapes, key order aside)"
            (every (lambda (c)
-                    (or (%json-shape-equal (car c) (cl-ton:tlapi->plist (cdr c)))
-                        (progn (format t "    differs: ~S~%        vs ~S~%" (car c) (cl-ton:tlapi->plist (cdr c))) nil)))
+                    (or (%json-shape-equal (car c) (cl-ton::tlapi->plist (cdr c)))
+                        (progn (format t "    differs: ~S~%        vs ~S~%" (car c) (cl-ton::tlapi->plist (cdr c))) nil)))
                   cases))
     (check "...and through real JSON text: encode, parse, decode gives the same typed object"
            (every (lambda (c)
                     (%tlapi-equal (cdr c)
-                                  (cl-ton:json->tlapi (cl-ton::json-decode (cl-ton::json-encode (cl-ton:tlapi->plist (cdr c)))))))
+                                  (cl-ton::json->tlapi (cl-ton::json-decode (cl-ton::json-encode (cl-ton::tlapi->plist (cdr c)))))))
                   cases))
     (check "Bool renders as JSON true/false"
-           (let ((j (cl-ton::json-encode (cl-ton:tlapi->plist
+           (let ((j (cl-ton::json-encode (cl-ton::tlapi->plist
                                           (cl-ton:tlapi-make "config" :config "x" :blockchain-name "" :use-callbacks-for-network t
                                                                       :ignore-cache nil)))))
              (and (search "\"use_callbacks_for_network\":true" j) (search "\"ignore_cache\":false" j)))))
   (check "int64 comes back from a JSON string or a JSON number alike"
          (every (lambda (text)
-                  (= 77 (cl-ton:tlapi-get (cl-ton:json->tlapi (cl-ton::json-decode text)) :lt)))
+                  (= 77 (cl-ton:tlapi-get (cl-ton::json->tlapi (cl-ton::json-decode text)) :lt)))
                 (list (format nil "{\"@type\":\"blocks.accountTransactionId\",\"account\":~S,\"lt\":\"77\"}"
-                              (cl-ton:base64-encode (%zeros 32)))
+                              (cl-ton::base64-encode (%zeros 32)))
                       (format nil "{\"@type\":\"blocks.accountTransactionId\",\"account\":~S,\"lt\":77}"
-                              (cl-ton:base64-encode (%zeros 32))))))
+                              (cl-ton::base64-encode (%zeros 32))))))
   (check "decoding is strict about types: a wrong class, a bad int256 and a typeless object are refused"
-         (flet ((bad (text) (%signals error (cl-ton:json->tlapi (cl-ton::json-decode text)))))
+         (flet ((bad (text) (%signals error (cl-ton::json->tlapi (cl-ton::json-decode text)))))
            (and (bad "{\"@type\":\"raw.getAccountState\",\"account_address\":{\"@type\":\"ok\"}}")
                 (bad (format nil "{\"@type\":\"smc.libraryEntry\",\"hash\":~S,\"data\":\"\"}"
-                             (cl-ton:base64-encode (%zeros 5))))
+                             (cl-ton::base64-encode (%zeros 5))))
                 (bad "{\"lt\":\"1\"}")
                 (bad "{\"@type\":\"no.such.type\"}"))))
   (check "decoding is lenient where tonlib may differ: unknown fields dropped, absent ones stay absent"
-         (let ((o (cl-ton:json->tlapi (cl-ton::json-decode "{\"@type\":\"error\",\"code\":500,\"message\":\"x\",\"@extra\":\"7\",\"future\":1}"))))
+         (let ((o (cl-ton::json->tlapi (cl-ton::json-decode "{\"@type\":\"error\",\"code\":500,\"message\":\"x\",\"@extra\":\"7\",\"future\":1}"))))
            (and (cl-ton:tlapi-is o "error") (= 500 (cl-ton:tlapi-get o :code))
                 (equal "x" (cl-ton:tlapi-get o :message))
                 (null (getf (cl-ton::tlapi-obj-fields o) :future)))))
   (check "tlapi-validate on a lenient decode demands completeness"
-         (let ((o (cl-ton:json->tlapi (cl-ton::json-decode "{\"@type\":\"error\",\"code\":500}"))))
-           (%signals error (cl-ton:tlapi-validate o)))))
+         (let ((o (cl-ton::json->tlapi (cl-ton::json-decode "{\"@type\":\"error\",\"code\":500}"))))
+           (%signals error (cl-ton::tlapi-validate o)))))
 
 (defun %typed-call (tl obj)
   "Send the typed request OBJ to the real tonlib and decode its answer into a typed object."
-  (cl-ton:json->tlapi (cl-ton::tonlib-call tl obj)))
+  (cl-ton::json->tlapi (cl-ton::tonlib-call tl obj)))
 
 (defun test-tlapi-vs-tonlib ()
   (format t "tonlib API: typed requests against the real tonlibjson.so (fakechain)~%")
@@ -298,13 +298,13 @@ are unordered); lists of non-plists compare element by element."
                   (%until (lambda ()
                             (let ((r (%typed-call tl (cl-ton:tlapi-make "blocks.getMasterchainInfo"))))
                               (and (cl-ton:tlapi-is r "blocks.masterchainInfo")
-                                   (cl-ton:tlapi-validate r)
+                                   (cl-ton::tlapi-validate r)
                                    (cl-ton:tlapi-is (cl-ton:tlapi-get r :last) "ton.blockIdExt")
                                    (eql (cl-ton:tlapi-get (cl-ton:tlapi-get r :last) :seqno) (cl-ton::fc-head-seqno fc)))))
                           :seconds 15 :each (lambda () nil)))
            (let ((r (%typed-call tl (cl-ton:tlapi-make "raw.getAccountState" :account-address addr))))
              (check "raw.getAccountState: a complete typed raw.fullAccountState"
-                    (and (cl-ton:tlapi-is r "raw.fullAccountState") (cl-ton:tlapi-validate r)))
+                    (and (cl-ton:tlapi-is r "raw.fullAccountState") (cl-ton::tlapi-validate r)))
              (check "...balance (int64) equals the fakechain's own"
                     (= (cl-ton:tlapi-get r :balance) (cl-ton::fakechain-account-balance fc (wallet-address w))))
              (check "...code and data are octet vectors, last_transaction_id a typed internal.transactionId"
@@ -313,7 +313,7 @@ are unordered); lists of non-plists compare element by element."
                          (cl-ton:tlapi-is (cl-ton:tlapi-get r :last-transaction-id) "internal.transactionId"))))
            (let ((r (%typed-call tl (cl-ton:tlapi-make "getConfigAll" :mode 0))))
              (check "getConfigAll: a typed configInfo carrying a tvm.cell"
-                    (and (cl-ton:tlapi-is r "configInfo") (cl-ton:tlapi-validate r)
+                    (and (cl-ton:tlapi-is r "configInfo") (cl-ton::tlapi-validate r)
                          (cl-ton:tlapi-is (cl-ton:tlapi-get r :config) "tvm.cell")
                          (plusp (length (cl-ton:tlapi-get (cl-ton:tlapi-get r :config) :bytes))))))
            (let* ((loaded (%typed-call tl (cl-ton:tlapi-make "smc.load" :account-address addr)))
@@ -323,7 +323,7 @@ are unordered); lists of non-plists compare element by element."
                                                            :method (cl-ton:tlapi-make "smc.methodIdName" :name "seqno")
                                                            :stack '()))))
                (check "smc.runGetMethod: a typed smc.runResult, exit code 0, one typed stack number = 0"
-                      (and (cl-ton:tlapi-is run "smc.runResult") (cl-ton:tlapi-validate run)
+                      (and (cl-ton:tlapi-is run "smc.runResult") (cl-ton::tlapi-validate run)
                            (eql 0 (cl-ton:tlapi-get run :exit-code))
                            (= 1 (length (cl-ton:tlapi-get run :stack)))
                            (let ((e (first (cl-ton:tlapi-get run :stack))))
@@ -358,7 +358,7 @@ are unordered); lists of non-plists compare element by element."
                                                 :from-transaction-id
                                                 (cl-ton:tlapi-get (%typed-call tl (cl-ton:tlapi-make "raw.getAccountState" :account-address addr))
                                                                   :last-transaction-id)))))
-                      (every #'cl-ton:tlapi-validate (cl-ton:tlapi-get txs :transactions)))))
+                      (every #'cl-ton::tlapi-validate (cl-ton:tlapi-get txs :transactions)))))
            (check "an error answer surfaces as the library's own error, naming the failing request"
                   (%signals error (%typed-call tl (cl-ton:tlapi-make "smc.forget" :id 99999999)))))))))
 
@@ -452,12 +452,13 @@ the `#id` of an explicit-id declaration removed from the name."
 
 (defun test-tl-schema-is-the-vendored-files ()
   (format t "binary TL schema: the registry is exactly lite_api.tl + ton_api.tl~%")
-  (let* ((vendored (remove-duplicates (append (%vendored-names "ton_api.tl") (%vendored-names "lite_api.tl"))
+  (let* ((vendored (remove-duplicates (append (%vendored-names "ton_api.tl") (%vendored-names "lite_api.tl")
+                                              (%vendored-names "cl_ton_api.tl"))
                                       :test #'equal))
          (names (remove-duplicates (mapcar #'car vendored) :test #'string=)))
     (check "the vendored schema files are the pinned revision (sha256)"
            (every (lambda (pin)
-                    (let ((actual (cl-ton:octets->hex (cl-ton:sha256 (%slurp (%tl-file (car pin)))))))
+                    (let ((actual (cl-ton::octets->hex (cl-ton::sha256 (%slurp (%tl-file (car pin)))))))
                       (or (string-equal actual (cdr pin))
                           (progn (format t "    ~A is ~A~%" (car pin) actual) nil))))
                   *vendored-schema-sha256*))

@@ -164,8 +164,9 @@ checksum check here: the loader does those when the file is used).  Never signal
         (when (or (adnl-ext-client-stop-p client) (>= (get-internal-real-time) limit)) (return nil))
         (sleep 0.05)))
 
-(defun lite-call (client request &key (timeout 8) wait-seqno (wait-timeout 8) (retry t) (deadline (* 3 timeout)))
-  "Send the TL function object REQUEST and return the decoded answer; liteServer.error signals
+(defun %lite-call-raw (client request &key (timeout 8) wait-seqno (wait-timeout 8) (retry t) (deadline (* 3 timeout)))
+  "As LITE-CALL, but returns (VALUES ANSWER RAW): RAW is the answer's payload exactly as the server sent it.
+Send the TL function object REQUEST and return the decoded answer; liteServer.error signals
 LITE-ERROR.  The session reconnects by itself: with RETRY true (the default) a query that finds the
 session down, loses it, or gets no answer within TIMEOUT is sent again once it is back, until
 DEADLINE seconds have passed in all, then the ADNL condition is signalled.  RETRY :NOT-READY retries
@@ -188,8 +189,10 @@ waitMasterchainSeqno prefix); the answer is then at least that fresh, but still 
          (attempt-timeout (if wait-seqno (+ timeout wait-timeout) timeout))
          (payload (tl-encode (tl-make "liteServer.query" :data data))))
     (loop
-      (let ((answer
-              (handler-case (tl-decode (adnl-ext-client-send-query adnl payload attempt-timeout))
+      (let* ((raw nil)
+             (answer
+              (handler-case (progn (setf raw (adnl-ext-client-send-query adnl payload attempt-timeout))
+                                   (tl-decode raw))
                 (adnl-not-ready (e)
                   (unless (and retry (%lite-await-ready adnl limit)) (error e))
                   nil)
@@ -213,10 +216,54 @@ waitMasterchainSeqno prefix); the answer is then at least that fresh, but still 
             (error 'lite-error :code (tl-get answer :code)
                                :format-control "liteserver error ~D: ~A"
                                :format-arguments (list (tl-get answer :code) (tl-get answer :message))))
-          (return answer))
+          (return (values answer raw)))
         (when (>= (get-internal-real-time) limit)
           (error 'adnl-timeout :format-control "no answer within the ~As deadline"
                                :format-arguments (list deadline)))))))
+
+(defun lite-call (client request &rest keys &key timeout wait-seqno wait-timeout retry deadline)
+  "Send the TL function object REQUEST and return the decoded answer (see %LITE-CALL-RAW for the keys)."
+  (declare (ignore timeout wait-seqno wait-timeout retry deadline))
+  (values (apply #'%lite-call-raw client request keys)))
+
+;;; --- verdicts: telling the proxy which answer did not verify ------------------------------------------------------------
+;;;
+;;; The proxy remembers which upstream produced each answer (by the SHA-256 of its payload).  When an answer does not verify the
+;;; client reports it (clton.reportVerdict): the proxy bans that upstream for a while and the retry goes to another one.  A
+;;; server that is not a clton proxy (a liteserver reached directly, the released proxy-liteserver) answers an error or nothing:
+;;; the report is best effort and its failure is ignored.
+
+(defvar *lite-report-accepted* nil
+  "True: also report the answers that verified (clton.reportVerdict accepted).  Off by default: it doubles the traffic and
+the proxy needs nothing of it to judge an upstream.")
+
+(defun lite-report-verdict (client raw accepted reason)
+  "Tell the proxy the answer whose payload was RAW verified (ACCEPTED) or did not (REASON says why).  True when the proxy knew
+the answer; never signals."
+  (handler-case
+      (let* ((report (tl-make "clton.reportVerdict" :answer (sha256 raw) :accepted (and accepted t)
+                                                    :reason (subseq (or reason "") 0 (min 200 (length (or reason ""))))))
+             (payload (tl-encode (tl-make "liteServer.query" :data (tl-encode report))))
+             (reply (tl-decode (adnl-ext-client-send-query (lite-client-adnl client) payload 2))))
+        (and (tl-is reply "clton.verdictAck") (tl-get reply :known)))
+    (error () nil)))
+
+(defun lite-call-verified (client request verify &rest keys &key timeout wait-seqno wait-timeout retry deadline)
+  "Send REQUEST (as LITE-CALL), then call VERIFY with the answer: (VALUES (funcall VERIFY ANSWER) ANSWER).  When VERIFY signals
+a PROOF-ERROR the answer is reported to the proxy as rejected and the request is sent once more (the proxy then avoids the
+upstream that gave the bad answer); a second failure is signalled."
+  (declare (ignore timeout wait-seqno wait-timeout retry deadline))
+  (let ((failed nil))
+    (loop
+      (multiple-value-bind (answer raw) (apply #'%lite-call-raw client request keys)
+        (handler-case
+            (let ((result (funcall verify answer)))
+              (when *lite-report-accepted* (lite-report-verdict client raw t nil))
+              (return (values result answer)))
+          (proof-error (e)
+            (lite-report-verdict client raw nil (remove #\Newline (princ-to-string e)))
+            (when failed (error e))
+            (setf failed t)))))))
 
 (defun %lite-commit-key (client key key-state-hash)
   "Remember KEY, a key block just proved, as the newest one -- also as the head when it is newer than the
@@ -340,23 +387,33 @@ be of the chain CLIENT trusts -- LITE-PROVE-BLOCK, once per block -- and returne
 
 (defun lite-account-state (client address &key block)
   "The state of ADDRESS at the newest proved masterchain block -- or at BLOCK, a masterchain block id at or
-below it (proved first: %LITE-PINNED) -- checked by VERIFY-ACCOUNT-STATE."
-  (let* ((trusted (if block (%lite-pinned client block) (lite-sync client)))
-         (answer (lite-call client (tl-make "liteServer.getAccountState" :id trusted
-                                                                         :account (%lite-account-id address)))))
-    (verify-account-state answer address trusted)))
+below it (proved first: %LITE-PINNED) -- checked by VERIFY-ACCOUNT-STATE.  The result is that function's plist with
+the clton.Proof of the answer as :PROOF in front."
+  (let ((trusted (if block (%lite-pinned client block) (lite-sync client))))
+    (multiple-value-bind (verified answer)
+        (lite-call-verified client (tl-make "liteServer.getAccountState" :id trusted :account (%lite-account-id address))
+                            (lambda (answer) (verify-account-state answer address trusted)))
+      (list* :proof (make-account-state-proof trusted address answer) verified))))
 
-(defun lite-transactions (client address &key (count 10))
+(defun lite-transactions (client address &key (count 10) from-lt from-hash)
   "Up to COUNT of the newest transactions of ADDRESS, newest first, chained to its proved last
-transaction by VERIFY-TRANSACTION-LIST (see its result: :TRANSACTIONS :NEXT-LT :NEXT-HASH :COMPLETE)."
-  (let ((state (lite-account-state client address)))
-    (if (not (getf state :exists))
-        (list :transactions '() :next-lt 0 :next-hash nil :complete t)
-        (let ((lt (getf state :last-trans-lt)) (hash (getf state :last-trans-hash)))
-          (verify-transaction-list
-           (lite-call client (tl-make "liteServer.getTransactions" :count count :account (%lite-account-id address)
-                                                                   :lt lt :hash hash))
-           address lt hash :count count)))))
+transaction by VERIFY-TRANSACTION-LIST (see its result: :TRANSACTIONS :NEXT-LT :NEXT-HASH :COMPLETE).  With FROM-LT and
+FROM-HASH (the transaction id of a transaction the caller trusts) the list starts there instead.  The result is that plist
+with the clton.Proof of the answer as :PROOF in front (NIL for an account that does not exist)."
+  (let ((named (and from-lt from-hash)))
+    (when named (lite-sync client))
+    (let ((state (unless named (lite-account-state client address))))
+      (if (and (not named) (not (getf state :exists)))
+          (list :proof nil :transactions '() :next-lt 0 :next-hash nil :complete t)
+          (let* ((lt (if named from-lt (getf state :last-trans-lt)))
+                 (hash (if named from-hash (getf state :last-trans-hash)))
+                 (request (tl-make "liteServer.getTransactions" :count count :account (%lite-account-id address)
+                                                                :lt lt :hash hash)))
+            (multiple-value-bind (result answer)
+                (lite-call-verified client request
+                                    (lambda (answer) (verify-transaction-list answer address lt hash :count count)))
+              (list* :proof (make-transactions-proof address lt hash count (and state (list (getf state :proof))) answer)
+                     result)))))))
 
 (defun lite-run-get-method (client address method stack &rest options &key block &allow-other-keys)
   "Run the getter METHOD on the proved state of ADDRESS (see RUN-ACCOUNT-GET-METHOD for STACK and
@@ -390,20 +447,22 @@ liteserver did not accept it.  Whether it ever lands in a block is for the calle
 (defun lite-shards (client)
   "The shard blocks the newest proved masterchain block refers to (see VERIFY-ALL-SHARDS-INFO): the
 masterchain block id as :MC-BLOCK and the list of shard plists as :SHARDS."
-  (let* ((trusted (lite-sync client))
-         (answer (lite-call client (tl-make "liteServer.getAllShardsInfo" :id trusted))))
-    (list :mc-block trusted :shards (getf (verify-all-shards-info answer trusted) :shards))))
+  (let ((trusted (lite-sync client)))
+    (list :mc-block trusted
+          :shards (getf (lite-call-verified client (tl-make "liteServer.getAllShardsInfo" :id trusted)
+                                            (lambda (answer) (verify-all-shards-info answer trusted)))
+                        :shards))))
 
 (defun lite-shard-info (client workchain shard &key exact)
   "The shard block the newest proved masterchain block names for SHARD (a 64-bit shard id, signed or
 not) of WORKCHAIN -- with EXACT only a block of that very shard -- checked by VERIFY-SHARD-INFO: a plist
 (:FOUND :SHARD-BLOCK :SHARD :SEQNO :ROOT-HASH :FILE-HASH); :FOUND NIL when the proof shows there is none."
-  (let* ((trusted (lite-sync client))
-         (answer (lite-call client (tl-make "liteServer.getShardInfo"
-                                            :id trusted :workchain workchain
-                                            :shard (if (>= shard (expt 2 63)) (- shard (expt 2 64)) shard)
-                                            :exact (and exact t)))))
-    (verify-shard-info answer trusted workchain shard :exact exact)))
+  (let ((trusted (lite-sync client)))
+    (values (lite-call-verified client (tl-make "liteServer.getShardInfo"
+                                                :id trusted :workchain workchain
+                                                :shard (if (>= shard (expt 2 63)) (- shard (expt 2 64)) shard)
+                                                :exact (and exact t))
+                                (lambda (answer) (verify-shard-info answer trusted workchain shard :exact exact))))))
 
 (defun %lite-unsupported-p (condition)
   "A liteserver that does not know the request answers error -400 (this fakechain: 400)."
@@ -493,7 +552,7 @@ what the client trusts."
   "The public libraries of the masterchain among HASHES (32-octet cell hashes; the node answers the first
 16), with the proof that the newest proved masterchain state publishes them, checked by
 VERIFY-LIBRARIES-WITH-PROOF: a list of (HASH . CELL)."
-  (let* ((trusted (lite-sync client))
-         (answer (lite-call client (tl-make "liteServer.getLibrariesWithProof" :id trusted :mode 1
-                                                                                :library-list (coerce hashes 'vector)))))
-    (verify-libraries-with-proof answer trusted hashes :mode 1)))
+  (let ((trusted (lite-sync client)))
+    (values (lite-call-verified client (tl-make "liteServer.getLibrariesWithProof" :id trusted :mode 1
+                                                                                    :library-list (coerce hashes 'vector))
+                                (lambda (answer) (verify-libraries-with-proof answer trusted hashes :mode 1))))))

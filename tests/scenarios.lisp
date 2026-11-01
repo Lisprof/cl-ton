@@ -227,7 +227,7 @@ emulator computed."
                   (%until
                    (lambda ()
                      (let* ((blk (cl-ton::fc-head fc))
-                            (id (cl-ton:make-block-id :workchain 0 :shard (- (expt 2 63)) :seqno (cl-ton::fc-block-seqno blk)
+                            (id (cl-ton::make-block-id :workchain 0 :shard (- (expt 2 63)) :seqno (cl-ton::fc-block-seqno blk)
                                                 :root-hash (cl-ton::fc-block-sh-root blk)
                                                 :file-hash (cl-ton::fc-block-sh-file blk))))
                        (some (lambda (x) (declare (ignore x)) t)
@@ -799,16 +799,16 @@ sockets every DROP-EVERY chunks."
                (setf proxy (cl-ton::open-proxy-liteserver :implementation :native :global-config cfg
                                                           :db (format nil "~Aproxy/" dir)))
                (check "flaky links: both relayed upstreams come up"
-                      (cl-ton:proxy-wait-ready proxy :timeout (%scaled 20)))
+                      (cl-ton::proxy-wait-ready proxy :timeout (%scaled 20)))
                (setf tl (cl-ton::open-tonlib-via-proxy proxy cfg :library-path lib :sync nil))
-               (let ((seqno (cl-ton:tonlib-sync tl :timeout (%scaled 60) :total-timeout (%scaled 120)
-                                                   :progress (cl-ton:proxy-progress-function proxy))))
+               (let ((seqno (cl-ton::tonlib-sync tl :timeout (%scaled 60) :total-timeout (%scaled 120)
+                                                   :progress (cl-ton::proxy-progress-function proxy))))
                  (check "flaky links: tonlib synchronises through them" (and seqno (>= seqno 3))))
                (let ((ok 0) (bad 0)
                      (addr (cl-ton:parse-address "0:1111111111111111111111111111111111111111111111111111111111111111")))
                  (dotimes (i 25)
                    (handler-case
-                       (progn (cl-ton::retrying (lambda () (cl-ton:tonlib-account-state tl addr))
+                       (progn (cl-ton::retrying (lambda () (cl-ton::tonlib-account-state tl addr))
                                                 :attempts 4 :delay 0.2)
                               (incf ok))
                      (error () (incf bad))))
@@ -820,7 +820,7 @@ sockets every DROP-EVERY chunks."
                                     (zerop (+ (chaos-relay-dropped r1) (chaos-relay-dropped r2))))
                          do (incf extra)
                             (handler-case
-                                (progn (cl-ton::retrying (lambda () (cl-ton:tonlib-account-state tl addr))
+                                (progn (cl-ton::retrying (lambda () (cl-ton::tonlib-account-state tl addr))
                                                          :attempts 4 :delay 0.2)
                                        (incf ok))
                               (error () (incf bad)))))
@@ -834,7 +834,7 @@ sockets every DROP-EVERY chunks."
                  ;; instead of sampling the counters at the very instant of the drop.
                  (check "flaky links: the proxy saw them (a lost session or a failover, then recovery)"
                         (loop repeat (ceiling (* 50 (%scaled 5)))
-                              do (let ((d (cl-ton:proxy-diagnostics proxy)))
+                              do (let ((d (cl-ton::proxy-diagnostics proxy)))
                                    (when (or (plusp (reduce #'+ (getf d :upstreams)
                                                             :key (lambda (u) (getf u :failures))))
                                              (plusp (or (cl-ton::proxy-stat-value
@@ -843,9 +843,9 @@ sockets every DROP-EVERY chunks."
                                  (sleep 0.02)
                               finally (return nil)))
                  (check "flaky links: at the end the proxy still has a working upstream"
-                        (cl-ton:proxy-wait-ready proxy :timeout (%scaled 20)))
+                        (cl-ton::proxy-wait-ready proxy :timeout (%scaled 20)))
                  (check "flaky links: the network summary has an opinion (answers were measured)"
-                        (multiple-value-bind (k) (cl-ton:proxy-network-summary proxy)
+                        (multiple-value-bind (k) (cl-ton::proxy-network-summary proxy)
                           (member k '(:fast :ok :slow :unknown))))))
           (ignore-errors (when tl (cl-ton::close-tonlib tl)))
           (ignore-errors (when proxy (cl-ton::close-proxy-liteserver proxy)))

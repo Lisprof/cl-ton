@@ -68,7 +68,10 @@ ids -- one pass over the library."
     (if so
         (let* ((found (%ids-in-so so))
                (absent (sort (loop for name being the hash-keys of cl-ton::*tl-by-name* using (hash-value con)
-                                   unless (gethash (cl-ton::tl-con-id con) found) collect name)
+                                   ;; cl-ton's own objects (clton.*) are not tonlib's: they are not in its binary
+                                   unless (or (gethash (cl-ton::tl-con-id con) found)
+                                              (and (> (length name) 6) (string= "clton." name :end2 6)))
+                                     collect name)
                              #'string<)))
           (check (format nil "~D of the ~D schema ids occur in tonlibjson.so; the absent ones are exactly the ~D tonlib never parses (differences: ~S)"
                          (- (hash-table-count cl-ton::*tl-by-name*) (length absent))

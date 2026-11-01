@@ -756,7 +756,16 @@
     "liteServer.nonfinal.getPendingShardBlocks mode:# wc:mode.0?int shard:mode.0?long = liteServer.nonfinal.PendingShardBlocks"
     "liteServer.queryPrefix = Object"
     "liteServer.query data:bytes = Object"
-    "liteServer.waitMasterchainSeqno seqno:int timeout_ms:int = Object"))
+    "liteServer.waitMasterchainSeqno seqno:int timeout_ms:int = Object"
+    "clton.proofAccountState trusted:tonNode.blockIdExt workchain:int account:int256 answer:liteServer.AccountState = clton.Proof"
+    "clton.proofAllShards block:tonNode.blockIdExt answer:liteServer.AllShardsInfo = clton.Proof"
+    "clton.proofConfig trusted:tonNode.blockIdExt answer:liteServer.ConfigInfo = clton.Proof"
+    "clton.proofTransactions workchain:int account:int256 lt:long hash:int256 count:int states:(vector clton.Proof) answer:liteServer.TransactionList = clton.Proof"
+    "clton.blockTransactionsPage count:int answer:liteServer.BlockTransactions = clton.BlockTransactionsPage"
+    "clton.proofBlockTransactions block:tonNode.blockIdExt reverse:Bool pages:(vector clton.BlockTransactionsPage) = clton.Proof"
+    "clton.proofRunMethod state:clton.Proof config:clton.Proof libraries:(vector bytes) = clton.Proof"
+    "clton.reportVerdict answer:int256 accepted:Bool reason:string = clton.Verdict"
+    "clton.verdictAck known:Bool = clton.Verdict"))
 
 (dolist (declaration *tl-schema-texts*)
   (tl-register declaration))

@@ -164,12 +164,15 @@ is loaded (the test build); empty in the lean build, which reads the chain throu
   (or (getf *tonlib-oracle* key)
       (ton-error "the JSON tonlib (~(~A~)) is a test oracle and is not part of this build: use the :lite chain backend" key)))
 
-(defgeneric tonlib-json-op (tl op &key &allow-other-keys)
-  (:documentation "One operation (OP, a keyword, with keyword arguments) of the JSON tonlib client TL.  The methods are
-in tests/tonlib-oracle.lisp; without them this default signals the error above.")
-  (:method (tl op &key &allow-other-keys)
-    (declare (ignore tl))
-    (tonlib-oracle op)))
+(defvar *tonlib-oracle-ops* (make-hash-table :test 'eq)
+  "Operation keyword -> function (TL &KEY ...), registered by tests/tonlib-oracle.lisp; empty in the lean build.")
+
+(defun tonlib-json-op (tl op &rest arguments)
+  "Run the operation OP (a keyword) of the JSON tonlib client TL with the keyword ARGUMENTS.  The operations are the test
+oracle's (tests/tonlib-oracle.lisp); without it this signals the error of TONLIB-ORACLE."
+  (let ((function (gethash op *tonlib-oracle-ops*)))
+    (unless function (tonlib-oracle op))
+    (apply function tl arguments)))
 
 (defun close-tonlib (tl)
   "Close a chain client: the lite client here, the JSON tonlib through the oracle."

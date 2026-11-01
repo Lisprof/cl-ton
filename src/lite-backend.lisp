@@ -43,19 +43,27 @@
                                         (:active :active) (:frozen :frozen) (t :uninit))
                               :sync-utime 0)))))
 
-(defun lite-backend-config-cell (lc &optional block)
-  "As TONLIB-CONFIG-CELL: the whole configuration dictionary, proved against the trusted block (or BLOCK, a pinned
-one).  The configuration of a block never changes, so the last one fetched is kept: the observe mode reads a dozen
-pools at one pinned block and asks for it once."
+(defun lite-backend-config-with-proof (lc &optional block)
+  "(VALUES CELL PROOF): the whole configuration dictionary, proved against the trusted block (or BLOCK, a pinned one),
+and the clton.proofConfig it was verified against.  The configuration of a block never changes, so the last one fetched
+is kept with its proof: the observe mode reads a dozen pools at one pinned block and asks for it once."
   (let* ((trusted (if block (%lite-pinned lc block) (lite-sync lc)))
          (key (list (tl-get trusted :seqno) (tl-get trusted :root-hash)))
          (cached (sb-thread:with-mutex ((lite-client-lock lc)) (lite-client-config-cache lc))))
     (if (and cached (equalp key (car cached)))
-        (cdr cached)
-        (let* ((answer (lite-call lc (tl-make "liteServer.getConfigAll" :mode 0 :id trusted)))
-               (cell (getf (verify-config-info answer trusted :all t) :config-root)))
-          (sb-thread:with-mutex ((lite-client-lock lc)) (setf (lite-client-config-cache lc) (cons key cell)))
-          cell))))
+        (values (cadr cached) (cddr cached))      ; the cache is (KEY CELL . PROOF)
+        (let* ((cell nil)
+               (answer (nth-value 1 (lite-call-verified
+                                     lc (tl-make "liteServer.getConfigAll" :mode 0 :id trusted)
+                                     (lambda (answer)
+                                       (setf cell (getf (verify-config-info answer trusted :all t) :config-root))))))
+               (proof (make-config-proof trusted answer)))
+          (sb-thread:with-mutex ((lite-client-lock lc)) (setf (lite-client-config-cache lc) (list* key cell proof)))
+          (values cell proof)))))
+
+(defun lite-backend-config-cell (lc &optional block)
+  "As TONLIB-CONFIG-CELL: the whole configuration dictionary, proved against the trusted block (or BLOCK, a pinned one)."
+  (values (lite-backend-config-with-proof lc block)))
 
 (defun lite-backend-shard-account-cell (lc addr)
   "As TONLIB-SHARD-ACCOUNT-CELL: the ShardAccount cell (the proved account, its last transaction's
@@ -91,6 +99,19 @@ own hash, so what was proved once stays right.  Signals when a node does not pub
             (sb-thread:with-mutex ((lite-client-lock lc)) (setf (gethash h (lite-client-libraries lc)) (cdr hit)))))))
     (loop for h in hashes
           collect (cons h (sb-thread:with-mutex ((lite-client-lock lc)) (gethash h (lite-client-libraries lc)))))))
+
+(defun lite-backend-run-with-proof (lc state method stack block)
+  "Run getter METHOD (a name or a method id) with STACK on STATE, a LITE-ACCOUNT-STATE plist (read at BLOCK, a pinned masterchain
+block id, or at the head when BLOCK is NIL): (VALUES ITEMS EXIT-CODE GAS-USED PROOF), the getter run in the emulator on the
+PROVED state with the configuration of that block and the public libraries the code or data refer to; PROOF is the
+clton.proofRunMethod of those inputs."
+  (let* ((account (and (getf state :exists) (parse-account (getf state :account-cell))))
+         (hashes (and account (collect-library-hashes (getf account :code) (getf account :data))))
+         (libraries (and hashes (lite-backend-libraries-for lc hashes))))
+    (multiple-value-bind (config config-proof) (lite-backend-config-with-proof lc block)
+      (multiple-value-bind (items exit-code gas)
+          (run-account-get-method (getf state :account-cell) method stack :config config :libraries libraries)
+        (values items exit-code gas (make-run-proof (getf state :proof) config-proof libraries))))))
 
 (defvar *getter-log* nil
   "NIL, or a cons whose CAR collects (ADDRESS METHOD STACK ITEMS EXIT-CODE BLOCK) of every getter LITE-BACKEND-RUN-GET-METHOD
@@ -253,33 +274,39 @@ minus the storage fee.  \"data\" is the transaction cell as a BoC (tonlib's byte
                                                     :in-msg (and in-cell (%message-raw in-cell))
                                                     :out-msgs out-msgs))))))))))))))))
 
+(defun lite-backend-transactions-with-proof (lc addr &key from-lt from-hash)
+  "As TONLIB-TRANSACTIONS, with more: (VALUES TRANSACTIONS NEXT-LT NEXT-HASH PROOF).  TRANSACTIONS are typed raw.transaction
+objects newest first, from the given transaction id (default: the account's latest), each proved by the hash chain from the
+account's proved state; NEXT-LT and NEXT-HASH name the transaction to continue with (0 and 32 zero octets when the list
+reached the account's first); PROOF is the clton.Proof of the list (NIL for an account that does not exist)."
+  (let ((r (lite-transactions lc addr :count 16 :from-lt from-lt :from-hash from-hash)))
+    (values (mapcar (lambda (tx) (%transaction-raw addr (getf tx :cell))) (getf r :transactions))
+            (or (getf r :next-lt) 0)
+            (or (getf r :next-hash) (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0))
+            (getf r :proof))))
+
 (defun lite-backend-transactions (lc addr &key from-lt from-hash)
   "As TONLIB-TRANSACTIONS: typed raw.transaction objects newest first, from the given transaction id
 (default: the account's latest), each proved by the hash chain from the account's proved state."
-  (let ((count 16))
-    (if (and from-lt from-hash)
-        (let* ((trusted (lite-sync lc))
-               (result (verify-transaction-list
-                        (lite-call lc (tl-make "liteServer.getTransactions" :count count :account (%lite-account-id addr)
-                                                                            :lt from-lt :hash from-hash))
-                        addr from-lt from-hash :count count)))
-          (declare (ignore trusted))
-          (mapcar (lambda (tx) (%transaction-raw addr (getf tx :cell))) (getf result :transactions)))
-        (let ((r (lite-transactions lc addr :count count)))
-          (mapcar (lambda (tx) (%transaction-raw addr (getf tx :cell))) (getf r :transactions))))))
+  (values (lite-backend-transactions-with-proof lc addr :from-lt from-lt :from-hash from-hash)))
 
 (defun lite-backend-shards (lc block &key timeout)
-  "As TONLIB-SHARDS: the workchain shard blocks (typed ton.blockIdExt) the masterchain block BLOCK names.
-BLOCK is the newest proved head, or an older masterchain block, which is first proved from it."
+  "As TONLIB-SHARDS: the workchain shard blocks (typed ton.blockIdExt) the masterchain block BLOCK names, and as a second
+value the clton.proofAllShards they were verified against.  BLOCK is the newest proved head, or an older masterchain
+block, which is first proved from it."
   (declare (ignore timeout))
   (let* ((id (tlapi->lite-block-id block))
          (head (lite-sync lc)))
     (unless (%same-block-id-p id head) (lite-prove-block lc id))
-    (let ((answer (lite-call lc (tl-make "liteServer.getAllShardsInfo" :id id))))
-      (mapcar (lambda (s) (lite-block-id->tlapi
-                           (tl-block-id-ext :workchain (getf s :workchain) :shard (getf s :shard) :seqno (getf s :seqno)
-                                            :root-hash (getf s :root-hash) :file-hash (getf s :file-hash))))
-              (getf (verify-all-shards-info answer id) :shards)))))
+    (multiple-value-bind (verified answer)
+        (lite-call-verified lc (tl-make "liteServer.getAllShardsInfo" :id id)
+                            (lambda (answer) (verify-all-shards-info answer id)))
+      (values (mapcar (lambda (s) (lite-block-id->tlapi
+                                   (tl-block-id-ext :workchain (getf s :workchain) :shard (getf s :shard)
+                                                    :seqno (getf s :seqno)
+                                                    :root-hash (getf s :root-hash) :file-hash (getf s :file-hash))))
+                      (getf verified :shards))
+              (make-all-shards-proof id answer)))))
 
 (defun %lite-trust-block (lc id)
   "Make sure the block ID (a blockIdExt) is one of the trusted chain: the head's masterchain block, one of
@@ -301,6 +328,35 @@ the head's shard blocks, or (proved by a block lookup) any other."
         (ton-error "block ~D of workchain ~D is not part of the chain this client trusts"
                    (tl-get id :seqno) (tl-get id :workchain)))))
 
+(defun lite-backend-block-page (lc block mode count after &key trusted)
+  "ONE page of the transactions of BLOCK as tonlib's blocks.getTransactions answers it: (VALUES SHORT-TX-IDS INCOMPLETE PROOF),
+the ids typed blocks.shortTxId (carrying MODE), up to COUNT of them after AFTER (a blocks.accountTransactionId, used when MODE
+has the bit 128), PROOF the clton.proofBlockTransactions.  Each id is proved to be in the block.  TRUSTED true when the
+caller already made sure BLOCK belongs to the trusted chain (%LITE-TRUST-BLOCK)."
+  (let ((id (tlapi->lite-block-id block)))
+    (unless trusted (%lite-trust-block lc id))
+    (let* ((count (min count 256))
+           (req (apply #'tl-make "liteServer.listBlockTransactions"
+                       :id id :mode (logior mode 32) :count count
+                       (and after (logtest mode 128)
+                            (list :after (tl-make "liteServer.transactionId3"
+                                                  :account (short-tx-account after)
+                                                  :lt (short-tx-lt after))))))
+           (reverse (logtest mode 64))
+           (answer nil)
+           (result (multiple-value-bind (verified a)
+                       (lite-call-verified lc req (lambda (a) (verify-block-transactions a id :count count :reverse reverse)))
+                     (setf answer a)
+                     verified)))
+      (values (mapcar (lambda (tx)
+                        (tlapi-make "blocks.shortTxId" :mode mode
+                                                       :account (coerce (getf tx :account) 'tl-octets)
+                                                       :lt (getf tx :lt)
+                                                       :hash (coerce (getf tx :hash) 'tl-octets)))
+                      (getf result :transactions))
+              (getf result :incomplete)
+              (make-block-transactions-proof id reverse (list (cons count answer)))))))
+
 (defun lite-backend-block-transactions (lc block &key (count 40) timeout)
   "As TONLIB-BLOCK-TRANSACTIONS: up to COUNT short transaction ids (typed blocks.shortTxId) of a block, NIL COUNT
 following the pagination to the end.  Each is proved to be in the block."
@@ -310,19 +366,8 @@ following the pagination to the end.  Each is proved to be in the block."
     (collect-block-transactions
      (lambda (block-ignored mode count after)
        (declare (ignore block-ignored))
-       (let* ((req (apply #'tl-make "liteServer.listBlockTransactions"
-                          :id id :mode (logior mode 32) :count count
-                          (and after (list :after (tl-make "liteServer.transactionId3"
-                                                           :account (short-tx-account after)
-                                                           :lt (short-tx-lt after))))))
-              (result (verify-block-transactions (lite-call lc req) id :count count)))
-         (values (mapcar (lambda (tx)
-                           (tlapi-make "blocks.shortTxId" :mode mode
-                                                          :account (coerce (getf tx :account) 'tl-octets)
-                                                          :lt (getf tx :lt)
-                                                          :hash (coerce (getf tx :hash) 'tl-octets)))
-                         (getf result :transactions))
-                 (getf result :incomplete))))
+       (multiple-value-bind (ids incomplete) (lite-backend-block-page lc block mode count after :trusted t)
+         (values ids incomplete)))
      id count)))
 
 ;;; --- opening a lite client from a global config ------------------------------------------------------
