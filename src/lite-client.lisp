@@ -14,7 +14,7 @@
   (:documentation "The liteserver answered with liteServer.error."))
 
 (defstruct (lite-client (:constructor %make-lite-client) (:copier nil))
-  adnl                                  ; the ADNL-EXT-CLIENT
+  adnl                                  ; the transport: an ADNL-EXT-CLIENT (one liteserver) or an UPSTREAM-POOL (several)
   anchor                                ; the trusted block id the client started from
   trusted                               ; the newest masterchain block id proved so far (the head)
   key-block                             ; the newest KEY block proved: where the next sync starts from
@@ -35,8 +35,15 @@ the newest key block proved is kept there and read back by the next client with 
 so a restart does not walk the whole chain again (see %LITE-LOAD-STATE for what is checked).
 With HEAD-SLACK (a number of masterchain blocks) LITE-SYNC refuses a head that lags the newest block
 the liteserver reports by more than that: some upstreams answer getBlockProof with a long stale head."
-  (let ((client (%make-lite-client :adnl (open-adnl-ext-client host port server-public :name name)
-                                   :anchor anchor :trusted anchor :key-block anchor
+  (%init-lite-client (open-adnl-ext-client host port server-public :name name) anchor state-file head-slack))
+
+(defun open-lite-client-pool (pool anchor &key state-file head-slack)
+  "A client that talks to the liteservers of the UPSTREAM-POOL POOL (see OPEN-UPSTREAM-POOL) and trusts the block ANCHOR and nothing
+else yet; the keys are those of OPEN-LITE-CLIENT.  CLOSE-LITE-CLIENT closes the pool."
+  (%init-lite-client pool anchor state-file head-slack))
+
+(defun %init-lite-client (transport anchor state-file head-slack)
+  (let ((client (%make-lite-client :adnl transport :anchor anchor :trusted anchor :key-block anchor
                                    :state-file state-file :head-slack head-slack)))
     (when state-file
       (multiple-value-bind (key state-hash) (%lite-load-state state-file anchor)
@@ -156,12 +163,24 @@ checksum check here: the loader does those when the file is used).  Never signal
             (error (e) (adnl-log "lite client: state not saved: ~A" e))))))))
 
 (defun close-lite-client (client)
-  (close-adnl-ext-client (lite-client-adnl client)))
+  (let ((transport (lite-client-adnl client)))
+    (if (upstream-pool-p transport) (close-upstream-pool transport) (close-adnl-ext-client transport))))
 
-(defun %lite-await-ready (client limit)
-  "Wait until CLIENT's session is up or the internal real time LIMIT passes; true when it is up."
-  (loop (when (adnl-ext-client-alive-p client) (return t))
-        (when (or (adnl-ext-client-stop-p client) (>= (get-internal-real-time) limit)) (return nil))
+(defun %lite-transport-alive-p (transport)
+  (if (upstream-pool-p transport) (upstream-pool-alive-p transport) (adnl-ext-client-alive-p transport)))
+
+(defun %lite-transport-stopped-p (transport)
+  (if (upstream-pool-p transport) (upstream-pool-stopped transport) (adnl-ext-client-stop-p transport)))
+
+(defun %lite-send (transport payload timeout)
+  (if (upstream-pool-p transport)
+      (upstream-pool-send-query transport payload timeout)
+      (adnl-ext-client-send-query transport payload timeout)))
+
+(defun %lite-await-ready (transport limit)
+  "Wait until TRANSPORT (a session or a pool) is up or the internal real time LIMIT passes; true when it is up."
+  (loop (when (%lite-transport-alive-p transport) (return t))
+        (when (or (%lite-transport-stopped-p transport) (>= (get-internal-real-time) limit)) (return nil))
         (sleep 0.05)))
 
 (defun %lite-call-raw (client request &key (timeout 8) wait-seqno (wait-timeout 8) (retry t) (deadline (* 3 timeout)))
@@ -191,7 +210,7 @@ waitMasterchainSeqno prefix); the answer is then at least that fresh, but still 
     (loop
       (let* ((raw nil)
              (answer
-              (handler-case (progn (setf raw (adnl-ext-client-send-query adnl payload attempt-timeout))
+              (handler-case (progn (setf raw (%lite-send adnl payload attempt-timeout))
                                    (tl-decode raw))
                 (adnl-not-ready (e)
                   (unless (and retry (%lite-await-ready adnl limit)) (error e))
@@ -238,14 +257,17 @@ waitMasterchainSeqno prefix); the answer is then at least that fresh, but still 
 the proxy needs nothing of it to judge an upstream.")
 
 (defun lite-report-verdict (client raw accepted reason)
-  "Tell the proxy the answer whose payload was RAW verified (ACCEPTED) or did not (REASON says why).  True when the proxy knew
+  "Tell the proxy (or the pool) the answer whose payload was RAW verified (ACCEPTED) or did not (REASON says why).  True when it knew
 the answer; never signals."
   (handler-case
-      (let* ((report (tl-make "clton.reportVerdict" :answer (sha256 raw) :accepted (and accepted t)
+      (let* ((transport (lite-client-adnl client)))
+        (when (upstream-pool-p transport)
+          (return-from lite-report-verdict (upstream-pool-apply-verdict transport (sha256 raw) accepted)))
+        (let* ((report (tl-make "clton.reportVerdict" :answer (sha256 raw) :accepted (and accepted t)
                                                     :reason (subseq (or reason "") 0 (min 200 (length (or reason ""))))))
              (payload (tl-encode (tl-make "liteServer.query" :data (tl-encode report))))
              (reply (tl-decode (adnl-ext-client-send-query (lite-client-adnl client) payload 2))))
-        (and (tl-is reply "clton.verdictAck") (tl-get reply :known)))
+        (and (tl-is reply "clton.verdictAck") (tl-get reply :known))))
     (error () nil)))
 
 (defun lite-call-verified (client request verify &rest keys &key timeout wait-seqno wait-timeout retry deadline)
@@ -395,6 +417,18 @@ the clton.Proof of the answer as :PROOF in front."
                             (lambda (answer) (verify-account-state answer address trusted)))
       (list* :proof (make-account-state-proof trusted address answer) verified))))
 
+(defun lite-account-state-at (client address trusted-mc-block)
+  "The state of ADDRESS at TRUSTED-MC-BLOCK, a masterchain block id (a blockIdExt tl-obj) that the CALLER trusts -- for instance the
+block a tonNode follower proved by the validators' signatures -- checked by VERIFY-ACCOUNT-STATE against it.  Nothing is proved
+about TRUSTED-MC-BLOCK here (CLIENT's own chain is not asked, so the answer is as good as the caller's trust in the block, and a
+liteserver is only the supplier of the proof): that is the cold-account read of a client that follows the chain itself.  The
+liteserver must still hold the state of that block (a few minutes old at most is safe).  The result is the plist of
+LITE-ACCOUNT-STATE, :PROOF first."
+  (multiple-value-bind (verified answer)
+      (lite-call-verified client (tl-make "liteServer.getAccountState" :id trusted-mc-block :account (%lite-account-id address))
+                          (lambda (answer) (verify-account-state answer address trusted-mc-block)))
+    (list* :proof (make-account-state-proof trusted-mc-block address answer) verified)))
+
 (defun lite-transactions (client address &key (count 10) from-lt from-hash)
   "Up to COUNT of the newest transactions of ADDRESS, newest first, chained to its proved last
 transaction by VERIFY-TRANSACTION-LIST (see its result: :TRANSACTIONS :NEXT-LT :NEXT-HASH :COMPLETE).  With FROM-LT and
@@ -420,6 +454,13 @@ with the clton.Proof of the answer as :PROOF in front (NIL for an account that d
 OPTIONS) -- at BLOCK, a pinned masterchain block, when given.  The values of that function: look at the exit code."
   (let ((options (loop for (k v) on options by #'cddr unless (eq k :block) append (list k v))))
     (apply #'run-account-get-method (getf (lite-account-state client address :block block) :account-cell) method stack options)))
+
+(defun lite-run-get-method-at (client address method stack trusted-mc-block &rest options)
+  "Run the getter METHOD on the state of ADDRESS at TRUSTED-MC-BLOCK, a masterchain block id the CALLER trusts (for example the
+masterchain block of a TONNODE-FOLLOWER, proved by the validators' signatures): the account is read by LITE-ACCOUNT-STATE-AT, i.e. proved
+against that block whatever the liteserver is, and then run locally (see RUN-ACCOUNT-GET-METHOD for STACK and OPTIONS).  The values of
+that function: look at the exit code."
+  (apply #'run-account-get-method (getf (lite-account-state-at client address trusted-mc-block) :account-cell) method stack options))
 
 (defun lite-server-get-method (client address method stack &key block)
   "The getter METHOD (a name or a numeric method id) of ADDRESS as the LITESERVER computes it at BLOCK, a masterchain

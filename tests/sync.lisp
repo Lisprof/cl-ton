@@ -125,7 +125,10 @@ state's own hash, which is what the client's global config names."
                                                                       :slot 0 :candidate (make-array 0 :element-type '(unsigned-byte 8)))))))
   (test-simplex-signatures)
   (test-ironclad-assembly)
-  (test-real-link-vectors))
+  (test-real-link-vectors)
+  (test-real-node-block)
+  (test-real-node-proofs)
+  (test-real-shard-block))
 
 ;;; --- ironclad's SBCL assembly optimizer ----------------------------------------------------------
 
@@ -250,6 +253,114 @@ state's own hash, which is what the client's global config names."
         (format t "  (no real link vectors yet in ~A: run TON_TRADER_LITE_DIAGNOSE=mainnet and add the files of its capture/ directory)~%"
                 (%real-vector-dir))
         (dolist (bin files) (%check-link-vector bin)))))
+
+;;; --- a block and its proof as a full node serves them over RLDP2 ---------------------------------------
+;;;
+;;; fixtures/real/node-block-103977810.boc / node-proof-103977810.boc (README.txt there).  What the first real RLDP2 download showed:
+;;; the answer is the raw BoC (no tonNode.data wrapper), with has_cache_bits set in the header (flags #xE2), which PARSE-BOC used to
+;;; refuse.  Checked here: the file hash of the block id is the sha256 of the file, the root hash is the hash of the parsed root
+;;; cell, and the proof (block_proof#c3: the id, a Merkle proof of the block, the signatures) proves exactly that root.
+
+(defun %read-octets (path)
+  (with-open-file (f path :element-type '(unsigned-byte 8))
+    (let ((a (make-array (file-length f) :element-type '(unsigned-byte 8)))) (read-sequence a f) a)))
+
+(defun test-real-node-block ()
+  (format t "sync: a real block and proof as a full node serves them~%")
+  (let* ((dir (%real-vector-dir))
+         (block-file (merge-pathnames "node-block-103977810.boc" dir))
+         (proof-file (merge-pathnames "node-proof-103977810.boc" dir))
+         (meta-file (merge-pathnames "node-block-103977810.sexp" dir)))
+    (if (not (and (probe-file block-file) (probe-file proof-file) (probe-file meta-file)))
+        (format t "  (no node block fixtures in ~A)~%" dir)
+        (let* ((block (%read-octets block-file)) (proof (%read-octets proof-file))
+               (meta (with-open-file (f meta-file) (read f)))
+               (root-hash (cl-ton::hex->octets (getf meta :root-hash)))
+               (file-hash (cl-ton::hex->octets (getf meta :file-hash))))
+          (check "the header carries has_cache_bits (flags #xE2)" (= #xe2 (aref block 4)))
+          (check "the file hash of the block id is the sha256 of the file" (equalp file-hash (cl-ton::sha256 block)))
+          (let* ((roots (cl-ton::parse-boc block)) (root (first roots)))
+            (check "the BoC parses (cache bits accepted): one root" (= 1 (length roots)))
+            (check "the root hash of the block id is the hash of the parsed root cell"
+                   (equalp root-hash (cl-ton::hex->octets (cl-ton::cell-hash-hex root))))
+            (check "the block info says seqno 103977810, masterchain"
+                   (let ((info (cl-ton::parse-block-info (svref (cl-ton::cell-refs root) 0))))
+                     (and (= 103977810 (getf info :seqno)) (= -1 (getf info :workchain))))))
+          (let* ((roots (cl-ton::parse-boc proof)) (proof-root (first roots)))
+            (check "the proof BoC parses: one root with two references (the Merkle proof and the signatures)"
+                   (and (= 1 (length roots)) (= 2 (length (cl-ton::cell-refs proof-root)))))
+            (check "the proof's Merkle proof proves exactly the block's root hash (it opens to the block of seqno 103977810)"
+                   (let ((proved (cl-ton::verify-merkle-proof (svref (cl-ton::cell-refs proof-root) 0) root-hash)))
+                     (and proved (= 103977810 (getf (cl-ton::parse-block-info (svref (cl-ton::cell-refs proved) 0)) :seqno)))))
+            (check "the same proof against another root hash is refused"
+                   (let ((other (copy-seq root-hash))) (setf (aref other 0) (logxor (aref other 0) 1))
+                     (handler-case (progn (cl-ton::verify-merkle-proof (svref (cl-ton::cell-refs proof-root) 0) other) nil)
+                       (cl-ton::boc-error () t)))))
+          (check "has_cache_bits without has_idx is refused"
+                 (let ((bad (copy-seq block))) (setf (aref bad 4) #x62)
+                   (handler-case (progn (cl-ton::parse-boc bad) nil) (cl-ton::boc-error () t))))))))
+
+;;; --- real proofs of a full node: signatures checked against the key block's validator set ----------------
+
+(defun test-real-node-proofs ()
+  (format t "sync: real block proofs of a full node (Simplex signatures, validator set of the key block)~%")
+  (let* ((dir (%real-vector-dir))
+         (files (mapcar (lambda (n) (merge-pathnames n dir))
+                        '("node-proof-104057524.boc" "node-proof-104057524.sexp" "node-keyblock-103967771.boc" "node-keyproof-103967771.boc"))))
+    (if (notevery #'probe-file files)
+        (format t "  (no node proof fixtures in ~A)~%" dir)
+        (destructuring-bind (proof-file meta-file kb-file kp-file) files
+          (let* ((proof (%read-octets proof-file)) (kb-octets (%read-octets kb-file)) (kp-octets (%read-octets kp-file))
+                 (meta (getf (with-open-file (f meta-file) (read f)) :block))
+                 (id (cl-ton::tl-make "tonNode.blockIdExt" :workchain -1 :shard (cl-ton::%signed64 #x8000000000000000)
+                                      :seqno (getf meta :seqno) :root-hash (cl-ton::hex->octets (getf meta :root-hash))
+                                      :file-hash (cl-ton::hex->octets (getf meta :file-hash))))
+                 (kb (first (cl-ton::parse-boc kb-octets))))
+            ;; the head block, signed by the set its key block names
+            (multiple-value-bind (info weight total count) (cl-ton::verify-node-block-proof-by-key-block proof id kb)
+              (check "the head block's proof verifies against the key block's validator set"
+                     (and (= 104057524 (getf info :seqno)) (= 68 count)))
+              (check "...with more than two thirds of the weight (322782628457191926 of 479104467914321684)"
+                     (and (= weight 322782628457191926) (= total 479104467914321684) (> (* 3 weight) (* 2 total)))))
+            (multiple-value-bind (proof-for merkle sigset) (cl-ton::parse-block-proof (first (cl-ton::parse-boc proof)))
+              (check "the proof says it is for the head block, with a Simplex signature set of 68 (cc seqno 880007)"
+                     (and (cl-ton::%same-block-id-p proof-for id) (cl-ton::tl-is sigset "liteServer.signatureSet.simplex")
+                          (= 68 (length (cl-ton::tl-get sigset :signatures))) (= 880007 (cl-ton::tl-get sigset :cc-seqno))))
+              (let* ((config-root (cl-ton::key-block-config-root kb))
+                     (vset (first (cl-ton::key-block-validator-sets config-root)))
+                     (other (cl-ton::tl-make "tonNode.blockIdExt" :workchain -1 :shard (cl-ton::tl-get id :shard)
+                                             :seqno (1+ (cl-ton::tl-get id :seqno)) :root-hash (cl-ton::tl-get id :root-hash)
+                                             :file-hash (cl-ton::tl-get id :file-hash)))
+                     (bad-sig (let* ((sigs (copy-seq (cl-ton::tl-get sigset :signatures))) (first (aref sigs 0))
+                                     (octets (copy-seq (cl-ton::tl-get first :signature))))
+                                (setf (aref octets 5) (logxor (aref octets 5) 1))
+                                (setf (aref sigs 0) (%obj-with first :signature octets))
+                                (%obj-with sigset :signatures sigs)))
+                     (few (%obj-with sigset :signatures (subseq (cl-ton::tl-get sigset :signatures) 0 40))))
+                (check "a proof for another block id is refused"
+                       (%vector-refused-p (lambda () (cl-ton::verify-node-block-proof proof other vset config-root))))
+                (check "one flipped signature bit is refused"
+                       (%vector-refused-p (lambda () (cl-ton::check-block-signatures vset id bad-sig))))
+                (check "40 of the 68 signatures are not more than two thirds"
+                       (%vector-refused-p (lambda () (cl-ton::check-block-signatures vset id few))))
+                (check "a signature set whose catchain seqno differs from the header's is refused"
+                       (%vector-refused-p (lambda ()
+                                            (cl-ton::check-validator-set-binding
+                                             vset (%obj-with sigset :cc-seqno 880008)
+                                             (third (multiple-value-list (cl-ton::verify-block-proof merkle id :require-update nil)))
+                                             config-root))))))
+            ;; the key block itself: its proof was signed by the set BEFORE the one it names (parameter 32 of its own configuration)
+            (let* ((kb-id (cl-ton::tl-make "tonNode.blockIdExt" :workchain -1 :shard (cl-ton::%signed64 #x8000000000000000) :seqno 103967771
+                                           :root-hash (cl-ton::hex->octets (cl-ton::cell-hash-hex kb))
+                                           :file-hash (cl-ton::sha256 kb-octets)))
+                   (config-root (cl-ton::key-block-config-root kb))
+                   (previous (cl-ton::parse-validator-set (cl-ton::config-param config-root 32))))
+              (multiple-value-bind (info weight total count) (cl-ton::verify-node-block-proof kp-octets kb-id previous config-root)
+                (check "the key block's proof verifies against the set before it (parameter 32): file hash = sha256 of the file"
+                       (and (getf info :key-block) (= 103967771 (getf info :seqno)) (= count 67) (> (* 3 weight) (* 2 total)))))
+              (check "...and is refused against the set the key block names (parameter 34), which did not sign it"
+                     (%vector-refused-p
+                      (lambda () (cl-ton::verify-node-block-proof kp-octets kb-id (first (cl-ton::key-block-validator-sets config-root)) config-root))))))))))
 
 ;;; --- Simplex signature sets (the new consensus) ---------------------------------------------------
 ;;;
@@ -938,3 +1049,64 @@ McBlockExtra and the configuration parameters a node reveals in a forward link (
   (test-ed25519-batch)
   (test-config-answers)
   (test-config-fuzz))
+
+(defun test-real-shard-block ()
+  (format t "sync: a real basechain shard block and its proof link as a full node serves them~%")
+  (let* ((dir (%real-vector-dir))
+         (block-file (merge-pathnames "node-shardblock-108759255.boc" dir))
+         (link-file (merge-pathnames "node-shardlink-108759255.boc" dir))
+         (meta-file (merge-pathnames "node-shardblock-108759255.sexp" dir)))
+    (if (not (and (probe-file block-file) (probe-file link-file) (probe-file meta-file)))
+        (format t "  (no shard block fixtures in ~A)~%" dir)
+        (let* ((octets (%read-octets block-file)) (link (%read-octets link-file))
+               (meta (with-open-file (f meta-file) (read f)))
+               (id (cl-ton::tl-make "tonNode.blockIdExt" :workchain (getf meta :workchain)
+                                                         :shard (cl-ton::%signed64 (parse-integer (getf meta :shard) :radix 16))
+                                                         :seqno (getf meta :seqno)
+                                                         :root-hash (cl-ton::hex->octets (getf meta :root-hash))
+                                                         :file-hash (cl-ton::hex->octets (getf meta :file-hash))))
+               (checked (cl-ton::verify-block-data (cl-ton::tl-make "liteServer.blockData" :id id :data octets) id))
+               (block (getf checked :block)))
+          (check "shard block: the file hash is the sha256 of the file and the root hash that of the root cell (VERIFY-BLOCK-DATA)" checked)
+          (check "shard block: BlockInfo says basechain, shard 8000000000000000, seqno 108759255, not a key block"
+                 (let ((info (getf checked :info)))
+                   (and (= 0 (getf info :workchain)) (= #x8000000000000000 (getf info :shard)) (= 108759255 (getf info :seqno))
+                        (not (getf info :key-block)))))
+          (multiple-value-bind (old new) (cl-ton::merkle-update-hashes (svref (cl-ton::cell-refs block) 2))
+            (check "shard block: the state_update is a Merkle update from one state hash to another"
+                   (and (= 32 (length old)) (= 32 (length new)) (not (equalp old new))))
+            (let ((roots (cl-ton::parse-boc link)))
+              (check "proof link: one root, a block_proof#c3 for this very block and without signatures"
+                     (and (= 1 (length roots))
+                          (multiple-value-bind (proof-for merkle sigs) (cl-ton::parse-block-proof (first roots))
+                            (declare (ignore merkle))
+                            (and (cl-ton::%same-block-id-p proof-for id) (null sigs)))))
+              (check "proof link: its Merkle proof opens to the block's root hash and reveals the same new state hash as the block"
+                     (multiple-value-bind (merkle-block state) (cl-ton::verify-block-proof (nth-value 1 (cl-ton::parse-block-proof (first roots))) id :require-update nil)
+                       (declare (ignore merkle-block))
+                       (equalp state new)))))
+          (let ((changes (cl-ton::block-account-changes block)))
+            (check "account changes: the block did 14 transactions on 12 accounts, listed in account order"
+                   (and (= 12 (length changes)) (= 14 (reduce #'+ (mapcar (lambda (c) (getf c :transactions)) changes)))
+                        (let ((keys (mapcar (lambda (c) (cl-ton::octets->uint (getf c :account))) changes))) (equal keys (sort (copy-list keys) #'<)))
+                        (every (lambda (c) (and (= 32 (length (getf c :account))) (= 32 (length (getf c :last-trans-hash)))
+                                                (= 32 (length (getf c :new-account-hash))) (not (equalp (getf c :old-account-hash) (getf c :new-account-hash)))))
+                               changes)))
+            (check "account changes: for every account the new ShardAccount in the state update agrees with its AccountBlock (last transaction lt and hash, account hash)"
+                   (every (lambda (c)
+                            (let ((a (cl-ton::block-new-shard-account block (getf c :account))))
+                              (and (getf a :exists) (not (minusp (getf a :balance)))
+                                   (= (getf a :last-trans-lt) (getf c :last-lt))
+                                   (equalp (getf a :last-trans-hash) (getf c :last-trans-hash))
+                                   (equalp (cl-ton::node-hash-at (getf a :account-cell) 0) (getf c :new-account-hash)))))
+                          changes)))
+          (check "account changes: an account the block did not change is not revealed in the new tree (PROOF-ERROR), a non-block is refused"
+                 (and (handler-case (progn (cl-ton::block-new-shard-account block (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)) nil)
+                        (cl-ton::proof-error () t))
+                      (handler-case (progn (cl-ton::block-account-changes (svref (cl-ton::cell-refs block) 0)) nil)
+                        (cl-ton::proof-error () t))))
+          (check "proof link: a link for another block is refused"
+                 (let ((other (cl-ton::tl-make "tonNode.blockIdExt" :workchain 0 :shard (cl-ton::tl-get id :shard) :seqno 108759256
+                                                                    :root-hash (cl-ton::tl-get id :root-hash) :file-hash (cl-ton::tl-get id :file-hash))))
+                   (not (cl-ton::%same-block-id-p (cl-ton::parse-block-proof (first (cl-ton::parse-boc link))) other))))))))
+

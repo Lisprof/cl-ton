@@ -43,6 +43,27 @@
                                                         :query (coerce #(1 2 3) 'cl-ton::tl-octets)))
            (packet (cl-ton::adnl-udp-make-packet client (list query) :seqno 1 :confirm-seqno 0 :reinit-date 1700000000
                                                  :address (cl-ton::adnl-udp-address-list))))
+      ;; --- a packet that names its sender by the short id only (nodes of 2026.10 do so once the peer has their key)
+      (let* ((short (cl-ton::adnl-short-id (cl-ton::keypair-public client)))
+             (unsigned (cl-ton::tl-make "adnl.packetContents" :rand1 (coerce #(1 2 3 4 5 6 7) 'cl-ton::tl-octets)
+                                        :flags (logior 2 cl-ton::+adnl-udp-flag-message+)
+                                        :from-short (cl-ton::tl-make "adnl.id.short" :id (coerce short 'cl-ton::tl-octets))
+                                        :message query :rand2 (coerce #(9 8 7 6 5 4 3) 'cl-ton::tl-octets)))
+             (signature (cl-ton::sign-octets client (cl-ton::adnl-udp-packet-to-sign unsigned)))
+             (signed (cl-ton::tl-encode (cl-ton::tl-make "adnl.packetContents" :rand1 (cl-ton::tl-get unsigned :rand1)
+                                                         :flags (logior (cl-ton::tl-get unsigned :flags) cl-ton::+adnl-udp-flag-signature+)
+                                                         :from-short (cl-ton::tl-get unsigned :from-short) :message query :rand2 (cl-ton::tl-get unsigned :rand2)
+                                                         :signature (coerce signature 'cl-ton::tl-octets))))
+             (lookup (lambda (s) (and (equalp s short) (cl-ton::keypair-public client)))))
+        (check "udp packet by short id: the signature is checked with the key the lookup knows"
+               (multiple-value-bind (decoded public) (cl-ton::adnl-udp-open-packet signed lookup)
+                 (and (cl-ton::tl-is decoded "adnl.packetContents") (equalp public (cl-ton::keypair-public client)))))
+        (check "udp packet by short id: an unknown sender (no lookup, or a lookup that does not know it) is refused"
+               (and (handler-case (progn (cl-ton::adnl-udp-open-packet signed) nil) (error () t))
+                    (handler-case (progn (cl-ton::adnl-udp-open-packet signed (lambda (s) (declare (ignore s)) nil)) nil) (error () t))))
+        (check "udp packet by short id: a lookup that gives another key (a forged sender) fails the signature"
+               (handler-case (progn (cl-ton::adnl-udp-open-packet signed (lambda (s) (declare (ignore s)) (cl-ton::keypair-public (cl-ton::adnl-generate-keypair)))) nil)
+                 (error () t))))
       (multiple-value-bind (decoded public) (cl-ton::adnl-udp-open-packet packet)
         (check "udp packet: signed with the sender's key, which it names"
                (equalp public (cl-ton::keypair-public client)))
@@ -74,6 +95,8 @@
       (unwind-protect
            (let ((public (cl-ton::keypair-public (cl-ton::adnl-udp-keypair srv)))
                  (port (cl-ton::adnl-udp-port srv)))
+             (check "udp client socket is bound to all interfaces (a loopback-bound socket cannot send to a public address: EINVAL)"
+                    (equalp #(0 0 0 0) (sb-bsd-sockets:socket-name (cl-ton::adnl-udp-socket cli))))
              (check "udp query: the server's answer comes back to a client with no public address"
                     (equalp (map '(vector (unsigned-byte 8)) #'char-code "re:ping")
                             (cl-ton::adnl-udp-query cli "127.0.0.1" port public (map '(vector (unsigned-byte 8)) #'char-code "ping")
@@ -113,17 +136,17 @@
                                    :seqno 1 :confirm-seqno 0 :reinit-date (cl-ton::unix-now))))
                       (unwind-protect
                            (let ((datagram (cl-ton::adnl-udp-datagram cpub plain)))
-                             (dotimes (i 2)
-                               (sb-bsd-sockets:socket-send sock datagram nil
-                                                           :address (list (sb-bsd-sockets:make-inet-address "127.0.0.1") (cl-ton::adnl-udp-port counting))))
+                             (progn (sb-bsd-sockets:socket-connect sock (sb-bsd-sockets:make-inet-address "127.0.0.1") (cl-ton::adnl-udp-port counting))
+                                    (dotimes (i 2)
+                                      (sb-bsd-sockets:socket-send sock datagram nil)))
                              (sleep 0.5)
                              (= 1 count))
                         (ignore-errors (sb-bsd-sockets:socket-close sock))
                         (cl-ton::adnl-udp-stop counting))))
              (check "udp query: garbage datagrams are counted and dropped, the node goes on"
                     (progn (let ((sock (make-instance 'sb-bsd-sockets:inet-socket :type :datagram :protocol :udp)))
-                             (sb-bsd-sockets:socket-send sock (make-array 200 :element-type '(unsigned-byte 8) :initial-element 1) nil
-                                                         :address (list (sb-bsd-sockets:make-inet-address "127.0.0.1") port))
+                             (progn (sb-bsd-sockets:socket-connect sock (sb-bsd-sockets:make-inet-address "127.0.0.1") port)
+                                    (sb-bsd-sockets:socket-send sock (make-array 200 :element-type '(unsigned-byte 8) :initial-element 1) nil))
                              (sb-bsd-sockets:socket-close sock))
                            (sleep 0.3)
                            (and (plusp (cl-ton::adnl-udp-dropped srv))
@@ -219,9 +242,9 @@
                                   :seqno 100000 :confirm-seqno 0))
                          (datagram (cl-ton::%cat (cl-ton::adnl-udp-peer-out-id peer) (cl-ton::adnl-udp-aes-encrypt (cl-ton::adnl-udp-peer-out-key peer) packet))))
                     (unwind-protect
-                         (progn (dotimes (i 2)
-                                  (sb-bsd-sockets:socket-send sock datagram nil
-                                                              :address (list (sb-bsd-sockets:make-inet-address "127.0.0.1") port)))
+                         (progn (sb-bsd-sockets:socket-connect sock (sb-bsd-sockets:make-inet-address "127.0.0.1") port)
+                                (dotimes (i 2)
+                                  (sb-bsd-sockets:socket-send sock datagram nil))
                                 (sleep 0.4)
                                 (= (1+ before) count))
                       (ignore-errors (sb-bsd-sockets:socket-close sock)))))
@@ -229,8 +252,8 @@
                   (let ((dropped (cl-ton::adnl-udp-dropped srv))
                         (sock (make-instance 'sb-bsd-sockets:inet-socket :type :datagram :protocol :udp)))
                     (unwind-protect
-                         (progn (sb-bsd-sockets:socket-send sock (make-array 200 :element-type '(unsigned-byte 8) :initial-element 3) nil
-                                                            :address (list (sb-bsd-sockets:make-inet-address "127.0.0.1") port))
+                         (progn (progn (sb-bsd-sockets:socket-connect sock (sb-bsd-sockets:make-inet-address "127.0.0.1") port)
+                                       (sb-bsd-sockets:socket-send sock (make-array 200 :element-type '(unsigned-byte 8) :initial-element 3) nil))
                                 (sleep 0.3)
                                 (> (cl-ton::adnl-udp-dropped srv) dropped))
                       (ignore-errors (sb-bsd-sockets:socket-close sock)))))

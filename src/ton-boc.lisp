@@ -892,8 +892,11 @@ is verified unless CHECK-CRC is NIL."
              (expected-length (+ data-end (if has-crc32c 4 0))))
         (unless (zerop (logand flags #x18))
           (boc-error "Reserved BOC flags are set: #x~2,'0x" flags))
-        (when (logbitp 5 flags)
-          (boc-error "BOC has_cache_bits is not supported"))
+        ;; has_cache_bits (bit 5) is what the full nodes of 2026 set (flags #xE2): it needs the index, the index entries then carry a
+        ;; cache flag in their lowest bit, and the cell data are unchanged.  We read the cells sequentially and never use the index,
+        ;; so the bit needs no other handling.
+        (when (and (logbitp 5 flags) (not has-idx))
+          (boc-error "BOC has_cache_bits without has_idx"))
         (unless (and (<= 1 ref-bytes 4) (<= 1 offset-bytes 8))
           (boc-error "Invalid size fields: size ~D, off_bytes ~D" ref-bytes offset-bytes))
         (unless (and (<= 1 root-count) (<= (+ root-count absent-count) cell-count))

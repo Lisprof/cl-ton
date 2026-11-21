@@ -48,7 +48,12 @@
      (:file "adnl-ext-server")     ; Phase D: inbound listener/handshake, shared with fakechain
      (:file "adnl-udp")            ; ADNL over UDP: datagrams, signed packets, queries (the DHT and peer discovery build on it)
      (:file "dht")                 ; the TON DHT client: signed nodes and values, Kademlia search, candidate cache
+     (:file "raptorq")             ; RaptorQ FEC (RFC 6330): the code RLDP2 carries its data in (encoder, decoder)
+     (:file "rldp")                ; RLDP2: reliable queries and answers of any size over lossy datagrams (transport-neutral)
+     (:file "quic")                ; QUIC (RFC 9000/9001): the node's other transport, on its adnl.address.quic endpoints
+     (:file "overlay-query")       ; overlay.query to the members of a public overlay without membership; transport choice (RLDP2 / ADNL)
      (:file "proxy-liteserver")    ; uses CONFIG-WITH-LITESERVERS/JSON-GET from tonlib
+     (:file "peers")               ; liteserver candidates: UDP probe, score, the upstream pool; the DHT/ADNL diagnose report (uses the proxy's query helpers)
      (:file "lite-client")         ; verifying liteserver client: sync, account state, transactions, getters
      (:file "lite-backend")        ; the lite client as a drop-in for the tonlib client (R2b)
      (:file "lite-api")            ; the typed Lite API on the lite client: LITE-EXECUTE
@@ -85,7 +90,12 @@
 			     (:file "fake-world")
 			     (:file "scenario-kit")
 			     (:file "adnl-udp")
-			     (:file "dht"))))   ; Stage 3: code the other suites never ran   ; validator sets, signatures, block links   ; the lite proof verifier   ; cell levels, pruned branches, Merkle proofs   ; the typed tonlib API: schema, validation, JSON bridge, A/B vs tonlibjson
+			     (:file "dht")
+			     (:file "raptorq")
+			     (:file "rldp")
+		     (:file "quic")
+			     (:file "overlay-query")
+			     (:file "peers"))))   ; Stage 3: code the other suites never ran   ; validator sets, signatures, block links   ; the lite proof verifier   ; cell levels, pruned branches, Merkle proofs   ; the typed tonlib API: schema, validation, JSON bridge, A/B vs tonlibjson
 
   :perform (test-op (o c)  
              (uiop:symbol-call :cl-ton/test :run-tests)))  

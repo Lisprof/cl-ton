@@ -52,6 +52,23 @@
                     (let ((state (cl-ton::lite-account-state client addr)))
                       (check "the wallet's state is proved: it exists with a last transaction"
                              (and (getf state :exists) (plusp (getf state :last-trans-lt)))))
+                    (let* ((head (cl-ton::lite-sync client))
+                           (at (cl-ton::lite-account-state-at client addr head))
+                           (own (cl-ton::lite-account-state client addr)))
+                      (check "state at a block the caller trusts: the same verified account as the client's own read"
+                             (and (getf at :exists) (= (getf at :last-trans-lt) (getf own :last-trans-lt))
+                                  (equalp (getf at :last-trans-hash) (getf own :last-trans-hash))
+                                  (equalp (getf at :state-hash) (getf own :state-hash))))
+                      (check "...and a block id whose hash the caller got wrong is a proof error, not an account"
+                             (let ((wrong (cl-ton::tl-make "tonNode.blockIdExt" :workchain (cl-ton::tl-get head :workchain) :shard (cl-ton::tl-get head :shard)
+                                                                                :seqno (cl-ton::tl-get head :seqno)
+                                                                                :root-hash (let ((h (copy-seq (cl-ton::tl-get head :root-hash)))) (setf (aref h 0) (logxor 1 (aref h 0))) h)
+                                                                                :file-hash (cl-ton::tl-get head :file-hash))))
+                               (handler-case (progn (cl-ton::lite-account-state-at client addr wrong) nil)
+                                 (error () t)))))
+                    (let ((head (cl-ton::lite-sync client)))
+                      (check "getter at a block the caller trusts: the wallet's seqno 3 from the state proved against that block"
+                             (equal '(3) (cl-ton::lite-run-get-method-at client addr "seqno" '() head))))
                     (let ((r (cl-ton::lite-transactions client addr :count 20)))
                       (check "its three transactions come back chained to the proved last one"
                              (and (= 3 (length (getf r :transactions))) (getf r :complete))))

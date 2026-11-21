@@ -341,6 +341,111 @@ is not recomputed with."
                     "the validator set hashes to ~D at catchain seqno ~D, the block header says ~D"
                     expected cc hash)))))))
 
+;;; --- block proofs as a full node serves them (tonNode.downloadBlockProof) ------------------------------
+;;;
+;;; The answer is a raw BoC of block_proof#c3 proof_for:BlockIdExt root:^Cell signatures:(Maybe ^BlockSignatures)
+;;; (crypto/block/block.tlb): the root is a Merkle proof of the block (what VERIFY-BLOCK-PROOF opens), the signatures
+;;; are block_signatures_ordinary#11 or block_signatures_simplex#12 cells, which BlockSignatureSet::fetch reads
+;;; (crypto/block/signature-set.cpp).  PARSE-BLOCK-SIGNATURES turns such a cell into the liteServer.signatureSet object
+;;; the verifiers above already take, so one code path checks both what a liteserver and what a full node serves.
+
+(defun cell-string-octets (cell)
+  "The octets of a vm::CellString: the bytes of CELL, then of its first reference, and so on."
+  (let ((out (make-array 0 :element-type '(unsigned-byte 8) :adjustable t :fill-pointer t)))
+    (loop while cell
+          do (let ((s (cell-slice cell)))
+               (%prove (zerop (mod (slice-remaining-bits s) 8)) "a cell string with a partial octet")
+               (loop for b across (load-bytes s (floor (slice-remaining-bits s) 8)) do (vector-push-extend b out))
+               (setf cell (and (plusp (length (cell-refs cell))) (svref (cell-refs cell) 0)))))
+    (coerce out '(simple-array (unsigned-byte 8) (*)))))
+
+(defun %s32 (x) (if (>= x (expt 2 31)) (- x (expt 2 32)) x))
+
+(define-proof-function parse-block-signatures (cell)
+  "CELL, a BlockSignatures (#11 ordinary or #12 Simplex), as a liteServer.signatureSet.ordinary / .simplex object.
+(VALUES SIGNATURE-SET SIGNED-WEIGHT): the weight the cell claims for its signatures, which is checked here against
+nothing but its own count; PLAN-BLOCK-SIGNATURES recomputes the weight from the validator set."
+  (let* ((s (cell-slice cell)) (tag (load-uint s 8)))
+    (%prove (member tag '(#x11 #x12)) "not a BlockSignatures cell (tag ~X)" tag)
+    (let* ((s (skip-bits s 8)))
+      (multiple-value-bind (list-hash s) (load-uint s 32)
+        (multiple-value-bind (cc s) (load-uint s 32)
+          (multiple-value-bind (count s) (load-uint s 32)
+            (multiple-value-bind (weight s) (load-uint s 64)
+              (multiple-value-bind (dict s) (load-maybe-ref s)
+                (let* ((entries
+                         (and dict
+                              (dict-entries dict 16
+                                            (lambda (v)
+                                              (%prove (= 772 (slice-remaining-bits v)) "a signature pair of ~D bits" (slice-remaining-bits v))
+                                              (let ((id (load-bytes v 32)) (v (skip-bits v 256)))
+                                                (%prove (= 5 (load-uint v 4)) "a signature that is not ed25519_signature#5")
+                                                (list id (load-bytes (skip-bits v 4) 64)))))))
+                       (signatures (loop for (key . (id sig)) in entries for i from 0
+                                         do (%prove (= key i) "the signature dictionary has key ~D at position ~D" key i)
+                                         collect (tl-make "liteServer.signature" :node-id-short id :signature sig))))
+                  (%prove (= count (length signatures)) "the signature set says ~D signatures, the dictionary has ~D"
+                          count (length signatures))
+                  (values
+                   (if (= tag #x11)
+                       (tl-make "liteServer.signatureSet.ordinary" :validator-set-hash (%s32 list-hash)
+                                                                  :catchain-seqno (%s32 cc) :signatures (coerce signatures 'vector))
+                       (multiple-value-bind (session s) (values (load-bytes s 32) (skip-bits s 256))
+                         (multiple-value-bind (slot s) (load-uint s 32)
+                           (let ((candidate (cell-string-octets (load-ref s))))
+                             (tl-make "liteServer.signatureSet.simplex" :cc-seqno (%s32 cc) :validator-set-hash (%s32 list-hash)
+                                                                       :signatures (coerce signatures 'vector)
+                                                                       :session-id session :slot (%s32 slot) :candidate candidate)))))
+                   weight))))))))))
+
+(define-proof-function parse-block-proof (root)
+  "ROOT, the root cell of a block_proof#c3 BoC.  (VALUES BLOCK-ID MERKLE-PROOF-CELL SIGNATURE-SET-OR-NIL), BLOCK-ID the
+tonNode.blockIdExt it says it is for."
+  (let* ((s (cell-slice root)))
+    (%prove (= #xc3 (load-uint s 8)) "not a block_proof#c3")
+    (let* ((s (skip-bits s 8)))
+      (%prove (zerop (load-uint s 2)) "the proof's shard id is not shard_ident$00")
+      (let* ((pfx-bits (ldb (byte 6 0) (load-uint s 8)))        ; the tag bits and the 6 bits of shard_pfx_bits are the first octet
+             (s (skip-bits s 8)))
+        (multiple-value-bind (workchain s) (load-int s 32)
+          (multiple-value-bind (prefix s) (load-uint s 64)
+            (let ((shard (%shard-id pfx-bits prefix)))
+            (multiple-value-bind (seqno s) (load-uint s 32)
+              (let ((root-hash (load-bytes s 32)) (s (skip-bits s 256)))
+                (let ((file-hash (load-bytes s 32)) (s (skip-bits s 256)))
+                  (multiple-value-bind (merkle s) (load-ref s)
+                    (let ((sigs (load-maybe-ref s)))
+                      (values (tl-make "tonNode.blockIdExt" :workchain workchain :shard (%signed64 shard) :seqno seqno
+                                                            :root-hash root-hash :file-hash file-hash)
+                              merkle
+                              (and sigs (values (parse-block-signatures sigs))))))))))))))))
+
+(define-proof-function verify-node-block-proof (proof-octets block-id vset config-root)
+  "PROOF-OCTETS, a tonNode.downloadBlockProof answer, proves the masterchain block BLOCK-ID (a tonNode.blockIdExt whose
+hashes the caller trusts or is checking): the proof is for that id, its Merkle proof opens to the block's root hash, and the
+signature set is valid for it -- signers distinct members of VSET, more than two thirds of its weight, every ed25519
+signature good, and the catchain seqno and validator-set hash agree with the block header and with VSET (CONFIG-ROOT, the
+configuration VSET comes from, supplies the shuffle flag of parameter 28).
+(VALUES INFO SIGNED-WEIGHT TOTAL-WEIGHT SIGNATURE-COUNT), INFO the block header (PARSE-BLOCK-INFO)."
+  (let ((roots (parse-boc proof-octets)))
+    (%prove (= 1 (length roots)) "a block proof BoC has ~D roots, not 1" (length roots))
+    (multiple-value-bind (proof-for merkle sigset) (parse-block-proof (first roots))
+      (%prove (%same-block-id-p proof-for block-id) "the proof is for block ~D, not ~D" (tl-get proof-for :seqno) (tl-get block-id :seqno))
+      (%prove sigset "the proof carries no signatures")
+      (multiple-value-bind (block state-hash info) (verify-block-proof merkle block-id :require-update nil)
+        (declare (ignore block state-hash))
+        (multiple-value-bind (weight total entries) (plan-block-signatures vset block-id sigset)
+          (check-signature-entries entries)
+          (check-validator-set-binding vset sigset info config-root)
+          (values info weight total (length entries)))))))
+
+(define-proof-function verify-node-block-proof-by-key-block (proof-octets block-id key-block)
+  "VERIFY-NODE-BLOCK-PROOF with the validator set (and configuration) of KEY-BLOCK, a masterchain key block cell the caller
+trusts: the set it names (parameter 35 when there is one, else 34) signs everything up to the next key block."
+  (let* ((config-root (key-block-config-root key-block))
+         (sets (key-block-validator-sets config-root)))
+    (verify-node-block-proof proof-octets block-id (first sets) config-root)))
+
 ;;; --- links ----------------------------------------------------------------------------
 
 (defun %same-block-id-p (a b)

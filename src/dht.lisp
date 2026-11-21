@@ -36,8 +36,19 @@
     ("jXiLaOQz1HPayilWgBWhV9xJhUIqfU95t+KFKQPIpXg=" "5.161.60.160" 12485)
     ("vhFPq+tgjJi+4ZbEOHBo4qjpqhBdSCzNZBdgXyj3NK8=" "5.22.218.95" 36752)
     ("sbsuMcdyYFSRQ0sG86/n+ZQ5FX3zOWm1aCVuHwXdgs0=" "45.63.114.174" 50187)
-    ("aeMgdMdkkbkfAS4+n4BEGgtqhkf2/zXrVWWECOJ/h3A=" "167.172.48.179" 25975))
-  "The only static seed: five public DHT nodes of the mainnet (public key in base64, IPv4, UDP port), from the global config.")
+    ("aeMgdMdkkbkfAS4+n4BEGgtqhkf2/zXrVWWECOJ/h3A=" "167.172.48.179" 25975)
+    ("rNzhnAlmtRn9rTzW6o2568S6bbOXly7ddO1olDws5wM=" "128.199.52.250" 45943)
+    ("CIqsqR/buVM5KpxcHIuGuEZZH80Lp/DI5n+1dbRa0OM=" "78.141.205.142" 59725)
+    ("BSFIXhvNbS8Zwq8oIN4fYoXBnftoDsi3LIZTFQE3G14=" "45.63.101.172" 42137)
+    ("Mj9H1aVAspTqRnagoaVLqE0ovyJnqter1jE4gHBKNso=" "70.34.194.158" 34355)
+    ("c7+Jd6MPFVfAusmnD+1hX6A2iczGZZ/kZERGiQQlycM=" "70.34.215.235" 53014)
+    ("LGgzse/Kxf8I0f46JfIIQUtwYWMnHhVn80iiyJH09uA=" "206.189.101.193" 14641)
+    ("LNCoE/tQO9cOE0OJpzvXf+hTHUX0SaUuIB4QzeQwMXs=" "178.62.214.203" 14314)
+    ("QUHRV9niw5zMhTDG3eNWTBTWi2xktaG0CDUyf5D71ns=" "46.101.218.166" 35390)
+    ("0wrkYa1l41HIm+AIyPfWl3LpSLcUKcbmLY7oxfbGgeE=" "164.92.192.235" 35691)
+    ("+DP0vy0JfaEde/QUhCVCQ7dnIcNdwiRlePv+S7vNo5k=" "194.62.96.18" 55303)
+    ("h0tVJofF+g+pwwfzj7wRToFPco/rph6zRKBh2zQf/Qc=" "5.22.219.87" 47163))
+  "The only static seed: the sixteen public DHT nodes of the mainnet (public key in base64, IPv4, UDP port), as the static_nodes of the global config list them (the first eight are the older ones, the rest were published in 2026).")
 
 (defconstant +dht-k+ 10 "How many nearest nodes a search keeps and asks for.")
 (defconstant +dht-a+ 3 "How many queries of a search run at once.")
@@ -65,9 +76,7 @@
   "(VALUES HOST PORT) of the first IPv4 UDP address of an adnl.addressList, or NIL."
   (loop for a across (coerce (tl-get address-list :addrs) 'vector)
         when (tl-is a "adnl.address.udp")
-          do (let ((ip (ldb (byte 32 0) (tl-get a :ip))))
-               (return (values (format nil "~D.~D.~D.~D" (ldb (byte 8 24) ip) (ldb (byte 8 16) ip) (ldb (byte 8 8) ip) (ldb (byte 8 0) ip))
-                               (tl-get a :port))))))
+          do (return (values (%dht-ip-string (tl-get a :ip)) (tl-get a :port)))))
 
 (defun %dht-verify-signature (public message signature)
   (and (= 32 (length public)) (= 64 (length signature))
@@ -130,7 +139,8 @@ value are signed by the key's owner and that has not expired; NIL when anything 
   (peers (make-hash-table :test 'equalp)) ; short id -> dht-peer
   (lock (sb-thread:make-mutex :name "dht"))
   (timeout 2.0)                          ; seconds a node gets for one query
-  (queries 0))
+  (queries 0)
+  (last-error nil))                     ; the last non-timeout condition of a query, for the diagnose
 
 (defun %dht-add-peer (dht peer)
   "Remember PEER unless a node with its id is known (a newer version of the same node replaces it)."
@@ -175,7 +185,7 @@ remembers of an earlier run."
     (adnl-udp-timeout ()
       (sb-thread:with-mutex ((dht-lock dht)) (incf (dht-queries dht)) (incf (dht-peer-failures peer)))
       nil)
-    (error () (sb-thread:with-mutex ((dht-lock dht)) (incf (dht-peer-failures peer))) nil)))
+    (error (e) (sb-thread:with-mutex ((dht-lock dht)) (incf (dht-peer-failures peer)) (setf (dht-last-error dht) (princ-to-string e))) nil)))
 
 (defun dht-ping (dht peer)
   "True when PEER answers dht.ping with the random id we sent."
@@ -284,3 +294,92 @@ value T to end the search with RESULT.  Returns (VALUES RESULT CLOSEST-PEERS)."
                (cond ((and space start) (push (subseq line start i) words) (setf start nil))
                      ((and (not space) (not start)) (setf start i)))))
     (nreverse words)))
+
+;;; --- members of a public overlay -------------------------------------------------------------------------------------------------------
+;;;
+;;; The members of a public overlay are published in the DHT under the key {overlay short id, "nodes", 0} with the update rule
+;;; dht.updateRule.overlayNodes (dht/dht-types.cpp): the key owner is a pub.overlay whose short id IS the overlay id, the value
+;;; carries NO signature, and every overlay.node inside it is signed by its own key over the boxed overlay.node.toSign.  So the
+;;; signature rule of DHT-VERIFY-VALUE does not apply: this section checks the nodes one by one, and nothing is believed unverified.
+
+(defun dht-verify-overlay-node (node overlay-id)
+  "The 32-octet ADNL public key of a decoded overlay.node whose signature is good for OVERLAY-ID (flags 0 form), else NIL."
+  (ignore-errors
+   (let ((id (tl-get node :id)) (sig (as-octets (tl-get node :signature))))
+     (when (and (tl-is id "pub.ed25519") (equalp (as-octets (tl-get node :overlay)) (as-octets overlay-id)))
+       (let* ((public (as-octets (tl-get id :key)))
+              (to-sign (tl-encode (tl-make "overlay.node.toSign"
+                                           :id (tl-make "adnl.id.short" :id (coerce (adnl-short-id public) 'tl-octets))
+                                           :overlay (coerce overlay-id 'tl-octets)
+                                           :version (tl-get node :version)))))
+         (when (%dht-verify-signature public to-sign sig) public))))))
+
+(defun dht-overlay-value-nodes (value overlay-id)
+  "(VALUES MEMBERS REASON) for a decoded dht.value that should hold the overlay nodes of OVERLAY-ID: MEMBERS is the list of the
+verified (PUBLIC . VERSION) pairs; the value is refused (MEMBERS NIL) unless its key is {OVERLAY-ID, \"nodes\", 0}, its owner is the
+pub.overlay of OVERLAY-ID, its rule is overlayNodes and it carries no signature.  REASON says in a few words what was seen."
+  (let* ((description (tl-get value :key))
+         (key (tl-get description :key))
+         (pub (tl-get description :id))
+         (rule (tl-get description :update-rule))
+         (data (as-octets (tl-get value :value))))
+    (cond
+      ((not (tl-is rule "dht.updateRule.overlayNodes")) (values nil (format nil "rule ~A" (tl-obj-name rule))))
+      ((not (tl-is pub "pub.overlay")) (values nil "key owner is not pub.overlay"))
+      ((not (equalp (sha256 (tl-encode pub)) (as-octets overlay-id))) (values nil "pub.overlay is another overlay"))
+      ((not (equalp (sha256 (tl-encode key)) (as-octets (dht-key-id overlay-id :name "nodes")))) (values nil "not the key asked for"))
+      ((plusp (length (as-octets (tl-get value :signature)))) (values nil "value carries a signature"))
+      ((> (length data) (* 16 +dht-max-value+)) (values nil "value too long"))
+      (t (let ((obj (ignore-errors (tl-decode data))))
+           (if (not (and obj (tl-is obj "overlay.nodes")))
+               (values nil "value is not overlay.nodes")
+               (let ((good (loop for n across (coerce (tl-get obj :nodes) 'vector)
+                                 for pub = (dht-verify-overlay-node n overlay-id)
+                                 when pub collect (cons pub (tl-get n :version)))))
+                 (values good (format nil "~D of ~D nodes verified" (length good) (length (tl-get obj :nodes)))))))))))
+
+(defun dht-find-overlay-members (dht overlay-id &key (want 30))
+  "The verified members of the public overlay OVERLAY-ID that the DHT knows: (VALUES MEMBERS NOTES), MEMBERS a list of (PUBLIC . VERSION)
+merged over every DHT node that holds a value for the key (a member is listed once; the newest version wins), the search ends when
+WANT members are known; NOTES is a list of short strings telling what each asked node said (for a diagnose report)."
+  (let ((key-id (dht-key-id overlay-id :name "nodes"))
+        (all (make-hash-table :test 'equalp))
+        (notes '())
+        (lock (sb-thread:make-mutex :name "overlay-members")))
+    (%dht-search dht key-id
+                 (lambda (peer)
+                   (let ((answer (%dht-ask dht peer (tl-make "dht.findValue" :key (coerce key-id 'tl-octets) :k +dht-k+))))
+                     (cond ((tl-is answer "dht.valueFound")
+                            (multiple-value-bind (nodes note) (ignore-errors (dht-overlay-value-nodes (tl-get answer :value) overlay-id))
+                              (sb-thread:with-mutex (lock)
+                                (push (or note "value not decodable") notes)
+                                (dolist (n nodes)
+                                  (let* ((short (adnl-short-id (car n))) (old (gethash short all)))
+                                    (when (or (null old) (> (cdr n) (cdr old))) (setf (gethash short all) n))))
+                                (if (>= (hash-table-count all) want) (values (list :enough) t) nil))))
+                           ((tl-is answer "dht.valueNotFound")
+                            (%dht-merge-nodes dht (tl-get answer :nodes))
+                            (sb-thread:with-mutex (lock) (push "valueNotFound" notes))
+                            nil)
+                           (t (sb-thread:with-mutex (lock)
+                                (push (if answer (format nil "other ~A" (tl-obj-name answer)) "no answer") notes))
+                              nil)))))
+    (values (loop for v being the hash-values of all collect v) (reverse notes))))
+
+(defun %dht-ip-string (ip)
+  (let ((ip (ldb (byte 32 0) ip)))
+    (format nil "~D.~D.~D.~D" (ldb (byte 8 24) ip) (ldb (byte 8 16) ip) (ldb (byte 8 8) ip) (ldb (byte 8 0) ip))))
+
+(defun adnl-address-summary (address-list)
+  "(VALUES STRINGS QUIC-HOST QUIC-PORT UDP-HOST UDP-PORT) of a decoded adnl.addressList: STRINGS describe every address (\"udp h:p\",
+\"quic h:p\", the TL name of any other kind), the rest are the first IPv4 UDP and QUIC endpoints or NIL."
+  (let (strings qh qp uh up)
+    (loop for a across (coerce (tl-get address-list :addrs) 'vector)
+          do (cond ((tl-is a "adnl.address.udp")
+                    (push (format nil "udp ~A:~D" (%dht-ip-string (tl-get a :ip)) (tl-get a :port)) strings)
+                    (unless uh (setf uh (%dht-ip-string (tl-get a :ip)) up (tl-get a :port))))
+                   ((tl-is a "adnl.address.quic")
+                    (push (format nil "quic ~A:~D" (%dht-ip-string (tl-get a :ip)) (tl-get a :port)) strings)
+                    (unless qh (setf qh (%dht-ip-string (tl-get a :ip)) qp (tl-get a :port))))
+                   (t (push (princ-to-string (tl-obj-name a)) strings))))
+    (values (nreverse strings) qh qp uh up)))

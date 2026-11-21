@@ -52,6 +52,17 @@
 (defconstant +adnl-udp-part-size+ 1024 "Adnl::get_mtu(): the largest part of a big message.")
 (defconstant +adnl-udp-max-message+ (+ 8192 128) "Adnl::huge_packet_max_size() + 128.")
 
+;;; the flags of adnl.packetContents (the bit of each flags.N field of the schema)
+(defconstant +adnl-udp-flag-from+ #x1)
+(defconstant +adnl-udp-flag-message+ #x4)
+(defconstant +adnl-udp-flag-messages+ #x8)
+(defconstant +adnl-udp-flag-address+ #x10)
+(defconstant +adnl-udp-flag-seqno+ #x40)
+(defconstant +adnl-udp-flag-confirm+ #x80)
+(defconstant +adnl-udp-flag-reinit+ #x400)
+(defconstant +adnl-udp-flag-signature+ #x800)
+
+
 ;;; --- the encrypted message --------------------------------------------------------------------------------------------------------
 
 (defun adnl-udp-key-iv (secret digest)
@@ -142,15 +153,6 @@ too short or whose digest does not match what the keys decrypt to."
 
 ;;; --- the signed packet ----------------------------------------------------------------------------------------------------------------
 
-(defconstant +adnl-udp-flag-from+ #x1)
-(defconstant +adnl-udp-flag-message+ #x4)
-(defconstant +adnl-udp-flag-messages+ #x8)
-(defconstant +adnl-udp-flag-address+ #x10)
-(defconstant +adnl-udp-flag-seqno+ #x40)
-(defconstant +adnl-udp-flag-confirm+ #x80)
-(defconstant +adnl-udp-flag-reinit+ #x400)
-(defconstant +adnl-udp-flag-signature+ #x800)
-
 (defun %adnl-udp-random-pad ()
   (ironclad:random-data (if (logbitp 0 (aref (ironclad:random-data 1) 0)) 7 15)))
 
@@ -198,15 +200,20 @@ encrypted: the sender's key is always included, the rest only where given."
                         :reinit-date reinit-date :dst-reinit-date (tl-get packet :dst-reinit-date)
                         :signature (coerce signature 'tl-octets) :rand2 (tl-get packet :rand2)))))
 
-(defun adnl-udp-open-packet (plain)
+(defun adnl-udp-open-packet (plain &optional lookup)
   "(VALUES PACKET SENDER-PUBLIC) of the decrypted PLAIN octets: decoded, with the signature checked against the key the
-packet names; signals for a packet without a key or a signature, or whose signature is wrong."
+packet names; signals for a packet without a key or a signature, or whose signature is wrong.  A packet may name its sender by
+the SHORT id only (from_short: nodes of 2026.10 leave the key out once the peer has it, the signature stays): LOOKUP, a function
+from a short id (octets) to the public key of a peer we know (or NIL), gives the key then; an unknown sender is refused."
   (let ((packet (tl-decode plain)))
     (unless (tl-is packet "adnl.packetContents") (adnl-protocol-error "not an adnl.packetContents"))
     (let ((flags (tl-get packet :flags)))
-      (unless (and (logtest flags +adnl-udp-flag-from+) (logtest flags +adnl-udp-flag-signature+))
+      (unless (and (logtest flags (logior +adnl-udp-flag-from+ 2)) (logtest flags +adnl-udp-flag-signature+))
         (adnl-protocol-error "ADNL packet without a source key or a signature"))
-      (let ((public (coerce (tl-get (tl-get packet :from) :key) 'octets)))
+      (let ((public (if (logtest flags +adnl-udp-flag-from+)
+                        (coerce (tl-get (tl-get packet :from) :key) 'octets)
+                        (or (and lookup (funcall lookup (as-octets (tl-get (tl-get packet :from-short) :id))))
+                            (adnl-protocol-error "ADNL packet from an unknown sender (short id only)")))))
         (unless (ignore-errors
                  (ironclad:verify-signature (ironclad:make-public-key :ed25519 :y public)
                                             (adnl-udp-packet-to-sign packet)
@@ -234,10 +241,15 @@ packet names; signals for a packet without a key or a signature, or whose signat
   huge-hash huge-buffer (huge-offset 0)
   ;; what we know of the peer
   (rtt nil)                             ; round trip, seconds, smoothed (EWMA 0.3), NIL before the first answer
-  (failures 0) (answers 0))
+  (failures 0) (answers 0)
+  ;; the connected socket this peer is sent on, and the thread reading the
+  ;; answers that come back on it (see %adnl-udp-peer-socket)
+  send-socket send-thread send-host send-port
+  (send-lock (sb-thread:make-mutex :name "adnl-udp-peer-send")))
 
 (defstruct (adnl-udp (:constructor %make-adnl-udp) (:copier nil))
   keypair short-id socket port handler
+  custom-handler                        ; (funcall fn octets sender-public) for every adnl.message.custom, or NIL (RLDP2 rides on these)
   (peers (make-hash-table :test 'equalp))
   (channels (make-hash-table :test 'equalp)) ; in-id -> peer
   (pending (make-hash-table :test 'equalp))
@@ -308,6 +320,52 @@ it is ready, none after."
                                                           :data (coerce (subseq octets offset (min size (+ offset +adnl-udp-part-size+)))
                                                                         'tl-octets))))))))
 
+(defun %adnl-udp-peer-receive-loop (node peer socket)
+  "Read PEER's datagrams off its connected SOCKET and hand them to the node's
+datagram handler with PEER's address, as the node's own receive loop does for
+datagrams that arrive on the node's socket."
+  (let ((buffer (make-array 2048 :element-type '(unsigned-byte 8))))
+    (loop while (and (adnl-udp-running node) (eq socket (adnl-udp-peer-send-socket peer)))
+          do (handler-case
+                 (when (sb-sys:wait-until-fd-usable (sb-bsd-sockets:socket-file-descriptor socket) :input 0.1)
+                   (multiple-value-bind (buf length host port) (sb-bsd-sockets:socket-receive socket buffer nil)
+                     (declare (ignore host port))
+                     (when (and buf length (plusp length))
+                       (%adnl-udp-handle-datagram node (subseq buf 0 length)
+                                                  (adnl-udp-peer-host peer) (adnl-udp-peer-port peer)))))
+               (error () (return))))))
+
+(defun %adnl-udp-peer-socket (node peer)
+  "PEER's connected sending socket, made on first use and remade when the
+peer's address has moved.  The socket is connected because a datagram sent to
+a per-call address is refused in some environments (sendto: EPERM) while a
+send on a connected socket goes through; the peer's answers return on the
+same socket and are read by its own thread."
+  (sb-thread:with-mutex ((adnl-udp-peer-send-lock peer))
+    (let ((socket (adnl-udp-peer-send-socket peer))
+          (host (adnl-udp-peer-host peer))
+          (port (adnl-udp-peer-port peer)))
+      (when (and socket (not (and (equalp host (adnl-udp-peer-send-host peer))
+                                  (eql port (adnl-udp-peer-send-port peer)))))
+        (ignore-errors (sb-bsd-sockets:socket-close socket))
+        (setf socket nil (adnl-udp-peer-send-socket peer) nil))
+      (unless socket
+        (setf socket (make-instance 'sb-bsd-sockets:inet-socket :type :datagram :protocol :udp))
+        (setf (sb-bsd-sockets:sockopt-reuse-address socket) t)
+        ;; the socket shares the node's own address and port, so the peer
+        ;; sees every datagram as coming from the node (and answers to it),
+        ;; while the connection still picks out this peer's datagrams
+        (multiple-value-bind (address node-port) (sb-bsd-sockets:socket-name (adnl-udp-socket node))
+          (sb-bsd-sockets:socket-bind socket address node-port))
+        (sb-bsd-sockets:socket-connect socket host port)
+        (setf (adnl-udp-peer-send-socket peer) socket
+              (adnl-udp-peer-send-host peer) host
+              (adnl-udp-peer-send-port peer) port
+              (adnl-udp-peer-send-thread peer)
+              (sb-thread:make-thread (lambda () (%adnl-udp-peer-receive-loop node peer socket))
+                                     :name "adnl-udp-peer-receive"))))
+    (adnl-udp-peer-send-socket peer)))
+
 (defun %adnl-udp-send-packet (node peer messages)
   "One datagram of MESSAGES to PEER: through the channel once it is ready, else a signed packet that also carries the channel message."
   (let* ((seqno (sb-thread:with-mutex ((adnl-udp-lock node)) (incf (adnl-udp-peer-out-seqno peer))))
@@ -329,8 +387,7 @@ it is ready, none after."
                                                                       :reinit-date (adnl-udp-start-time node)))))))
     (when (> (length datagram) +adnl-udp-max-datagram+)
       (ton-error "ADNL UDP datagram of ~D octets does not fit the ~D of the network" (length datagram) +adnl-udp-max-datagram+))
-    (sb-bsd-sockets:socket-send (adnl-udp-socket node) datagram nil
-                                :address (list (adnl-udp-peer-host peer) (adnl-udp-peer-port peer)))))
+    (sb-bsd-sockets:socket-send (%adnl-udp-peer-socket node peer) datagram nil)))
 
 (defun %adnl-udp-send-messages (node peer messages)
   "Send MESSAGES to PEER, a big one in parts, each piece in a datagram of its own."
@@ -402,6 +459,9 @@ it is ready, none after."
          (setf (adnl-udp-pending-answer entry) (as-octets (tl-get message :answer)))
          (sb-thread:signal-semaphore (adnl-udp-pending-semaphore entry)))))
     ((tl-is message "adnl.message.part") (%adnl-udp-part node peer message))
+    ((tl-is message "adnl.message.custom")
+     (let ((handler (adnl-udp-custom-handler node)))
+       (when handler (ignore-errors (funcall handler (as-octets (tl-get message :data)) (adnl-udp-peer-public peer))))))
     ((tl-is message "adnl.message.createChannel")
      (%adnl-udp-create-channel node peer (as-octets (tl-get message :key)) (tl-get message :date)))
     ((tl-is message "adnl.message.confirmChannel")
@@ -423,7 +483,9 @@ it is ready, none after."
   (handler-case
       (let ((dst (subseq datagram 0 32)))
         (if (equalp dst (adnl-udp-short-id node))
-            (multiple-value-bind (packet public) (adnl-udp-open-packet (adnl-udp-open-datagram (adnl-udp-keypair node) datagram))
+            (multiple-value-bind (packet public) (adnl-udp-open-packet (adnl-udp-open-datagram (adnl-udp-keypair node) datagram)
+                                                                         (lambda (short) (let ((known (sb-thread:with-mutex ((adnl-udp-lock node)) (gethash short (adnl-udp-peers node)))))
+                                                                                           (and known (adnl-udp-peer-public known)))))
               (%adnl-udp-deliver node packet (%adnl-udp-peer node public host port)))
             (let ((peer (sb-thread:with-mutex ((adnl-udp-lock node)) (gethash dst (adnl-udp-channels node)))))
               (if (null peer)
@@ -450,14 +512,15 @@ it is ready, none after."
                        (%adnl-udp-handle-datagram node (subseq buf 0 length) host port)))
                  (error () nil))))))
 
-(defun adnl-udp-start (&key (keypair (adnl-generate-keypair)) (host "127.0.0.1") (port 0) handler)
-  "A node: a UDP socket bound to HOST:PORT (0 = any free port) and the thread reading it.  HANDLER, when given, answers
-queries: (funcall HANDLER query-octets sender-public) returns the answer octets, or NIL to stay silent."
+(defun adnl-udp-start (&key (keypair (adnl-generate-keypair)) (host "0.0.0.0") (port 0) handler custom-handler)
+  "A node: a UDP socket bound to HOST:PORT (0 = any free port; the default 0.0.0.0, because a socket bound to loopback cannot send to a public address: sendto fails with EINVAL) and the thread reading it.  HANDLER, when given, answers
+queries: (funcall HANDLER query-octets sender-public) returns the answer octets, or NIL to stay silent.  CUSTOM-HANDLER, when given, receives every
+custom message (adnl.message.custom): (funcall CUSTOM-HANDLER octets sender-public); its value is ignored, an error in it is swallowed."
   (let ((socket (make-instance 'sb-bsd-sockets:inet-socket :type :datagram :protocol :udp)))
     (setf (sb-bsd-sockets:sockopt-reuse-address socket) t)
     (sb-bsd-sockets:socket-bind socket (sb-bsd-sockets:make-inet-address host) port)
     (let ((node (%make-adnl-udp :keypair keypair :short-id (adnl-short-id (keypair-public keypair))
-                                :socket socket :handler handler
+                                :socket socket :handler handler :custom-handler custom-handler
                                 :port (nth-value 1 (sb-bsd-sockets:socket-name socket)))))
       (setf (adnl-udp-thread node)
             (sb-thread:make-thread (lambda () (%adnl-udp-receive-loop node)) :name "adnl-udp-receive"))
@@ -467,6 +530,12 @@ queries: (funcall HANDLER query-octets sender-public) returns the answer octets,
   "Stop the receive thread and close the socket."
   (setf (adnl-udp-running node) nil)
   (when (adnl-udp-thread node) (ignore-errors (sb-thread:join-thread (adnl-udp-thread node) :default nil)))
+  (loop for peer being the hash-values of (adnl-udp-peers node)
+        do (when (adnl-udp-peer-send-socket peer)
+             (ignore-errors (sb-bsd-sockets:socket-close (adnl-udp-peer-send-socket peer)))
+             (setf (adnl-udp-peer-send-socket peer) nil))
+           (when (adnl-udp-peer-send-thread peer)
+             (ignore-errors (sb-thread:join-thread (adnl-udp-peer-send-thread peer) :timeout 1 :default nil))))
   (ignore-errors (sb-bsd-sockets:socket-close (adnl-udp-socket node)))
   t)
 
@@ -500,6 +569,13 @@ peer's round trip time (smoothed) and failure count are kept.  Signals ADNL-UDP-
                                         :format-arguments (list host port timeout)))))
       (sb-thread:with-mutex ((adnl-udp-lock node))
         (remhash query-id (adnl-udp-pending node))))))
+
+(defun adnl-udp-send-custom (node host port peer-public data)
+  "Send DATA (octets) as one adnl.message.custom to the node at HOST:PORT owning PEER-PUBLIC; no answer is expected and none
+is waited for (a datagram can be lost).  A message above the single-datagram size goes in parts, as every message does."
+  (let ((peer (%adnl-udp-peer node peer-public (sb-bsd-sockets:make-inet-address host) port)))
+    (%adnl-udp-send-messages node peer (list (tl-make "adnl.message.custom" :data (coerce data 'tl-octets))))
+    t))
 
 (defun adnl-udp-peer-of (node public)
   "The peer record of the key PUBLIC, or NIL when the node has never met it."

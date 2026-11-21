@@ -207,10 +207,134 @@
                                          :timeout 1.5)))
              (unwind-protect
                   (multiple-value-bind (list public) (cl-ton::dht-find-address dht short)
-                    (check "dht: a nearer node that serves a forged value is ignored, the honest value is found; a dead bootstrap node is tolerated"
+                    (check "dht: a nearer node that serves a forged value is ignored and the honest value is found"
                            (and list (equalp public (cl-ton::keypair-public target))
-                                (= 2222 (nth-value 1 (cl-ton::%dht-udp-address list)))
-                                (plusp (cl-ton::dht-peer-failures (gethash (cl-ton::adnl-short-id (cl-ton::base64-decode "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="))
-                                                                           (cl-ton::dht-peers dht)))))))
+                                (= 2222 (nth-value 1 (cl-ton::%dht-udp-address list)))))
+                    ;; the search may end before the query to the dead node has timed out: wait for it, then look
+                    (sleep 1.8)
+                    (check "dht: a dead bootstrap node is tolerated and counted as failing"
+                           (let ((dead (gethash (cl-ton::adnl-short-id (cl-ton::base64-decode "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="))
+                                                (cl-ton::dht-peers dht))))
+                             (and dead (plusp (cl-ton::dht-peer-failures dead))))))
                (cl-ton::dht-stop dht)))
         (%dht-t-stop servers)))))
+
+;;; --- members of a public overlay (the overlayNodes rule) ---------------------------------------------------------------------------
+
+(defun %dht-t-overlay-node (keypair overlay-id &key (version 1) (sign-with keypair) (overlay overlay-id))
+  "A signed overlay.node of KEYPAIR for OVERLAY (the overlay it names) signed by SIGN-WITH over the toSign of OVERLAY-ID."
+  (let* ((pub (cl-ton::tl-make "pub.ed25519" :key (coerce (cl-ton::keypair-public keypair) 'cl-ton::tl-octets)))
+         (short (cl-ton::adnl-short-id (cl-ton::keypair-public keypair)))
+         (to-sign (cl-ton::tl-encode (cl-ton::tl-make "overlay.node.toSign"
+                                                      :id (cl-ton::tl-make "adnl.id.short" :id (coerce short 'cl-ton::tl-octets))
+                                                      :overlay (coerce overlay-id 'cl-ton::tl-octets) :version version))))
+    (cl-ton::tl-make "overlay.node" :id pub :overlay (coerce overlay 'cl-ton::tl-octets) :version version
+                                    :signature (%dht-t-sign sign-with to-sign))))
+
+(defun %dht-t-overlay-value (overlay-name nodes &key (signature-octets #()) (rule "dht.updateRule.overlayNodes"))
+  "(VALUES VALUE OVERLAY-ID) a dht.value for the overlay-nodes key of the overlay named OVERLAY-NAME, holding NODES."
+  (let* ((pub (cl-ton::tl-make "pub.overlay" :name (coerce overlay-name 'cl-ton::tl-octets)))
+         (overlay-id (cl-ton::sha256 (cl-ton::tl-encode pub)))
+         (key (cl-ton::tl-make "dht.key" :id (coerce overlay-id 'cl-ton::tl-octets) :name (coerce (cl-ton::ascii "nodes") 'cl-ton::tl-octets) :idx 0))
+         (description (cl-ton::tl-make "dht.keyDescription" :key key :id pub :update-rule (cl-ton::tl-make rule)
+                                                            :signature (coerce #() 'cl-ton::tl-octets))))
+    (values (cl-ton::tl-make "dht.value" :key description
+                                         :value (coerce (cl-ton::tl-encode (cl-ton::tl-make "overlay.nodes" :nodes nodes)) 'cl-ton::tl-octets)
+                                         :ttl (+ (%dht-t-now) 3600)
+                                         :signature (coerce signature-octets 'cl-ton::tl-octets))
+            overlay-id)))
+
+(defun test-dht-overlay-members ()
+  (format t "DHT client: the verified members of a public overlay (dht.updateRule.overlayNodes)~%")
+  (let* ((name (ironclad:random-data 32))
+         (members (loop repeat 5 collect (cl-ton::adnl-generate-keypair)))
+         (stranger (cl-ton::adnl-generate-keypair))
+         (other-overlay (ironclad:random-data 32)))
+    (multiple-value-bind (probe-value overlay-id) (%dht-t-overlay-value name '())
+      (declare (ignore probe-value))
+      (let* ((good-nodes (loop for m in members for v from 10 collect (%dht-t-overlay-node m overlay-id :version v)))
+             (forged (%dht-t-overlay-node stranger overlay-id :sign-with (first members)))        ; signed by the wrong key
+             (foreign (%dht-t-overlay-node stranger overlay-id :overlay other-overlay))             ; names another overlay
+             (newer (%dht-t-overlay-node (first members) overlay-id :version 99))
+             (key-id (cl-ton::dht-key-id overlay-id :name "nodes")))
+        ;; the value check on its own
+        (multiple-value-bind (list reason) (cl-ton::dht-overlay-value-nodes (%dht-t-overlay-value name (list* forged foreign good-nodes)) overlay-id)
+          (check "overlay nodes: the five honest nodes verify, the forged one and the one of another overlay are dropped"
+                 (and (= 5 (length list)) (search "5 of 7" reason)
+                      (null (set-difference (mapcar #'car list) (mapcar #'cl-ton::keypair-public members) :test #'equalp))))
+          (check "overlay nodes: the versions come from the signed nodes" (equal (sort (mapcar #'cdr list) #'<) '(10 11 12 13 14))))
+        (check "overlay nodes: a value that carries a signature is refused"
+               (null (cl-ton::dht-overlay-value-nodes (%dht-t-overlay-value name good-nodes :signature-octets (make-array 64 :initial-element 7)) overlay-id)))
+        (check "overlay nodes: a value under the signature rule is refused"
+               (null (cl-ton::dht-overlay-value-nodes (%dht-t-overlay-value name good-nodes :rule "dht.updateRule.signature") overlay-id)))
+        (check "overlay nodes: a value of another overlay is refused"
+               (null (cl-ton::dht-overlay-value-nodes (%dht-t-overlay-value other-overlay good-nodes) overlay-id)))
+        (check "overlay nodes: a node is not accepted for an overlay it does not name"
+               (and (null (cl-ton::dht-verify-overlay-node foreign overlay-id))
+                    (null (cl-ton::dht-verify-overlay-node forged overlay-id))
+                    (equalp (cl-ton::dht-verify-overlay-node (first good-nodes) overlay-id) (cl-ton::keypair-public (first members)))))
+        ;; the search over a simulated DHT: two holders of different parts of the member list
+        (let* ((servers (%dht-t-network 12))
+               (sorted (sort (copy-list servers) #'<
+                             :key (lambda (s) (cl-ton::dht-distance (cl-ton::adnl-short-id (cl-ton::keypair-public (dht-t-server-keypair s))) key-id))))
+               (a (first sorted)) (b (second sorted)))
+          (setf (gethash key-id (dht-t-server-values a)) (%dht-t-overlay-value name (list* forged (subseq good-nodes 0 3))))
+          (setf (gethash key-id (dht-t-server-values b)) (%dht-t-overlay-value name (list* newer foreign (subseq good-nodes 2))))
+          (unwind-protect
+               (let ((dht (cl-ton::dht-start :bootstrap (%dht-t-bootstrap-of servers '(0 3)) :timeout 1.5)))
+                 (unwind-protect
+                      (multiple-value-bind (found notes) (cl-ton::dht-find-overlay-members dht overlay-id :want 100)
+                        (check "overlay members: the five honest members are found, merged over both holders, each once"
+                               (and (= 5 (length found))
+                                    (null (set-difference (mapcar #'car found) (mapcar #'cl-ton::keypair-public members) :test #'equalp))))
+                        (check "overlay members: the newest signed version of a member wins"
+                               (= 99 (cdr (find (cl-ton::keypair-public (first members)) found :key #'car :test #'equalp))))
+                        (check "overlay members: the notes tell what the nodes said" (and notes (every #'stringp notes))))
+                   (cl-ton::dht-stop dht)))
+            (%dht-t-stop servers)))
+        ;; the address summary
+        (let ((list (cl-ton::tl-make "adnl.addressList"
+                                     :addrs (list (cl-ton::tl-make "adnl.address.udp" :ip (+ (ash 10 24) (ash 1 16) (ash 2 8) 3) :port 3000)
+                                                  (cl-ton::tl-make "adnl.address.quic" :ip (+ (ash 10 24) (ash 1 16) (ash 2 8) 3) :port 4000))
+                                     :version 0 :reinit-date 0 :priority 0 :expire-at 0)))
+          (multiple-value-bind (strings qh qp uh up) (cl-ton::adnl-address-summary list)
+            (check "address summary: the udp and quic endpoints of an address list"
+                   (and (equal strings '("udp 10.1.2.3:3000" "quic 10.1.2.3:4000")) (string= qh "10.1.2.3") (= qp 4000)
+                        (string= uh "10.1.2.3") (= up 3000)))))))))
+
+;;; --- peers of a public overlay: members, then their signed address lists ---------------------------------------------------------
+
+(defun test-dht-overlay-peers ()
+  (format t "DHT client: the peers of a public overlay (members resolved through their address lists)~%")
+  (let* ((name (ironclad:random-data 32))
+         (members (loop repeat 4 collect (cl-ton::adnl-generate-keypair)))   ; the fourth has no address record
+         (overlay-id (nth-value 1 (%dht-t-overlay-value name '())))
+         (nodes (loop for m in members for v from 1 collect (%dht-t-overlay-node m overlay-id :version v)))
+         (servers (%dht-t-network 12)))
+    (flet ((put (key-id value)
+             (let ((holder (first (sort (copy-list servers) #'<
+                                        :key (lambda (s) (cl-ton::dht-distance (cl-ton::adnl-short-id (cl-ton::keypair-public (dht-t-server-keypair s))) key-id))))))
+               (setf (gethash key-id (dht-t-server-values holder)) value))))
+      (put (cl-ton::dht-key-id overlay-id :name "nodes") (%dht-t-overlay-value name nodes))
+      (loop for m in (subseq members 0 3) for port from 7001
+            do (put (cl-ton::dht-key-id (cl-ton::adnl-short-id (cl-ton::keypair-public m)))
+                    (%dht-t-value m (cl-ton::tl-encode (%dht-t-address-list port))))))
+    (unwind-protect
+         (let ((dht (cl-ton::dht-start :bootstrap (%dht-t-bootstrap-of servers '(0 3)) :timeout 1.5)))
+           (unwind-protect
+                (progn
+                  (multiple-value-bind (peers found notes) (cl-ton::dht-overlay-peers dht overlay-id :max 10)
+                    (check "overlay peers: the DHT nodes' answers come back as notes" (and notes (every #'stringp notes)))
+                    (check "overlay peers: four verified members, the three with an address record become peers (127.0.0.1, their ports, their keys)"
+                           (and (= 4 found) (= 3 (length peers))
+                                (every (lambda (p) (string= "127.0.0.1" (first p))) peers)
+                                (equal (sort (mapcar #'second peers) #'<) '(7001 7002 7003))
+                                (null (set-difference (mapcar #'third peers) (mapcar #'cl-ton::keypair-public (subseq members 0 3)) :test #'equalp)))))
+                  (check "overlay peers: MAX limits the list"
+                         (= 2 (length (cl-ton::dht-overlay-peers dht overlay-id :max 2))))
+                  (check "overlay peers: an overlay nobody publishes has no peers"
+                         (multiple-value-bind (peers found)
+                             (cl-ton::dht-overlay-peers dht (cl-ton::sha256 (ironclad:random-data 8)))
+                           (and (null peers) (zerop found)))))
+             (cl-ton::dht-stop dht)))
+      (%dht-t-stop servers))))

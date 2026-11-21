@@ -298,6 +298,106 @@ FETCH-POOL-STATES (dex-config.lisp) when it opens a chain."
                  (when (> seqno baseline) (return block)))  
                (sleep (min 0.1 (max 0 remaining))))))))
 
+;;; --- the lite implementation ---------------------------------------------
+;;;
+;;; The same operations over a LITE-CLIENT directly (its transport an UPSTREAM-POOL, see OPEN-LITE-CLIENT-POOL): every read is
+;;; proved by the client, no tonlib and no proxy in between.  TONLIB-CHAIN goes away with the tonlib layer (Stage L step 4).
+
+(defstruct (lite-chain (:include chain) (:constructor %make-lite-chain) (:conc-name lite-chain-) (:copier nil))
+  client dexes pool-fetcher wallet usdt-wallet head-poller scanner
+  (config-cell nil)
+  (jetton-wallets (make-hash-table :test 'equal)))
+
+(defun make-lite-getter (client)
+  "The (ADDRESS METHOD STACK) -> items function of CLIENT: the getter run by the client's emulator on the proved state."
+  (lambda (addr method &optional stack)
+    (multiple-value-bind (items exit-code) (lite-backend-run-get-method client addr method stack)
+      (unless (member exit-code '(0 1))
+        (ton-error "~A on ~A failed with exit code ~A" method (address->string addr) exit-code))
+      items)))
+
+(defun make-lite-chain (client dexes wallet usdt-wallet &key head-poller scanner pool-fetcher)
+  "A CHAIN over the lite client CLIENT.  POOL-FETCHER is (GETTER DEXES) -> list of pool states, supplied by the caller (cl-ton has
+no DEX-contract knowledge); HEAD-POLLER (START-HEAD-POLLER over a lite client) and SCANNER are optional."
+  (let ((c (%make-lite-chain :client client :dexes dexes :pool-fetcher pool-fetcher :wallet wallet :usdt-wallet usdt-wallet
+                             :head-poller head-poller :scanner scanner))
+        (getter (make-lite-getter client)))
+    (setf (chain-op-pools c) (lambda ()
+                               (if pool-fetcher
+                                   (funcall pool-fetcher getter dexes)
+                                   (ton-error "this chain has no POOL-FETCHER (see MAKE-LITE-CHAIN); cl-ton has no DEX-contract ~
+                                               knowledge of its own to fetch pool states with")))
+          (chain-op-ton-balance c) (lambda () (account-state-balance (lite-backend-account-state client (lite-chain-wallet-address c))))
+          (chain-op-usdt-balance c) (lambda ()
+                                      ;; Network errors propagate so a transient failure is never read as 0.
+                                      (let* ((addr (or (lite-chain-usdt-wallet c) (ton-error "no USDT wallet attached")))
+                                             (state (lite-backend-account-state client addr)))
+                                        (if (eq (account-state-status state) :active) (jetton-wallet-balance getter addr) 0)))
+          (chain-op-jetton-balance c) (lambda (master)
+                                        (let* ((addr (lite-chain-jetton-wallet c master))
+                                               (state (lite-backend-account-state client addr)))
+                                          (if (eq (account-state-status state) :active) (jetton-wallet-balance getter addr) 0)))
+          (chain-op-wallet-transactions c) (lambda (limit)
+                                             (let ((txs (lite-backend-transactions client (lite-chain-wallet-address c))))
+                                               (coerce (subseq txs 0 (min limit (length txs))) 'list)))
+          (chain-op-drain-flow-events c) (lambda () (drain-flow-events (lite-chain-scanner c)))
+          (chain-op-wallet-deployed-p c) (lambda ()
+                                           (eq :active (account-state-status
+                                                        (lite-backend-account-state client (lite-chain-wallet-address c)))))
+          (chain-op-wallet-seqno c) (lambda () (wallet-seqno getter (lite-chain-wallet c)))
+          (chain-op-send c) (lambda (external) (lite-backend-send-message client external))
+          (chain-op-emulate c) (lambda (external pretend-balance) (%lite-chain-emulate c external pretend-balance))
+          (chain-op-wait-block c) (lambda (timeout) (%lite-chain-wait-block c timeout))
+          (chain-op-set-wallet c) (lambda (wallet usdt-wallet)
+                                    (setf (lite-chain-wallet c) wallet (lite-chain-usdt-wallet c) usdt-wallet))
+          (chain-op-getter c) (lambda () getter)
+          (chain-op-close c) (lambda () (%lite-chain-close c)))
+    c))
+
+(defun lite-chain-wallet-address (c)
+  (wallet-address (or (lite-chain-wallet c) (ton-error "no wallet attached"))))
+
+(defun lite-chain-jetton-wallet (c master)
+  "The wallet's own jetton wallet for MASTER, derived once per master."
+  (let ((key (address->string master)) (table (lite-chain-jetton-wallets c)))
+    (or (gethash key table)
+        (setf (gethash key table)
+              (jetton-wallet-address (chain-getter c) master (lite-chain-wallet-address c))))))
+
+(defun lite-chain-config (c)
+  "The proved configuration cell, fetched once."
+  (or (lite-chain-config-cell c)
+      (setf (lite-chain-config-cell c) (lite-backend-config-cell (lite-chain-client c)))))
+
+(defun %lite-chain-emulate (c external pretend-balance)
+  (let* ((wallet (lite-chain-wallet c))
+         (shard (if pretend-balance
+                    (funded-shard-account (wallet-address wallet) (wallet-state-init wallet) pretend-balance)
+                    (lite-backend-shard-account-cell (lite-chain-client c) (wallet-address wallet)))))
+    (emulate-external-message (lite-chain-config c) shard external)))
+
+(defun %lite-chain-wait-block (c timeout)
+  "The first masterchain block newer than the head at the call, or NIL after TIMEOUT seconds."
+  (let ((poller (lite-chain-head-poller c)))
+    (if poller
+        (wait-for-published-head poller (sb-thread:with-mutex ((head-poller-lock poller)) (head-poller-seqno poller)) timeout)
+        (let* ((client (lite-chain-client c))
+               (deadline (+ (get-internal-real-time) (* timeout internal-time-units-per-second)))
+               (baseline (block-id-seqno (lite-backend-masterchain-block client))))
+          (loop
+            for remaining = (/ (- deadline (get-internal-real-time)) internal-time-units-per-second)
+            when (<= remaining 0) return nil
+            do (let ((block (lite-backend-masterchain-block client)))
+                 (when (> (block-id-seqno block) baseline) (return block)))
+               (sleep (min 0.1 (max 0 remaining))))))))
+
+(defun %lite-chain-close (c)
+  (unwind-protect
+       (progn
+         (when (lite-chain-scanner c) (stop-flow-scanner (lite-chain-scanner c)))
+         (stop-head-poller (lite-chain-head-poller c)))
+    (close-lite-client (lite-chain-client c))))
+
 ;;; --- waiting -------------------------------------------------------------
 
 (defun wait-until (chain predicate timeout &key (interval 3))

@@ -430,6 +430,93 @@ AccountBlock) as block::get_block_transaction reads it."
                           (values nil nil)
                           (values (load-ref (%skip-currency-collection leaf)) t)))))))))))
 
+;;; --- the accounts a block changed (the hot path: no supplier, the block alone) --------------------------------------------------------
+
+(define-proof-function dict-walk-in-slice (slice key-bits function &optional cell)
+  "Call FUNCTION with (KEY SLICE CELL) for every leaf of the Hashmap/HashmapAug whose root edge is the rest of SLICE (as
+DICT-LOOKUP-IN-SLICE reads it), in key order: KEY an integer of KEY-BITS bits, SLICE positioned after the leaf's label (for an
+augmented map the extra comes first), CELL the cell the leaf is stored in (the root's is CELL, the optional argument, which is NIL
+when the dictionary is stored inline in a larger cell).  Signals if a pruned cell is on the way: a walk reads whole dictionaries."
+  (labels ((walk (current cell prefix bits)
+             (let ((m (- key-bits bits)))
+               (multiple-value-bind (label n rest) (load-hm-label current m)
+                 (%prove (<= n m) "dictionary label of ~D bits longer than the ~D left of the key" n m)
+                 (let ((key (logior (ash prefix n) label)) (bits (+ bits n)))
+                   (if (= n m)
+                       (funcall function key rest cell)
+                       (multiple-value-bind (left rest2) (load-ref rest)
+                         (let ((right (load-ref rest2)))
+                           (walk (cell-slice left) left (ash key 1) (1+ bits))
+                           (walk (cell-slice right) right (logior (ash key 1) 1) (1+ bits))))))))))
+    (walk slice cell 0 0)))
+
+(define-proof-function dict-walk (root key-bits function)
+  "DICT-WALK-IN-SLICE for the Hashmap/HashmapAug whose root edge cell is ROOT (NIL for an empty one)."
+  (when root (dict-walk-in-slice (cell-slice root) key-bits function root)))
+
+(define-proof-function block-account-changes (block)
+  "BLOCK, a Block cell with its account blocks revealed (the block's own data): what the block did to each account that had a
+transaction in it, in account order, as a list of plists (:ACCOUNT the 32-octet account hash, :TRANSACTIONS how many, :LAST-LT and
+:LAST-TRANS-HASH of the last one, :OLD-ACCOUNT-HASH and :NEW-ACCOUNT-HASH the hash of the Account cell before and after the block,
+from the AccountBlock's HASH_UPDATE).  A transaction's hash is the hash of its cell, which covers everything in it."
+  (%prove (= 4 (length (cell-refs block))) "a Block has four references")
+  (let ((extra (svref (cell-refs block) 3)) (changes '()))
+    (%prove (= (load-uint (cell-slice extra) 32) #x4a33f6fd) "not a BlockExtra cell")
+    (%prove (<= 3 (length (cell-refs extra))) "a BlockExtra has at least three references")
+    (multiple-value-bind (present s) (load-uint (cell-slice (svref (cell-refs extra) 2)) 1)
+      (when (= present 1)
+        (dict-walk
+         (load-ref s) 256
+         (lambda (key leaf cell)
+           (multiple-value-bind (tag s) (load-uint (%skip-currency-collection leaf) 4)
+             (%prove (= tag 5) "not an AccountBlock (tag ~D)" tag)
+             (multiple-value-bind (addr s) (load-bytes s 32)
+               (%prove (= (octets->uint addr) key) "an AccountBlock of another account than its key")
+               (let ((count 0) (last-lt nil) (last-cell nil))
+                 (dict-walk-in-slice s 64
+                                     (lambda (lt value tx-cell)
+                                       (declare (ignore tx-cell))
+                                       (incf count)
+                                       (when (or (null last-lt) (> lt last-lt))
+                                         (setf last-lt lt last-cell (load-ref (%skip-currency-collection value))))))
+                 (%prove (plusp count) "an AccountBlock without transactions")
+                 ;; state_update:^(HASH_UPDATE Account) is the last reference of the AccountBlock
+                 (let* ((update (svref (cell-refs cell) (1- (length (cell-refs cell)))))
+                        (u (cell-slice update)))
+                   (multiple-value-bind (tag u) (load-uint u 8)
+                     (%prove (= tag #x72) "an AccountBlock whose state update is not a HASH_UPDATE")
+                     (multiple-value-bind (old u) (load-bytes u 32)
+                       (push (list :account addr :transactions count :last-lt last-lt :last-trans-hash (node-hash-at last-cell 0)
+                                   :old-account-hash old :new-account-hash (load-bytes u 32))
+                             changes)))))))))))
+    (nreverse changes)))
+
+(define-proof-function block-new-shard-account (block account)
+  "BLOCK, a shard Block cell: the ShardAccount of ACCOUNT (32 octets) in the state AFTER the block, read from the new tree of its
+state_update, which reveals every account the block changed.  A plist (:EXISTS T :BALANCE grams :ACCOUNT-CELL the Account cell, its
+code and data possibly pruned :LAST-TRANS-LT :LAST-TRANS-HASH), (:EXISTS NIL) when the new state has no such account, and a
+PROOF-ERROR when the account is not revealed (it was not changed by the block) or the new tree is not the update's new state."
+  (%prove (= 4 (length (cell-refs block))) "a Block has four references")
+  (let ((update (svref (cell-refs block) 2)))
+    (%prove (eql 4 (cell-special-type update)) "the state_update is not a Merkle update")
+    (let* ((new-hash (nth-value 1 (merkle-update-hashes update)))
+           (new-tree (svref (cell-refs update) 1))
+           (header (parse-shard-state-header new-tree))
+           (accounts (getf header :accounts)))
+      (%prove (equalp (node-hash-at new-tree 0) new-hash) "the new tree of the state update is not the state it names")
+      (multiple-value-bind (present s) (load-uint (cell-slice accounts) 1)
+        (multiple-value-bind (value found) (dict-lookup (and (= present 1) (load-ref s)) (octets->uint account) 256)
+          (if (not found)
+              (list :exists nil)
+              ;; ShardAccounts leaf: DepthBalanceInfo (split_depth, balance) then ShardAccount
+              (let ((s (skip-bits value 5)))
+                (multiple-value-bind (balance s) (load-coins s)
+                  (let ((s (nth-value 1 (load-maybe-ref s))))
+                    (multiple-value-bind (account-ref s) (load-ref s)
+                      (multiple-value-bind (trans-hash s) (load-bytes s 32)
+                        (list :exists t :balance balance :account-cell account-ref
+                              :last-trans-lt (load-uint s 64) :last-trans-hash trans-hash))))))))))))
+
 (defun verify-block-transactions (answer block-id &key count reverse)
   (with-proof-errors
     (%prove-same-block-id (tl-get answer :id) block-id "block transactions")
@@ -629,6 +716,23 @@ NIL when empty), as a list of plists (:WORKCHAIN :SHARD :SEQNO :REG-MC-SEQNO :ST
         (let ((key (car entry)))
           (walk (cdr entry) (if (>= key #x80000000) (- key #x100000000) key) 0 0))))
     (nreverse out)))
+
+(define-proof-function block-shard-descriptions (block)
+  "The shards a masterchain Block names, as LIST-SHARD-DESCRIPTIONS lists them: BLOCK is the cell of a masterchain block whose
+McBlockExtra is readable (the block's own data, or a proof of it that reveals that part).  Each :ROOT-HASH and :FILE-HASH is the
+id of the newest block of that shard the masterchain block commits to.  NIL for a block with an empty ShardHashes."
+  (%prove (and (cell-p block) (not (cell-exotic-p block)) (= 4 (length (cell-refs block)))
+               (= (load-uint (cell-slice block) 32) #x11ef55aa))
+          "shard descriptions: not a Block")
+  (let* ((extra (svref (cell-refs block) 3))
+         (extra-slice (cell-slice extra)))
+    (%prove (= (load-uint extra-slice 32) #x4a33f6fd) "shard descriptions: not a BlockExtra")
+    (%prove (= 1 (load-uint (skip-bits extra-slice 544) 1)) "shard descriptions: the block has no McBlockExtra")
+    (%prove (= 4 (length (cell-refs extra))) "shard descriptions: a BlockExtra with a custom part has four references")
+    (let ((s (cell-slice (svref (cell-refs extra) 3))))
+      (%prove (= (load-uint s 16) #xcca5) "shard descriptions: not a McBlockExtra")
+      (multiple-value-bind (present s) (load-uint (skip-bits s 17) 1)
+        (and (= present 1) (list-shard-descriptions (load-ref s)))))))
 
 (defun verify-all-shards-info (answer mc-block-id)
   (with-proof-errors
